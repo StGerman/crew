@@ -22,7 +22,7 @@ the published snapshot.
 ## Commands
 
 ```bash
-cargo test                                 # 124 unit + 36 integration
+cargo test                                 # 124 unit + 37 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -273,9 +273,10 @@ agent onto its worktree.
 
 ## Invariants
 
-Each of these closes a defect found in the original spec — bar the last four: two from the
-first dogfooding review, two from putting an operator surface on top of the same state — and
-each has a test that fails without it. Several only fail in
+Each of these closes a defect found in the original spec — bar the last five: two from the
+first dogfooding review, two from putting an operator surface on top of the same state, and one
+that is issue #1's acceptance criterion made executable — and each has a test that fails
+without it. Several only fail in
 the exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
 
@@ -296,6 +297,7 @@ reading — check the named test is still meaningful, not just still green.
 | A finished run keeps no write authority | the session is an RAII guard living in the `running` entry | `a_run_that_ends_takes_its_broker_authority_with_it` |
 | Clearing a quarantine cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL` and reports what it did | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim` |
 | A slow HTTP client cannot delay a tick | one task per connection, a `oneshot` reply the scheduler never waits on, and a bounded read timeout | `a_client_that_never_finishes_its_request_cannot_delay_a_tick` |
+| The projection cannot become load-bearing | `publish` logs a projector error and returns `Ok`; nothing written is ever read back | `the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the
