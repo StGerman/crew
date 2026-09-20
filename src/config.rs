@@ -32,6 +32,18 @@ fn d_quarantine_after() -> u32 {
 fn d_miss_grace() -> u32 {
     2
 }
+fn d_api_bind() -> String {
+    "127.0.0.1:8787".to_string()
+}
+fn d_broker_enabled() -> bool {
+    true
+}
+fn d_calls_per_run() -> u32 {
+    20
+}
+fn d_calls_per_issue() -> u32 {
+    100
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -45,6 +57,72 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub worker: WorkerConfig,
+    #[serde(default)]
+    pub broker: BrokerConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+}
+
+/// The ops HTTP surface ([`crate::api`]).
+///
+/// Off by default, and loopback when on: `POST /refresh` and `POST /unquarantine` control
+/// agent execution, so an orchestrator that grows a control plane merely by being upgraded, or
+/// that binds `0.0.0.0` because a field was left at a convenient default, is not something an
+/// operator asked for.
+///
+/// Deliberately absent from [`Config::preflight`]: preflight gates *dispatch*, so validating
+/// the bind address there would let a typo in a field the scheduler does not use stop the
+/// scheduler. The address is parsed once, by [`crate::api::bind`], where a failure costs the
+/// API and nothing else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `host:port`. Refused unless the host is loopback or `allow_public` is set.
+    #[serde(default = "d_api_bind")]
+    pub bind: String,
+    /// Permit a non-loopback bind — a deliberate decision to expose the write endpoints to
+    /// whatever can reach that interface, which is why it is a separate flag rather than an
+    /// inference from the address.
+    #[serde(default)]
+    pub allow_public: bool,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self { enabled: false, bind: d_api_bind(), allow_public: false }
+    }
+}
+
+/// The host-side tool broker (see [`crate::broker`]).
+///
+/// On by default, unlike `worker.kind`, because the blast radius is the other way round: the
+/// broker's whole purpose is to give the agent a *scoped* way to do what it can already do
+/// ambiently, so switching it off does not remove an authority, it removes the audited path to
+/// one. An operator who wants no agent-initiated tracker writes at all wants a token without
+/// write scope, not `enabled = false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerConfig {
+    #[serde(default = "d_broker_enabled")]
+    pub enabled: bool,
+    /// Broker calls one dispatched run may make.
+    #[serde(default = "d_calls_per_run")]
+    pub max_calls_per_run: u32,
+    /// Broker calls one issue may accumulate across all of its runs. The per-run cap does not
+    /// bound the continuation loop on its own — each continuation is a fresh run with a fresh
+    /// allowance — which is the same gap `max_turns_per_issue` closes for turns.
+    #[serde(default = "d_calls_per_issue")]
+    pub max_calls_per_issue: u32,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: d_broker_enabled(),
+            max_calls_per_run: d_calls_per_run(),
+            max_calls_per_issue: d_calls_per_issue(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -59,6 +137,17 @@ pub struct WorkerConfig {
     /// Only used when `kind = "claude"`. Defaults to `"claude"` — resolved via `PATH`.
     #[serde(default)]
     pub bin: Option<String>,
+    /// Replaces
+    /// [`DEFAULT_ENV_ALLOWLIST`](crate::worker::claude::DEFAULT_ENV_ALLOWLIST) wholesale when
+    /// set — not merged with it, so an operator who names a list gets exactly that list and
+    /// nothing arrives by inheritance.
+    ///
+    /// The reason to reach for it is usually to *add* something deliberate, like
+    /// `ANTHROPIC_API_KEY` on an API-key install. Tightening it is a weaker lever than it
+    /// looks: see [`crate::broker`] on why removing `HOME` does not take the agent's ambient
+    /// credentials away.
+    #[serde(default)]
+    pub env_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -209,6 +298,16 @@ impl Config {
         if self.polling.interval_ms == 0 {
             return Err(ConfigError::Invalid("polling.interval_ms must be > 0".into()));
         }
+        // A zero cap would not mean "unlimited", it would refuse the agent's first call and
+        // read as the broker being broken. Anyone wanting that wants `enabled = false`.
+        if self.broker.enabled
+            && (self.broker.max_calls_per_run == 0 || self.broker.max_calls_per_issue == 0)
+        {
+            return Err(ConfigError::Invalid(
+                "broker call budgets must be > 0; use broker.enabled = false to disable tools"
+                    .into(),
+            ));
+        }
         // Overlap makes startup cleanup delete a workspace for an issue about to be dispatched.
         let overlap: Vec<_> = self
             .tracker
@@ -232,6 +331,16 @@ impl Config {
 
     pub fn is_terminal(&self, state_key: &str) -> bool {
         self.tracker.terminal_states.iter().any(|s| s == state_key)
+    }
+
+    /// Every state the operator has named, active or terminal. The broker accepts exactly
+    /// these for `set_state`, so an agent cannot move its ticket somewhere the scheduler has
+    /// no rule for.
+    pub fn known_states(&self) -> Vec<String> {
+        let mut v = self.tracker.active_states.clone();
+        v.extend(self.tracker.terminal_states.iter().cloned());
+        v.dedup();
+        v
     }
 
     pub fn state_limit(&self, state_key: &str) -> usize {
@@ -261,6 +370,8 @@ mod tests {
             workspace: Default::default(),
             agent: Default::default(),
             worker: Default::default(),
+            broker: Default::default(),
+            api: Default::default(),
         };
         c.normalize();
         c

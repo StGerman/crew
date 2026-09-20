@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 
 use crate::clock::{Clock, Wall};
 use crate::model::{ErrorClass, Phase};
@@ -33,12 +34,33 @@ pub struct IssueState {
     pub last_error_class: Option<ErrorClass>,
     pub last_error: Option<String>,
     pub task_ref: Option<String>,
+    /// The conversation continuations for this issue resume into, once one has been named.
+    pub session_id: Option<String>,
 }
 
 impl IssueState {
     pub fn is_quarantined(&self) -> bool {
         self.quarantined_at.is_some()
     }
+}
+
+/// One dispatched run, as the published snapshot carries it.
+///
+/// `ended_at` and `outcome` are `None` while the run is in flight — and stay `None` for a run
+/// whose process was killed with the orchestrator, until the next startup's `recover()` closes
+/// it. The counters are what the run had reported by the time it ended, which is zero for a run
+/// that died with whatever was counting them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunRecord {
+    pub run_id: String,
+    pub issue_id: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub outcome: Option<String>,
+    pub session_id: Option<String>,
+    pub turns: u32,
+    pub in_tok: u64,
+    pub out_tok: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +115,7 @@ impl Store {
         conn.query_row(
             "SELECT issue_id, identifier, worktree_key, phase, attempt, consecutive_fail,
                     last_fail_class, cumulative_turns, miss_count, parked_state, quarantined_at,
-                    last_error_class, last_error, task_ref
+                    last_error_class, last_error, task_ref, session_id
              FROM issue_state WHERE issue_id = ?1",
             params![issue_id],
             Self::row_to_state,
@@ -126,6 +148,7 @@ impl Store {
             last_error_class: last_err_class.as_deref().and_then(ErrorClass::parse),
             last_error: row.get(12)?,
             task_ref: row.get(13)?,
+            session_id: row.get(14)?,
         })
     }
 
@@ -134,11 +157,40 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT issue_id, identifier, worktree_key, phase, attempt, consecutive_fail,
                     last_fail_class, cumulative_turns, miss_count, parked_state, quarantined_at,
-                    last_error_class, last_error, task_ref
+                    last_error_class, last_error, task_ref, session_id
              FROM issue_state ORDER BY identifier",
         )?;
         let rows = stmt.query_map([], Self::row_to_state)?;
         rows.collect()
+    }
+
+    /// Every issue the store currently holds a claim for.
+    ///
+    /// At startup this is the set of runs the *previous* process was executing, because
+    /// nothing else can write the claim: a scheduler releases every claim it holds on the way
+    /// out. Filtering in Rust rather than SQL keeps the column list in one place, and this
+    /// table carries one row per issue ever seen — it is read whole on every tick already.
+    pub fn claimed(&self) -> rusqlite::Result<Vec<IssueState>> {
+        Ok(self.all()?.into_iter().filter(|s| s.phase == Phase::Running).collect())
+    }
+
+    /// Close every still-open run row for an issue, returning how many there were.
+    ///
+    /// A run row opens before the worker exists and closes in `finish_run`. A process killed
+    /// mid-run closes nothing, so the row reads as in-flight forever. Recovery closes it with
+    /// what is actually known — the counters stay zero, because the turns and tokens that run
+    /// spent died with the process that was counting them.
+    pub fn close_open_runs(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        outcome: &str,
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE run SET ended_at = ?2, outcome = ?3 WHERE issue_id = ?1 AND ended_at IS NULL",
+            params![issue_id, clock.wall().0, outcome],
+        )
     }
 
     pub fn set_phase(
@@ -240,16 +292,24 @@ impl Store {
         Ok(quarantine)
     }
 
-    pub fn unquarantine(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<()> {
+    /// Clear a quarantine, reporting whether there was one to clear.
+    ///
+    /// Guarded on `quarantined_at IS NOT NULL` rather than applied unconditionally, because
+    /// this also resets `phase` to `released`: run it against an issue that is *not*
+    /// quarantined and it drops a live claim out from under a running agent, and the next tick
+    /// dispatches a second one onto the same worktree. An operator action that names the wrong
+    /// issue must be a no-op, and the only place that can be decided without a race is here,
+    /// in the same statement that would have done the damage.
+    pub fn unquarantine(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let n = conn.execute(
             "UPDATE issue_state
              SET quarantined_at = NULL, phase = 'released', attempt = 0, consecutive_fail = 0,
                  last_fail_class = NULL, updated_at = ?2
-             WHERE issue_id = ?1",
+             WHERE issue_id = ?1 AND quarantined_at IS NOT NULL",
             params![issue_id, clock.wall().0],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     /// Park an issue in its current tracker state after a `Done` or `Blocked` verdict.
@@ -272,6 +332,25 @@ impl Store {
         conn.execute(
             "UPDATE issue_state SET parked_state = NULL, updated_at = ?2 WHERE issue_id = ?1",
             params![issue_id, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
+    /// Name the conversation this issue's continuations resume into, or clear it.
+    ///
+    /// Clearing is the degradation path: a resume target the CLI no longer knows about fails
+    /// every attempt identically, so the run that discovers it drops the id and the next
+    /// attempt starts fresh instead of retrying its way into quarantine.
+    pub fn set_session(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        session_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET session_id = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, session_id, clock.wall().0],
         )?;
         Ok(())
     }
@@ -371,11 +450,12 @@ impl Store {
         clock: &dyn Clock,
         run_id: &str,
         issue_id: &str,
+        session_id: &str,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO run (run_id, issue_id, started_at) VALUES (?1, ?2, ?3)",
-            params![run_id, issue_id, clock.wall().0],
+            "INSERT INTO run (run_id, issue_id, started_at, session_id) VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, issue_id, clock.wall().0, session_id],
         )?;
         Ok(())
     }
@@ -396,6 +476,38 @@ impl Store {
             params![run_id, clock.wall().0, outcome, turns as i64, in_tok as i64, out_tok as i64],
         )?;
         Ok(())
+    }
+
+    /// The latest runs of every issue, newest first, at most `per_issue` each.
+    ///
+    /// Bounded per issue rather than by a global `LIMIT`: one issue that has been retried
+    /// fifty times would otherwise crowd every other issue's history out of a view that is
+    /// published on every tick.
+    pub fn recent_runs(&self, per_issue: usize) -> rusqlite::Result<Vec<RunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id,
+                    turns, in_tok, out_tok
+             FROM (SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY issue_id ORDER BY started_at DESC, run_id DESC) AS rn
+                   FROM run)
+             WHERE rn <= ?1
+             ORDER BY issue_id, started_at DESC, run_id DESC",
+        )?;
+        let rows = stmt.query_map(params![per_issue as i64], |r| {
+            Ok(RunRecord {
+                run_id: r.get(0)?,
+                issue_id: r.get(1)?,
+                started_at: r.get(2)?,
+                ended_at: r.get(3)?,
+                outcome: r.get(4)?,
+                session_id: r.get(5)?,
+                turns: r.get::<_, i64>(6)? as u32,
+                in_tok: r.get::<_, i64>(7)? as u64,
+                out_tok: r.get::<_, i64>(8)? as u64,
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn token_totals(&self) -> rusqlite::Result<(u64, u64)> {
@@ -465,8 +577,49 @@ mod tests {
         let (s, c) = setup();
         s.record_failure(&c, "id-1", ErrorClass::AuthFailed, "401", 3).unwrap();
         assert!(!s.claim(&c, "id-1").unwrap());
-        s.unquarantine(&c, "id-1").unwrap();
+        assert!(s.unquarantine(&c, "id-1").unwrap(), "clearing a real quarantine reports it");
         assert!(s.claim(&c, "id-1").unwrap());
+    }
+
+    #[test]
+    fn clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim() {
+        // The operator action reachable from the dashboard and the HTTP API. Pointed at an
+        // issue that is merely running, an unguarded version would reset its phase to
+        // `released` — and the next tick would dispatch a second agent onto the same worktree.
+        let (s, c) = setup();
+        assert!(s.claim(&c, "id-1").unwrap());
+
+        assert!(!s.unquarantine(&c, "id-1").unwrap(), "nothing was quarantined; nothing to clear");
+
+        assert_eq!(s.get("id-1").unwrap().unwrap().phase, Phase::Running, "the claim must stand");
+        assert!(!s.claim(&c, "id-1").unwrap(), "and must still be exclusive");
+    }
+
+    #[test]
+    fn run_history_is_newest_first_and_bounded_per_issue() {
+        let (s, c) = setup();
+        s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
+        for n in 1..=4 {
+            c.advance_ms(1_000);
+            s.start_run(&c, &format!("run-1-{n}"), "id-1", "sess-1").unwrap();
+            s.finish_run(&c, &format!("run-1-{n}"), "done", n, 10 * n as u64, n as u64).unwrap();
+        }
+        s.start_run(&c, "run-2-1", "id-2", "sess-2").unwrap();
+
+        let runs = s.recent_runs(2).unwrap();
+        let for_1: Vec<_> = runs.iter().filter(|r| r.issue_id == "id-1").collect();
+        assert_eq!(
+            for_1.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            vec!["run-1-4", "run-1-3"],
+            "the two newest, newest first"
+        );
+        assert_eq!(for_1[0].turns, 4);
+
+        // A busy issue must not crowd out a quiet one's history.
+        let for_2: Vec<_> = runs.iter().filter(|r| r.issue_id == "id-2").collect();
+        assert_eq!(for_2.len(), 1);
+        assert!(for_2[0].ended_at.is_none(), "a run still in flight has no end");
+        assert_eq!(for_2[0].outcome, None);
     }
 
     #[test]
@@ -477,6 +630,46 @@ mod tests {
         assert!(s.due_retries(c.wall()).unwrap().is_empty());
         c.advance_ms(10_000);
         assert_eq!(s.due_retries(c.wall()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_claimed_issues_are_reported_as_claimed() {
+        let (s, c) = setup();
+        s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
+        assert!(s.claimed().unwrap().is_empty(), "nothing is claimed before anything claims it");
+
+        s.claim(&c, "id-1").unwrap();
+        let held: Vec<String> = s.claimed().unwrap().into_iter().map(|x| x.issue_id).collect();
+        assert_eq!(held, vec!["id-1"], "a claim is visible; an untouched issue is not");
+
+        s.release(&c, "id-1").unwrap();
+        assert!(s.claimed().unwrap().is_empty(), "and it stops being visible once released");
+    }
+
+    #[test]
+    fn a_retrying_or_quarantined_issue_is_not_mistaken_for_a_claimed_one() {
+        // Recovery releases every claim it finds, so anything it can see that is merely *queued*
+        // behind a timer would have its retry row deleted out from under it.
+        let (s, c) = setup();
+        s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
+
+        s.schedule_retry(&c, "id-1", Wall(c.wall().0 + 10_000), 1, "backoff").unwrap();
+        s.record_failure(&c, "id-2", ErrorClass::AuthFailed, "401", 3).unwrap();
+
+        assert!(s.claimed().unwrap().is_empty());
+    }
+
+    #[test]
+    fn closing_open_runs_touches_only_the_ones_still_in_flight() {
+        let (s, c) = setup();
+        s.start_run(&c, "run-a", "id-1", "sess-a").unwrap();
+        s.finish_run(&c, "run-a", "done", 3, 10, 20).unwrap();
+        s.start_run(&c, "run-b", "id-1", "sess-b").unwrap();
+
+        // Only the run the kill interrupted; the one that reported for itself keeps its verdict.
+        assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 1);
+        assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 0, "and it is idempotent");
+        assert_eq!(s.token_totals().unwrap(), (10, 20), "a run nobody counted contributes none");
     }
 
     #[test]

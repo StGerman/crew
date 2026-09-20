@@ -2,13 +2,22 @@
 //!
 //! Headless is the default; `--tui` opts into the dashboard. That asymmetry is deliberate —
 //! it keeps the UI a client of the same snapshot an operator could curl, rather than a
-//! privileged view that correctness quietly depends on.
+//! privileged view that correctness quietly depends on. `--api` makes the curl literal: the
+//! same published snapshot, over HTTP, with no second path to the store.
+//!
+//! The loop below is the one place that owns the `Scheduler`, which is why both operator
+//! surfaces reach it the same way — a message on a channel, never a handle. The dashboard's
+//! messages are fire-and-forget; the API's carry a `oneshot` to answer on, because an HTTP
+//! client is owed a response and a keypress is not.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use symphony_cc::api::{Api, Command};
+use symphony_cc::broker::fake::FakeWrites;
+use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
 use symphony_cc::config::Config;
 use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
@@ -38,6 +47,11 @@ struct Args {
     /// Stop after this many ticks. Useful for smoke tests in CI.
     #[arg(long)]
     max_ticks: Option<u64>,
+
+    /// Serve the ops HTTP API on this address, overriding `[api]` in the config. A
+    /// non-loopback address still needs `api.allow_public`.
+    #[arg(long, value_name = "ADDR")]
+    api: Option<String>,
 }
 
 #[tokio::main]
@@ -94,11 +108,14 @@ async fn main() -> anyhow::Result<()> {
     // does not imply a real worker.
     let worker: Arc<dyn Worker> = if use_real_worker {
         let bin = cfg.worker.bin.clone().unwrap_or_else(|| "claude".to_string());
-        Arc::new(ClaudeWorker::new(
-            bin,
-            DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
-            cfg.agent.max_turns_per_session,
-        ))
+        // An operator-supplied list replaces the default outright rather than extending it, so
+        // what reaches the child is exactly what the config says.
+        let env_allowlist = cfg
+            .worker
+            .env_allowlist
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
+        Arc::new(ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session))
     } else {
         let fake = Arc::new(FakeWorker::new(clock.clone()));
         // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
@@ -110,18 +127,30 @@ async fn main() -> anyhow::Result<()> {
         fake
     };
 
-    let tracker: Arc<dyn Tracker> = if use_github_tracker {
+    // One adapter, two traits: the GitHub tracker reads for the scheduler and writes for the
+    // broker over the same credential, which never leaves this process either way.
+    let (tracker, writes): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>) = if use_github_tracker {
         let token = std::env::var("GITHUB_TOKEN")
             .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
-        Arc::new(GithubTracker::new(
+        let gh = Arc::new(GithubTracker::new(
             UreqHttp::default(),
             &cfg.tracker.owner,
             &cfg.tracker.repo,
             &token,
             &cfg.tracker.required_labels,
-        ))
+        ));
+        (gh.clone(), gh)
     } else {
-        Arc::new(FakeTracker::demo())
+        // The demo tracker has nothing to write to, so broker calls are recorded and dropped.
+        // That still exercises the whole path — scoping, budgets, audit — without a network.
+        (Arc::new(FakeTracker::demo()), Arc::new(FakeWrites::new()))
+    };
+
+    let broker = if cfg.broker.enabled {
+        start_broker(&cfg, writes, clock.clone())
+    } else {
+        tracing::info!("broker disabled by config; agents run without tracker tools");
+        None
     };
 
     if use_real_worker && use_github_tracker {
@@ -141,11 +170,38 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let interval_ms = cfg.polling.interval_ms;
+
+    // Read before the config moves into the scheduler; `--api` is an override of it, not a
+    // second source of truth.
+    let mut api_cfg = cfg.api.clone();
+    if let Some(addr) = args.api.clone() {
+        api_cfg.enabled = true;
+        api_cfg.bind = addr;
+    }
+
     let mut sched =
         Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
+    sched.set_broker(broker);
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
     let (act_tx, mut act_rx) = mpsc::unbounded_channel::<UiAction>();
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+
+    // Publish once before anything can observe, so the window between start and the first tick
+    // shows the scheduler's real state rather than `Snapshot::default()` — whose `running 0/0`
+    // reports a concurrency limit this process never had.
+    let _ = snap_tx.send(sched.snapshot()?);
+
+    // Best-effort by contract: the API failing to start costs the API. Dispatch is not the
+    // scheduler's opinion of whether a port was free.
+    if api_cfg.enabled {
+        match symphony_cc::api::bind(&api_cfg).await {
+            Ok(listener) => {
+                tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
+            }
+            Err(e) => tracing::error!(error = %e, "ops API not started; scheduling continues"),
+        }
+    }
 
     let ui = args.tui.then(|| {
         let rx = snap_rx.clone();
@@ -185,9 +241,31 @@ async fn main() -> anyhow::Result<()> {
                         let _ = snap_tx.send(sched.snapshot()?);
                     }
                     UiAction::Unquarantine(id) => {
-                        tracing::info!(issue_id = %id, "operator cleared quarantine");
-                        sched.unquarantine(&id)?;
+                        let cleared = sched.unquarantine(&id)?;
+                        tracing::info!(issue_id = %id, cleared, "operator cleared quarantine");
                         let _ = snap_tx.send(sched.snapshot()?);
+                    }
+                }
+            }
+            Some(command) = cmd_rx.recv() => {
+                // Every arm publishes before it answers, so a client that reads
+                // `GET /snapshot` the instant its POST returns sees the effect it asked for.
+                // A dropped reply channel is an ordinary outcome, not an error: it means the
+                // client went away, and nothing here waits to find out.
+                match command {
+                    Command::Tick(reply) => {
+                        if let Err(e) = sched.tick() { tracing::error!(error = %e, "api tick failed"); }
+                        let snap = sched.snapshot();
+                        if let Ok(s) = &snap { let _ = snap_tx.send(s.clone()); }
+                        let _ = reply.send(snap);
+                    }
+                    Command::Unquarantine { issue_id, reply } => {
+                        let cleared = sched.unquarantine(&issue_id);
+                        if let Ok(c) = &cleared {
+                            tracing::info!(issue_id = %issue_id, cleared = c, "api cleared quarantine");
+                        }
+                        if let Ok(s) = sched.snapshot() { let _ = snap_tx.send(s); }
+                        let _ = reply.send(cleared);
                     }
                 }
             }
@@ -208,6 +286,50 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.join();
     }
     Ok(())
+}
+
+/// Bind the broker's loopback listener and start serving.
+///
+/// Every failure here returns `None` rather than propagating: a broker that cannot start is an
+/// agent without tracker tools, which is a degrade the whole design allows for. Failing startup
+/// over it would turn an optional capability into a required one.
+fn start_broker(
+    cfg: &Config,
+    writes: Arc<dyn TrackerWrites>,
+    clock: Arc<dyn Clock>,
+) -> Option<Arc<Broker>> {
+    let listener = match broker::server::bind() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "broker could not bind; agents run without tracker tools");
+            return None;
+        }
+    };
+    let addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "broker listener has no address; running without tools");
+            return None;
+        }
+    };
+
+    // Per-process, so two orchestrators on one host cannot collide or read each other's tokens.
+    let config_dir = std::env::temp_dir().join(format!("symphony-mcp-{}", std::process::id()));
+    let limits = BrokerLimits {
+        max_calls_per_run: cfg.broker.max_calls_per_run,
+        max_calls_per_issue: cfg.broker.max_calls_per_issue,
+    };
+
+    let broker = match Broker::new(writes, clock, limits, cfg.known_states(), addr, &config_dir) {
+        Ok(b) => Arc::new(b),
+        Err(e) => {
+            tracing::warn!(error = %e, "broker setup failed; agents run without tracker tools");
+            return None;
+        }
+    };
+    broker::server::serve(Arc::clone(&broker), listener);
+    tracing::info!(%addr, states = ?cfg.known_states(), "tool broker listening");
+    Some(broker)
 }
 
 /// Give the demo tracker a spread of behaviours so the dashboard shows every state worth

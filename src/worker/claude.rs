@@ -9,8 +9,9 @@
 //! hangs the run until the stall timeout kills it anyway, which is strictly worse than the
 //! bypass.
 //!
-//! Two things confirmed against a real install (`claude 2.1.268`) rather than assumed, because
-//! guessing them wrong would have meant a worker that silently never worked:
+//! Three things confirmed against a real install (`claude 2.1.268`, and the session handling
+//! below against `2.1.278`) rather than assumed, because guessing them wrong would have meant a
+//! worker that silently never worked:
 //!
 //! * **There is no `--max-turns` flag.** [`AgentConfig::max_turns_per_session`]'s per-session
 //!   turn budget is enforced by this module instead — it counts `assistant` events as they
@@ -23,17 +24,43 @@
 //!   inherits whatever hooks, plugins and MCP servers the operator's own `claude` config
 //!   already has — worth knowing before dispatching against a machine with heavy global hook
 //!   configuration, and worth revisiting once a dedicated API key exists for headless dispatch.
+//! * **`--session-id <uuid>` names a conversation and `--resume <id>` continues it**, both
+//!   working with the prompt on stdin and with `-p`. That is what lets a continuation pick up
+//!   where the last one stopped instead of re-reading the issue from scratch. Three details
+//!   decided the shape of [`Session`]: a resumed session is *not* scoped to the directory it
+//!   was created in, so a worktree moving underneath it is survivable; an id the CLI no longer
+//!   holds is answered with `No conversation found with session ID` and a `result` event
+//!   carrying `is_error: true` and no turns at all, rather than a hang — which is the signal
+//!   the scheduler degrades on; and `--resume` must always be passed *with* an id, because
+//!   bare it opens an interactive picker and there is no human here to answer it.
 //!
 //! [`AgentConfig::max_turns_per_session`]: crate::config::AgentConfig::max_turns_per_session
+//! [`Session`]: crate::worker::Session
+//!
+//! ## Tracker tools
+//!
+//! When the scheduler has a broker session for the run, this worker adds `--mcp-config <path>`
+//! pointing at the file the broker wrote, and names the resulting tools in the prompt — an
+//! agent does not use a tool nobody told it about. The flag goes *last* on the command line on
+//! purpose: the CLI declares `--mcp-config <configs...>` as variadic, so anything non-flag
+//! following it is swallowed as a second config path. (Found the direct way: passing the prompt
+//! as an argument after it made the CLI try to open the prompt text as a file.) The prompt goes
+//! on stdin regardless, so nothing needs to follow it.
+//!
+//! `--strict-mcp-config` is deliberately *not* passed: it would suppress the operator's own MCP
+//! servers, and this repo commits a [`.mcp.json`] that gives every dispatched agent
+//! rust-analyzer. The broker is added to what the operator configured, not substituted for it.
+//!
+//! [`.mcp.json`]: https://github.com/StGerman/symphony-cc/blob/master/.mcp.json
 //!
 //! ## The outcome convention
 //!
 //! `claude -p`'s own terminal `result` event gives exactly one structural verdict: `is_error`.
 //! That is enough to distinguish [`Outcome::Done`] from [`Outcome::Failed`], but this project
 //! also needs [`Outcome::Continue`] (real progress, wants another turn) and
-//! [`Outcome::Blocked`] (stuck, wants a human) — verdicts the CLI has no concept of. Until the
-//! MCP broker (slice 5) gives the agent a tool to report through, the only channel available is
-//! its own final text, so the prompt this worker sends asks the agent to end that text with:
+//! [`Outcome::Blocked`] (stuck, wants a human) — verdicts the CLI has no concept of. The only
+//! channel available is the agent's own final text, so the prompt this worker sends asks the
+//! agent to end that text with:
 //!
 //! ```text
 //! SYMPHONY_OUTCOME: continue: <reason>
@@ -54,12 +81,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use super::{KillResult, Progress, RunHandle, Worker};
+use super::{KillResult, Progress, RunHandle, Session, ToolEndpoint, Worker};
 use crate::model::{ErrorClass, Issue, Outcome};
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
 /// any tracker credential and any API key. An operator on API-key auth adds `ANTHROPIC_API_KEY`
 /// to their own allowlist deliberately; it is not here by default.
+///
+/// `HOME` is here, and dropping it was considered and rejected on evidence rather than taste.
+/// The worry was that it hands the agent ambient credentials — `gh`'s token under
+/// `~/.config/gh`, git's credential helper via `~/.gitconfig`. It does not, because on macOS
+/// those credentials are not under `$HOME` at all: `gh auth token` succeeds with `HOME` unset,
+/// reading the login keychain, which is keyed to the user session. Removing `HOME` would cost
+/// the agent its git identity and its own config while closing off nothing. See
+/// [`crate::broker`]'s module doc for what that means for the broker's security story — the
+/// short version is that the broker is a sanctioned, audited write path, not a sandbox.
+///
+/// Overridable via [`WorkerConfig::env_allowlist`](crate::config::WorkerConfig::env_allowlist)
+/// for an operator who wants a tighter environment anyway.
 pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
@@ -167,8 +206,20 @@ impl RunHandle for ClaudeRun {
 }
 
 impl Worker for ClaudeWorker {
-    fn spawn(&self, issue: &Issue, workspace: &Path, _attempt: u32) -> Arc<dyn RunHandle> {
-        let prompt = build_prompt(issue);
+    fn spawn(
+        &self,
+        issue: &Issue,
+        workspace: &Path,
+        _attempt: u32,
+        session: &Session,
+        tools: Option<&ToolEndpoint>,
+    ) -> Arc<dyn RunHandle> {
+        // `--resume` is passed with an explicit id, never bare: bare opens an interactive
+        // picker, and there is no human here to answer it.
+        let (prompt, flag) = match session {
+            Session::New(_) => (build_prompt(issue, tools), "--session-id"),
+            Session::Resume(_) => (build_continuation_prompt(issue, tools), "--resume"),
+        };
 
         let mut cmd = Command::new(&self.bin);
         cmd.current_dir(workspace)
@@ -186,9 +237,14 @@ impl Worker for ClaudeWorker {
                 "--permission-mode",
                 "bypassPermissions",
             ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .args([flag, session.id()]);
+
+        // Last, and nothing non-flag may follow it: `--mcp-config` is variadic.
+        if let Some(t) = tools {
+            cmd.args([std::ffi::OsStr::new("--mcp-config"), t.config_path.as_os_str()]);
+        }
+
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // A new process group, rooted at this child, so `kill` can signal every descendant
         // `claude` spawns — a wedged grandchild would otherwise hold the worktree open after
@@ -386,7 +442,31 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn build_prompt(issue: &Issue) -> String {
+/// The prompt for an attempt that resumes an existing conversation.
+///
+/// It deliberately omits the issue body and most of the contract: the session being resumed
+/// already holds both, and re-sending them spends the turn budget on what the agent is about to
+/// re-read anyway. What it adds is the one thing the agent cannot see from inside — that the
+/// previous session ended without the work being finished.
+fn build_continuation_prompt(issue: &Issue, tools: Option<&ToolEndpoint>) -> String {
+    let mut p = format!(
+        "Continue working on {}. Your previous session on this issue ended before the work was \
+         finished — either you asked for another turn, or the orchestrator's per-session turn \
+         budget stopped you. The working directory is the same worktree, with whatever you \
+         committed still in it. Pick up where you left off.\n\n\
+         The same rules apply: commit as you go, and when the work is fully complete, simply \
+         stop. If you need another turn, end your final message with a line reading \
+         exactly:\n\
+         SYMPHONY_OUTCOME: continue: <one-sentence reason>\n\n\
+         If you are stuck and need a human to unblock you, end with:\n\
+         SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
+        issue.identifier
+    );
+    p.push_str(&tool_help(tools));
+    p
+}
+
+fn build_prompt(issue: &Issue, tools: Option<&ToolEndpoint>) -> String {
     let mut p = format!("You are working on issue {}: {}\n\n", issue.identifier, issue.title);
     if let Some(url) = &issue.url {
         p.push_str(&format!("Tracker URL: {url}\n\n"));
@@ -405,7 +485,41 @@ fn build_prompt(issue: &Issue) -> String {
          If you are stuck and need a human to unblock you, end your final message with:\n\
          SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
     );
+    p.push_str(&tool_help(tools));
     p
+}
+
+/// Names the broker's tools in the prompt.
+///
+/// Without this the tools are wired up and never called: they arrive in the tool list as
+/// `mcp__symphony__*` among everything else the operator's config provides, with nothing to say
+/// they are the sanctioned way to touch the ticket. Saying so is also the only lever there is
+/// against the agent reaching for ambient `gh` instead — see [`crate::broker`] on why that
+/// remains possible and why this is persuasion rather than enforcement.
+fn tool_help(tools: Option<&ToolEndpoint>) -> String {
+    let Some(t) = tools else { return String::new() };
+
+    let mut s = String::from(
+        "\nTracker tools are available for this issue. The orchestrator performs each write and \
+         holds the credential, so prefer these over `gh` or any other tracker CLI:\n",
+    );
+    for tool in &t.tools {
+        let what = match tool.as_str() {
+            "comment" => "post a comment on this issue",
+            "set_state" => {
+                "move this issue to another workflow state (it ends your run if the \
+                            state is terminal, so do it last)"
+            }
+            "link_pr" => "link a pull request to this issue",
+            _ => continue,
+        };
+        s.push_str(&format!("  {} — {what}\n", t.qualified(tool)));
+    }
+    s.push_str(
+        "They act on the issue you were dispatched for and take no issue id. If one fails, the \
+         failure is yours to work around, not a reason to stop.\n",
+    );
+    s
 }
 
 #[cfg(test)]
@@ -427,6 +541,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// A fresh conversation name. These tests drive fixture scripts standing in for `claude`,
+    /// which ignore the flag; what matters is that the call shape is the real one.
+    fn fresh_session() -> Session {
+        Session::New("11111111-1111-4111-8111-111111111111".into())
     }
 
     fn issue() -> Issue {
@@ -466,7 +586,7 @@ mod tests {
     fn a_clean_done_stream_reports_done_and_matches_reported_tokens() {
         let ws = tmp_workspace("done");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let p = h.progress();
@@ -481,7 +601,7 @@ mod tests {
     fn a_symphony_outcome_continue_marker_is_parsed_from_the_final_text() {
         let ws = tmp_workspace("continue");
         let w = ClaudeWorker::new(fixture("explicit_continue.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -495,7 +615,7 @@ mod tests {
     fn a_crash_with_no_result_event_fails_rather_than_hanging_or_inferring_done() {
         let ws = tmp_workspace("crash");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
 
         let outcome = wait_for_finish(&h);
         assert!(
@@ -510,7 +630,7 @@ mod tests {
     fn a_partial_trailing_line_is_skipped_not_fatal_to_the_supervisor() {
         let ws = tmp_workspace("partial");
         let w = ClaudeWorker::new(fixture("partial_trailing_line.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
 
         // The point under test is that a malformed final line does not panic or hang the
         // reader thread — it still reaches a verdict (Failed, since no result event arrived).
@@ -524,7 +644,7 @@ mod tests {
     fn killing_a_process_that_ignores_sigterm_forces_it_and_it_is_actually_gone() {
         let ws = tmp_workspace("silence");
         let w = ClaudeWorker::new(fixture("silence.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
 
         // Give the script time to install its SIGTERM trap and write its own pid before we
         // try to kill it.
@@ -551,6 +671,35 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_session_is_named_on_the_command_line_and_a_continuation_resumes_it_by_id() {
+        // The two halves are one decision: `--session-id` is what makes the conversation
+        // findable later, and `--resume <id>` is the only reason naming it was worth doing.
+        for (session, flag) in [
+            (Session::New("a1b2c3d4-0000-4000-8000-000000000001".into()), "--session-id"),
+            (Session::Resume("a1b2c3d4-0000-4000-8000-000000000002".into()), "--resume"),
+        ] {
+            let ws = tmp_workspace(flag.trim_start_matches('-'));
+            let w = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
+            let h = w.spawn(&issue(), &ws, 0, &session, None);
+            wait_for_finish(&h);
+
+            let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
+            let argv: Vec<&str> = dump.lines().collect();
+            let at = argv
+                .iter()
+                .position(|a| *a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing from {argv:?}"));
+            assert_eq!(
+                argv.get(at + 1).copied(),
+                Some(session.id()),
+                "{flag} must carry the id explicitly — bare `--resume` opens an interactive \
+                 picker, and there is no human here to answer it"
+            );
+            std::fs::remove_dir_all(&ws).ok();
+        }
+    }
+
+    #[test]
     fn no_tracker_credential_reaches_the_child_environment() {
         let ws = tmp_workspace("env-leak");
         // SAFETY: a unique key nothing else reads or writes, scoped to this one test.
@@ -559,7 +708,7 @@ mod tests {
         }
 
         let w = ClaudeWorker::new(fixture("dump_env.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
         wait_for_finish(&h);
 
         let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
@@ -579,7 +728,7 @@ mod tests {
         // first and report Continue rather than waiting for (or trusting) the CLI's own exit.
         let ws = tmp_workspace("budget");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 1);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -593,7 +742,7 @@ mod tests {
     fn a_missing_binary_reports_agent_not_found_immediately() {
         let ws = tmp_workspace("missing-bin");
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
 
         let outcome = wait_for_finish(&h);
         assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }));

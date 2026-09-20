@@ -1,0 +1,12 @@
+# The toolchain pin, so that "it compiles" means the same thing on CI, on the dev machine and
+# in every dispatched worktree. The crate is edition 2024 and uses let-chains, so it needs
+# >= 1.85; this is the version the work was actually done on.
+#
+# Only rustup reads this file. A toolchain installed another way ignores it silently -- which
+# includes the Homebrew `rust` this dev machine runs today, so locally the pin is inert until
+# someone installs rustup. Worth knowing before concluding a CI/local disagreement is
+# impossible: on CI the pin is real, here it is aspirational.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

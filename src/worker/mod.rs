@@ -7,9 +7,33 @@
 pub mod claude;
 pub mod fake;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::model::{Issue, Outcome};
+
+/// Where this run's host-side tool broker is, when there is one.
+///
+/// Carries a path rather than a URL because the token inside it is a secret: a `--mcp-config`
+/// file (mode 0600, written and owned by the broker) keeps it out of `argv`, where any process
+/// on the host could read it out of `ps`. The worker never parses this — it hands the path to
+/// the CLI and names the tools in its prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolEndpoint {
+    /// MCP server name. Tools reach the agent as `mcp__<server>__<tool>`.
+    pub server: String,
+    /// A `--mcp-config` file carrying this run's own endpoint and bearer token.
+    pub config_path: PathBuf,
+    /// Tool names, for the prompt. The agent will not use a tool it was not told about.
+    pub tools: Vec<String>,
+}
+
+impl ToolEndpoint {
+    /// The name the agent actually sees, which is not the bare tool name.
+    pub fn qualified(&self, tool: &str) -> String {
+        format!("mcp__{}__{}", self.server, tool)
+    }
+}
 
 /// Progress reported while a run is in flight. Drives stall detection and the dashboard.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -18,6 +42,31 @@ pub struct Progress {
     pub in_tok: u64,
     pub out_tok: u64,
     pub last_event: Option<String>,
+}
+
+/// Which conversation an attempt runs in.
+///
+/// The scheduler names it before the process exists, the same ordering as claim-before-spawn:
+/// a worker that reported its own id back afterwards would leave a window in which a run that
+/// died early could never be resumed, because nothing outside it ever learned the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Session {
+    /// Start a fresh conversation under this id.
+    New(String),
+    /// Continue the conversation already recorded under this id.
+    Resume(String),
+}
+
+impl Session {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::New(id) | Self::Resume(id) => id,
+        }
+    }
+
+    pub fn is_resume(&self) -> bool {
+        matches!(self, Self::Resume(_))
+    }
 }
 
 /// A run in flight. Dropping the handle does not stop the work — call [`RunHandle::kill`].
@@ -44,6 +93,15 @@ pub enum KillResult {
 }
 
 pub trait Worker: Send + Sync {
-    fn spawn(&self, issue: &Issue, workspace: &std::path::Path, attempt: u32)
-    -> Arc<dyn RunHandle>;
+    /// `tools` is `None` when the broker is unavailable. That is a degrade, not an error: the
+    /// run proceeds without tracker tools rather than failing, so a broker that cannot bind
+    /// costs the agent a capability and nothing else.
+    fn spawn(
+        &self,
+        issue: &Issue,
+        workspace: &std::path::Path,
+        attempt: u32,
+        session: &Session,
+        tools: Option<&ToolEndpoint>,
+    ) -> Arc<dyn RunHandle>;
 }

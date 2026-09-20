@@ -5,6 +5,8 @@
 //! integration layers. Every external effect is a trait so the scheduler can be tested with
 //! fakes, on a fake clock, with no sleeps and no tokens spent.
 
+pub mod api;
+pub mod broker;
 pub mod clock;
 pub mod config;
 pub mod model;

@@ -33,3 +33,21 @@ max_retry_backoff_ms = 60000
 stall_timeout_ms = 15000
 quarantine_after_identical = 3
 refresh_miss_grace = 2
+
+# Host-side tracker tools. These writes are real: comments land on the issue, and `set_state`
+# rewrites its `state:*` label and open/closed flag. The credential stays in this process — the
+# agent gets a per-run token scoped to the one issue it was dispatched for, and never a token
+# for GitHub itself.
+#
+# `set_state` costs three requests (read labels, replace labels, set the flag) against the
+# rate-limit budget in src/tracker/github.rs's module doc, so it is worth keeping the per-run
+# cap tight enough that a confused agent cannot spend the poll budget on label churn.
+[broker]
+enabled = true
+max_calls_per_run = 10
+max_calls_per_issue = 40
+# Inspect a headless run without attaching a terminal:
+#   curl -s localhost:8787/api/v1/snapshot | jq '.rows[] | {identifier, phase, turns}'
+[api]
+enabled = false
+bind = "127.0.0.1:8787"

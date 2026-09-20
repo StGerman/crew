@@ -46,6 +46,14 @@ const MIGRATIONS: &[&str] = &[
       reason   TEXT
     );
     "#,
+    // v2
+    r#"
+    -- The conversation an issue's work is happening in. A continuation resumes it instead of
+    -- starting cold. Nullable in both directions that matter: an issue that has never been
+    -- dispatched has no session yet, and a run that proves its session unresumable clears the
+    -- column rather than retrying into the same dead id.
+    ALTER TABLE issue_state ADD COLUMN session_id TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

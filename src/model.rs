@@ -48,13 +48,23 @@ impl Issue {
 }
 
 /// The orchestrator's claim state for an issue. Distinct from tracker state.
+///
+/// The serde spelling is pinned to [`Phase::label`], which is also what the store writes into
+/// its `phase` column and what the dashboard prints. One word per phase everywhere it is
+/// visible means an operator reading the HTTP API, the database and the TUI side by side never
+/// has to translate between three vocabularies for the same thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Phase {
+    #[serde(rename = "queued")]
     Queued,
+    #[serde(rename = "running")]
     Running,
+    #[serde(rename = "retry")]
     RetryQueued,
+    #[serde(rename = "quarantine")]
     Quarantined,
     #[default]
+    #[serde(rename = "released")]
     Released,
 }
 
@@ -192,9 +202,55 @@ pub fn worktree_key(issue_id: &str, identifier: &str) -> String {
     format!("{stem}-{suffix}")
 }
 
+/// A UUID-shaped name for a `claude` conversation, derived rather than random so this crate
+/// keeps its dependency surface: blake3 is already here for [`worktree_key`], and the CLI only
+/// needs this to parse as a UUID.
+///
+/// `stamp` is what makes it unique per dispatch rather than per issue. An issue can be worked
+/// more than once, and reusing a name the CLI still holds a conversation under would collide
+/// with it rather than start something new.
+pub fn session_id(issue_id: &str, stamp: i64) -> String {
+    let mut b = *blake3::hash(format!("{issue_id}:{stamp}").as_bytes()).as_bytes();
+    // Version 4 and the RFC 4122 variant: the two fields a UUID parser actually checks.
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b[..16].iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_id_is_uuid_shaped_and_never_repeats_across_dispatches() {
+        let a = session_id("iss-1", 1_000);
+        assert_eq!(a.len(), 36);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{a} is not hex");
+        assert!(parts[2].starts_with('4'), "{a} is not version 4");
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "{a} does not carry the RFC 4122 variant"
+        );
+
+        // A second dispatch of the same issue must not land on the name the first one is
+        // already using.
+        assert_ne!(a, session_id("iss-1", 1_001));
+        assert_ne!(a, session_id("iss-2", 1_000));
+    }
+
+    #[test]
+    fn a_phase_serialises_to_the_one_word_the_store_and_the_dashboard_use() {
+        for p in
+            [Phase::Queued, Phase::Running, Phase::RetryQueued, Phase::Quarantined, Phase::Released]
+        {
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.label()), "serde and label disagree for {p:?}");
+            assert_eq!(serde_json::from_str::<Phase>(&json).unwrap(), p);
+        }
+    }
 
     #[test]
     fn every_error_class_is_classified_and_round_trips() {

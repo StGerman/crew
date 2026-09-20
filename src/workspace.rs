@@ -28,6 +28,10 @@ pub struct Prepared {
     pub path: PathBuf,
     /// True only when this call created the directory. Gates first-time setup.
     pub created_now: bool,
+    /// The branch this run's commits land on, for impls that have one. It is the only durable
+    /// artifact a dispatched run leaves behind — the worktree directory is scratch space — so
+    /// it is reported upwards rather than kept private to the impl.
+    pub branch: Option<String>,
 }
 
 pub trait Workspace: Send + Sync {
@@ -91,7 +95,7 @@ impl Workspace for DirWorkspace {
         let created_now = !path.exists();
         std::fs::create_dir_all(&path)
             .map_err(|source| WorkspaceError::Io { path: path.clone(), source })?;
-        Ok(Prepared { path, created_now })
+        Ok(Prepared { path, created_now, branch: None })
     }
 
     fn remove(&self, issue_id: &str, identifier: &str) -> Result<(), WorkspaceError> {
@@ -114,6 +118,11 @@ impl Workspace for DirWorkspace {
 /// untracked scratch file, and nothing upstream of this type inspects worktree contents before
 /// asking for cleanup. An agent that wants work preserved has to commit it; that is the only
 /// signal this type can see.
+///
+/// **Committed work survives it.** The branch outlives the worktree whenever it carries commits
+/// `repo`'s HEAD does not already have. Cleanup is driven by a ticket reaching a terminal state,
+/// and closing a ticket is not a decision to discard the run's output — so the directory goes
+/// and the branch stays.
 pub struct GitWorktreeWorkspace {
     root: PathBuf,
     repo: PathBuf,
@@ -172,13 +181,31 @@ impl GitWorktreeWorkspace {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Namespaced under `symphony/` and keyed off the dispatch id (not the identifier), so two
-    /// issues that happen to share an identifier — the case `worktree_key` exists to handle —
-    /// get two distinct branches as well as two distinct directories.
-    fn branch_for(issue_id: &str) -> String {
-        let digest = blake3::hash(issue_id.as_bytes());
-        let suffix: String = digest.to_hex().chars().take(12).collect();
-        format!("symphony/{suffix}")
+    /// Namespaced under `symphony/` and named after the same key as the directory, so the
+    /// branch holding a finished run's work can be found from the issue identifier by eye
+    /// rather than by recomputing a hash. `worktree_key` already keys off the dispatch id, so
+    /// two issues that happen to share an identifier still get two distinct branches.
+    ///
+    /// Dots are dropped even though the directory name keeps them: `a..b` is a legal directory
+    /// and an illegal ref, and a hostile identifier reaches both.
+    fn branch_for(issue_id: &str, identifier: &str) -> String {
+        let key: String = worktree_key(issue_id, identifier)
+            .chars()
+            .map(|c| if c == '.' { '_' } else { c })
+            .collect();
+        format!("symphony/{key}")
+    }
+
+    /// True when `branch` exists and holds commits `repo`'s HEAD does not already contain.
+    ///
+    /// `merge-base --is-ancestor` exits non-zero both for a branch that is ahead and for one
+    /// that does not exist, so existence is established first rather than inferred from it.
+    fn branch_carries_work(repo: &Path, branch: &str) -> bool {
+        let full = format!("refs/heads/{branch}");
+        if Self::git(repo, &["rev-parse", "--verify", "--quiet", &full]).is_err() {
+            return false;
+        }
+        Self::git(repo, &["merge-base", "--is-ancestor", branch, "HEAD"]).is_err()
     }
 
     fn is_worktree_checkout(path: &Path) -> bool {
@@ -200,19 +227,26 @@ impl Workspace for GitWorktreeWorkspace {
         // treat a leftover plain directory — e.g. from a `DirWorkspace` deployment migrating to
         // this type, or any other stray write to the workspace root — as an already-prepared
         // worktree, when nothing ever registered it with git.
+        let branch = Self::branch_for(issue_id, identifier);
         if Self::is_worktree_checkout(&path) {
-            return Ok(Prepared { path, created_now: false });
+            return Ok(Prepared { path, created_now: false, branch: Some(branch) });
         }
 
-        let branch = Self::branch_for(issue_id);
         let path_str = path.to_string_lossy().into_owned();
-        // `-B` rather than `-b`: force-creates or resets the branch, so a previous run that
-        // created the branch but crashed before deleting it does not turn every future
-        // `prepare` for this issue into a permanent "branch already exists" failure. If `path`
-        // exists but is not a worktree checkout, git itself refuses with a clear error rather
-        // than this type guessing at what to do with foreign state.
-        Self::git(&self.repo, &["worktree", "add", "-B", &branch, &path_str])?;
-        Ok(Prepared { path, created_now: true })
+        // A branch left behind by an earlier run holds that run's commits, so this attaches to
+        // it rather than resetting it — otherwise a re-dispatch after `Done`, or a crash
+        // between `prepare` and `remove`, would throw the agent's work away. `-B` stays the
+        // path for a branch carrying nothing HEAD does not already have, so a run that crashed
+        // before committing anything still cannot turn every future `prepare` for this issue
+        // into a permanent "branch already exists" failure. If `path` exists but is not a
+        // worktree checkout, git itself refuses with a clear error rather than this type
+        // guessing at what to do with foreign state.
+        if Self::branch_carries_work(&self.repo, &branch) {
+            Self::git(&self.repo, &["worktree", "add", &path_str, &branch])?;
+        } else {
+            Self::git(&self.repo, &["worktree", "add", "-B", &branch, &path_str])?;
+        }
+        Ok(Prepared { path, created_now: true, branch: Some(branch) })
     }
 
     fn remove(&self, issue_id: &str, identifier: &str) -> Result<(), WorkspaceError> {
@@ -226,10 +260,16 @@ impl Workspace for GitWorktreeWorkspace {
         let path_str = path.to_string_lossy().into_owned();
         Self::git(&self.repo, &["worktree", "remove", "--force", &path_str])?;
 
-        // Best-effort: a branch that was already deleted, or never created because `prepare`
-        // failed before reaching it, must not turn a successful worktree removal into an error.
-        let branch = Self::branch_for(issue_id);
-        let _ = Self::git(&self.repo, &["branch", "-D", &branch]);
+        // `-d` rather than `-D`: git's own merged check is the test for whether this branch
+        // still holds the run's work. One carrying nothing HEAD does not already have is
+        // deleted exactly as before, so an issue that produced no commit leaves no litter; one
+        // carrying commits outlives its worktree.
+        //
+        // Best-effort either way: a branch that was already deleted, or never created because
+        // `prepare` failed before reaching it, must not turn a successful worktree removal into
+        // an error.
+        let branch = Self::branch_for(issue_id, identifier);
+        let _ = Self::git(&self.repo, &["branch", "-d", &branch]);
         Ok(())
     }
 }
@@ -425,7 +465,7 @@ mod tests {
 
         let p = ws.prepare("id-1", "MT-1").unwrap().path;
         std::fs::write(p.join("scratch.txt"), b"never committed").unwrap();
-        let branch = GitWorktreeWorkspace::branch_for("id-1");
+        let branch = GitWorktreeWorkspace::branch_for("id-1", "MT-1");
         assert!(branch_exists(&repo, &branch));
 
         ws.remove("id-1", "MT-1").unwrap();
@@ -459,6 +499,118 @@ mod tests {
             assert!(p.path.starts_with(ws.root()), "{bad} escaped the root: {}", p.path.display());
             assert_eq!(p.path.parent().unwrap(), ws.root(), "must be exactly one level deep");
         }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Commit a file inside a worktree, standing in for what a dispatched agent leaves behind.
+    /// Identity comes from the repo-local config `tmp_repo` set; worktrees share it.
+    fn commit_in(worktree: &Path, file: &str, msg: &str) {
+        std::fs::write(worktree.join(file), msg.as_bytes()).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(worktree).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["add", file]);
+        git(&["commit", "-q", "-m", msg]);
+    }
+
+    fn head_of(worktree: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with() {
+        // Cleanup fires when a ticket reaches a terminal state. Closing a ticket an agent
+        // already worked must not be what destroys the commits that work produced.
+        let root = tmp_root("wt-keep-branch");
+        let repo = tmp_repo("wt-keep-branch");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        commit_in(&p, "work.txt", "the agent output");
+        let branch = GitWorktreeWorkspace::branch_for("id-1", "MT-1");
+
+        ws.remove("id-1", "MT-1").unwrap();
+
+        assert!(!p.exists(), "the directory is scratch space and still goes");
+        assert!(branch_exists(&repo, &branch), "the run's commits must survive cleanup");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn re_preparing_an_issue_does_not_reset_a_branch_that_holds_work() {
+        // `-B` is what makes a crashed `prepare` recoverable, and it is also a force-reset:
+        // applied to a branch a finished run already committed to, it discards that run.
+        let root = tmp_root("wt-no-reset");
+        let repo = tmp_repo("wt-no-reset");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let first = ws.prepare("id-1", "MT-1").unwrap().path;
+        commit_in(&first, "work.txt", "the agent output");
+        let committed = head_of(&first);
+        ws.remove("id-1", "MT-1").unwrap();
+
+        let again = ws.prepare("id-1", "MT-1").unwrap();
+        assert!(again.path.join("work.txt").exists(), "the earlier run's file must come back");
+        assert_eq!(head_of(&again.path), committed, "the branch must not have been reset");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_prepared_worktree_reports_the_branch_its_work_will_land_on() {
+        let root = tmp_root("wt-report-branch");
+        let repo = tmp_repo("wt-report-branch");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let fresh = ws.prepare("id-1", "MT-1").unwrap();
+        let reused = ws.prepare("id-1", "MT-1").unwrap();
+        let named = fresh.branch.as_deref().expect("a git worktree always has a branch");
+        assert!(named.starts_with("symphony/MT-1-"), "{named} does not name its issue");
+        assert_eq!(fresh.branch, reused.branch, "reuse reports the same branch as creation");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_branch_names_the_issue_whose_work_it_holds() {
+        // Finding a finished run's output must not mean recomputing a hash by hand.
+        let branch = GitWorktreeWorkspace::branch_for("id-1", "MT-1");
+        assert!(branch.starts_with("symphony/MT-1-"), "{branch} does not name its issue");
+        assert_ne!(
+            branch,
+            GitWorktreeWorkspace::branch_for("id-2", "MT-1"),
+            "two issues sharing an identifier still need distinct branches"
+        );
+    }
+
+    #[test]
+    fn a_hostile_identifier_cannot_produce_a_branch_git_refuses() {
+        // The identifier reaches the ref namespace now, not just the filesystem, and git's
+        // rules there are not the filesystem's: `..`, a trailing `.lock`, a bare `@`.
+        let root = tmp_root("wt-branch-refs");
+        let repo = tmp_repo("wt-branch-refs");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        for (i, bad) in ["..", "a..b", "x.lock", "@", "-dash", "a/../b"].iter().enumerate() {
+            let id = format!("id-{i}");
+            ws.prepare(&id, bad).expect("a hostile identifier must not fail preparation");
+            let branch = GitWorktreeWorkspace::branch_for(&id, bad);
+            assert!(branch_exists(&repo, &branch), "git refused the branch name {branch}");
+        }
+
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
     }

@@ -13,17 +13,28 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::broker::{Broker, BrokerSession};
+use serde::Serialize;
+
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
-use crate::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
+use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
-use crate::store::Store;
+use crate::store::{RunRecord, Store};
 use crate::tracker::{Tracker, TrackerError};
-use crate::worker::{Progress, RunHandle, Worker};
+use crate::worker::{Progress, RunHandle, Session, Worker};
 use crate::workspace::Workspace;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
 const KILL_GRACE_MS: u64 = 10_000;
+
+/// How much of an issue's run history the snapshot carries.
+///
+/// Deep enough to read a retry pattern — the same failure three times over, or a continuation
+/// that keeps coming back — and shallow enough that a view rebuilt on every tick stays cheap.
+/// An operator who needs more than this is asking a question for the database, not the
+/// dashboard.
+const RUNS_PER_ISSUE: usize = 5;
 
 /// A tracker failure never stops the tick — every call site here already returns `Ok(())` and
 /// tries again next poll — but a permanent one (a bad credential, most likely) will not
@@ -48,9 +59,14 @@ struct Running {
     last_progress_at: Mono,
     /// Tracker state when this run began, to tell real progress from spinning.
     state_at_start: String,
+    /// This run's authority to write to the tracker, held for exactly as long as the run is in
+    /// the `running` map. Never read — dropping it is the point. Every path that ends a run
+    /// removes the entry, so every path revokes the token and deletes the config file without
+    /// having to remember to.
+    _broker: Option<BrokerSession>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Row {
     pub issue_id: String,
     pub identifier: String,
@@ -68,11 +84,18 @@ pub struct Row {
     pub last_error: Option<String>,
     pub last_event: Option<String>,
     pub workspace: Option<String>,
+    /// This issue's most recent runs, newest first, at most [`RUNS_PER_ISSUE`].
+    pub runs: Vec<RunRecord>,
 }
 
-/// Immutable view published to the UI. The TUI renders this and never touches the store,
-/// which is what keeps the dashboard from becoming load-bearing.
-#[derive(Debug, Clone, Default)]
+/// Immutable view published to observers. The TUI renders this and never touches the store,
+/// and neither does the HTTP API ([`crate::api`]), which is what keeps either from becoming
+/// load-bearing.
+///
+/// It follows that this type is the *whole* published view: an observer that needs something
+/// it does not carry does not get a `Store`, it gets a new field here. That is why run history
+/// lives on [`Row`] rather than being read back out of the database by whoever wants it.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub generated_at: i64,
     pub rows: Vec<Row>,
@@ -95,11 +118,16 @@ pub struct Scheduler {
     worker: Arc<dyn Worker>,
     workspace: Arc<dyn Workspace>,
     projector: Arc<dyn Projector>,
+    /// `None` when the broker could not start, or the operator turned it off. Dispatch carries
+    /// on either way — an agent without tracker tools is a degrade, not a failure.
+    broker: Option<Arc<Broker>>,
     running: HashMap<String, Running>,
     /// Latest issue snapshot seen for each id, for display and routing checks.
     seen: HashMap<String, Issue>,
     /// Consecutive `Continue` verdicts with no tracker state change, per issue.
     no_progress: HashMap<String, u32>,
+    /// Whether startup reconciliation has run. See [`Scheduler::recover`].
+    recovered: bool,
     ticks: u64,
     last_error: Option<String>,
 }
@@ -123,12 +151,26 @@ impl Scheduler {
             worker,
             workspace,
             projector,
+            broker: None,
             running: HashMap::new(),
             seen: HashMap::new(),
             no_progress: HashMap::new(),
+            recovered: false,
             ticks: 0,
             last_error: None,
         }
+    }
+
+    /// Attach a tool broker.
+    ///
+    /// A setter rather than a ninth constructor argument: it is optional by nature, and every
+    /// existing caller — the scheduler's whole test suite included — is correct without it.
+    pub fn set_broker(&mut self, broker: Option<Arc<Broker>>) {
+        self.broker = broker;
+    }
+
+    pub fn broker(&self) -> Option<&Arc<Broker>> {
+        self.broker.as_ref()
     }
 
     pub fn running_count(&self) -> usize {
@@ -145,6 +187,14 @@ impl Scheduler {
         self.ticks += 1;
         self.last_error = None;
 
+        // Once, ahead of everything else — including the config gate, because a stranded claim
+        // must not stay stranded behind a typo in the config. Living here rather than in
+        // `main` is deliberate: recovery that a second entry point can forget to call is
+        // recovery that silently does not happen, which is the failure this exists to fix.
+        if !self.recovered {
+            self.recover()?;
+        }
+
         // Unconditional: in-flight runs are reconciled even when config is broken.
         self.harvest_finished()?;
         self.detect_stalls()?;
@@ -160,6 +210,88 @@ impl Scheduler {
         self.dispatch_due_retries()?;
         self.dispatch_new()?;
         self.publish()?;
+        Ok(())
+    }
+
+    // ---- startup recovery ----------------------------------------------------
+
+    /// Release the claims of runs that did not survive the previous process.
+    ///
+    /// `running` is in-memory and the claim is in the store, so the two can only disagree
+    /// across a process boundary. Every ordinary exit reconciles them — `shutdown()`, `Drop for
+    /// Scheduler`, the interrupt arm in `main` — and a `SIGKILL`, an OOM kill or a host reboot
+    /// reaches none of those. What is left afterwards is an issue marked `running` in a
+    /// database with nothing running: [`Store::claim`] refuses it forever, `detect_stalls`
+    /// iterates `running` and never sees it, and no retry row exists to bring it back. The
+    /// issue silently stops being picked up, with no log line marking the moment it did.
+    ///
+    /// That inverts the store's contract. Losing `symphony.db` degrades to stateless
+    /// re-polling; *keeping* it across a hard kill is what produces incorrect behaviour.
+    ///
+    /// Adopting the work is not on the table — the agent went down with its parent and there is
+    /// no handle left to supervise it through — so the claim is released and the worktree
+    /// reconciled, which leaves the issue to be dispatched again from its branch.
+    ///
+    /// The conversation is not dropped with the claim. `release` leaves `session_id` alone, so
+    /// the re-dispatch resumes what the killed agent was part-way through rather than
+    /// re-orienting from cold; a name the CLI no longer holds still degrades through the
+    /// zero-turn path that exists for exactly that.
+    pub fn recover(&mut self) -> anyhow::Result<()> {
+        self.recovered = true;
+
+        // A claim matched by a live run is not stale. Nothing has populated `running` before
+        // the first tick, so this filter is a no-op on the startup path it exists for; it is
+        // what makes the method safe to call at any other point rather than only once.
+        let stale: Vec<_> = self
+            .store
+            .claimed()?
+            .into_iter()
+            .filter(|s| !self.running.contains_key(&s.issue_id))
+            .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            count = stale.len(),
+            "claims held with no live run to match them; the last process did not exit cleanly"
+        );
+
+        for st in stale {
+            let open_runs =
+                self.store.close_open_runs(self.clock.as_ref(), &st.issue_id, "orphaned")?;
+
+            // Removed rather than reused: a directory a kill caught mid-write is in whatever
+            // half-applied state it was in at the time, and `git worktree prune` cannot
+            // reconcile it because the directory itself still exists. The commits are not in
+            // the directory — `Workspace::remove` deletes the branch only when git's own merged
+            // check says it carries nothing HEAD already has, so a killed run's work survives
+            // this and the next `prepare` attaches straight back to it.
+            let workspace_removed = match self.workspace.remove(&st.issue_id, &st.identifier) {
+                Ok(()) => true,
+                Err(e) => {
+                    // Not fatal, deliberately. A worktree that cannot be removed must not be
+                    // what keeps the claim held, or this would reproduce the bug it fixes.
+                    tracing::warn!(
+                        issue_id = %st.issue_id, error = %e,
+                        "orphaned workspace cleanup failed; releasing the claim anyway"
+                    );
+                    false
+                }
+            };
+
+            // Released last. A second kill part-way through leaves the claim in place, so the
+            // next startup sees the issue again and retries the cleanup; releasing first would
+            // discard the only record that this issue still has a worktree to reconcile.
+            self.store.release(self.clock.as_ref(), &st.issue_id)?;
+
+            tracing::warn!(
+                issue_id = %st.issue_id,
+                identifier = %st.identifier,
+                open_runs,
+                workspace_removed,
+                "recovered a claim stranded by a hard kill; the issue is dispatchable again"
+            );
+        }
         Ok(())
     }
 
@@ -261,6 +393,17 @@ impl Scheduler {
             }
             Outcome::Failed { class, msg } => {
                 tracing::warn!(issue_id, class = class.as_str(), msg, "run failed");
+
+                // A run that never took a turn established nothing worth resuming into — and if
+                // it was resuming, its target is the likeliest reason it produced nothing at
+                // all: the CLI answers a name it no longer holds with "No conversation found
+                // with session ID" and exits. Dropping the name here is what keeps a dead
+                // session from failing every retry identically, straight into quarantine.
+                if r.handle.progress().turns == 0 {
+                    tracing::info!(issue_id, "run took no turns; dropping its session name");
+                    self.store.set_session(self.clock.as_ref(), issue_id, None)?;
+                }
+
                 let quarantined = self.store.record_failure(
                     self.clock.as_ref(),
                     issue_id,
@@ -624,18 +767,58 @@ impl Scheduler {
         };
 
         let run_id = format!("{}-{}", issue.id, self.clock.wall().0);
-        self.store.start_run(self.clock.as_ref(), &run_id, &issue.id)?;
 
-        let handle = self.worker.spawn(issue, &prepared.path, attempt);
+        // The conversation is named here, before the process exists, for the same reason the
+        // claim is written first: a run that dies early must still leave behind a name its
+        // continuation can resume, and the child cannot be the one to record it.
+        let session = match self.store.get(&issue.id)?.and_then(|s| s.session_id) {
+            Some(id) => Session::Resume(id),
+            None => {
+                let id = session_id(&issue.id, self.clock.wall().0);
+                self.store.set_session(self.clock.as_ref(), &issue.id, Some(&id))?;
+                Session::New(id)
+            }
+        };
+        self.store.start_run(self.clock.as_ref(), &run_id, &issue.id, session.id())?;
+
+        // Opened before the worker exists, for the same reason the claim and the session name
+        // are: the token has to be inside the config file the child reads at startup, so it
+        // cannot be something the child reports back afterwards.
+        let broker_session = self.broker.as_ref().and_then(|b| match b.open(issue, &run_id) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                // Degrade, never fail: the acceptance criterion for an unavailable broker is
+                // an agent without tools, not a run that did not happen.
+                tracing::warn!(
+                    issue_id = %issue.id, error = %e,
+                    "broker session could not be opened; dispatching without tracker tools"
+                );
+                None
+            }
+        });
+
+        let handle = self.worker.spawn(
+            issue,
+            &prepared.path,
+            attempt,
+            &session,
+            broker_session.as_ref().map(|s| s.endpoint()),
+        );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
         let now = self.clock.mono();
 
+        // The branch is logged alongside the directory because it, not the directory, is what
+        // a reviewer goes looking for once the run is over.
         tracing::info!(
             issue_id = %issue.id,
             identifier = %issue.identifier,
             attempt,
             workspace = %prepared.path.display(),
+            branch = prepared.branch.as_deref().unwrap_or("-"),
+            session = session.id(),
+            resumed = session.is_resume(),
+            tools = broker_session.is_some(),
             "dispatched"
         );
 
@@ -650,6 +833,7 @@ impl Scheduler {
                 workspace: prepared.path,
                 last_progress: Progress::default(),
                 last_progress_at: now,
+                _broker: broker_session,
             },
         );
         Ok(())
@@ -664,6 +848,13 @@ impl Scheduler {
         let retries: HashMap<String, i64> =
             self.store.all_retries()?.into_iter().map(|r| (r.issue_id, r.due_at)).collect();
         let (in_tok, out_tok) = self.store.token_totals()?;
+
+        // One query for every issue's history, not one per row: this runs on every tick, and
+        // under `--tui` four times a second on top of that.
+        let mut history: HashMap<String, Vec<RunRecord>> = HashMap::new();
+        for run in self.store.recent_runs(RUNS_PER_ISSUE)? {
+            history.entry(run.issue_id.clone()).or_default().push(run);
+        }
 
         let mut rows = Vec::new();
         for st in &states {
@@ -688,6 +879,7 @@ impl Scheduler {
                 last_error: st.last_error.clone(),
                 last_event: progress.last_event,
                 workspace: run.map(|r| r.workspace.display().to_string()),
+                runs: history.remove(&st.issue_id).unwrap_or_default(),
             });
         }
 
@@ -754,9 +946,13 @@ impl Scheduler {
     }
 
     /// Operator action: clear quarantine so the issue becomes dispatchable again.
-    pub fn unquarantine(&self, issue_id: &str) -> anyhow::Result<()> {
-        self.store.unquarantine(self.clock.as_ref(), issue_id)?;
-        Ok(())
+    ///
+    /// Reports whether a quarantine was actually cleared. An issue that was not quarantined is
+    /// a no-op and says so — the caller wants to tell an operator "there was nothing to clear"
+    /// rather than an error, and rather than the silent phase reset an unguarded version would
+    /// perform on a live claim (see [`Store::unquarantine`]).
+    pub fn unquarantine(&self, issue_id: &str) -> anyhow::Result<bool> {
+        Ok(self.store.unquarantine(self.clock.as_ref(), issue_id)?)
     }
 
     /// Stop every in-flight run before the process exits.
