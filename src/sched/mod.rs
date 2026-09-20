@@ -22,7 +22,7 @@ use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RunRecord, Store};
 use crate::tracker::{Tracker, TrackerError};
-use crate::worker::{Progress, RunHandle, Session, Worker};
+use crate::worker::{Progress, RunHandle, Session, TokenUsage, Worker};
 use crate::workspace::Workspace;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
@@ -76,8 +76,9 @@ pub struct Row {
     pub phase: Phase,
     pub attempt: u32,
     pub turns: u32,
-    pub in_tok: u64,
-    pub out_tok: u64,
+    /// The current run's totals, once its `result` event has supplied them. `None` while it is
+    /// in flight and for every row that is not running.
+    pub tokens: Option<TokenUsage>,
     pub age_ms: u64,
     pub retry_in_ms: Option<i64>,
     pub quarantined: bool,
@@ -103,8 +104,11 @@ pub struct Snapshot {
     pub limit: usize,
     pub retrying: usize,
     pub quarantined: usize,
-    pub in_tok: u64,
-    pub out_tok: u64,
+    /// Summed over every run that reported a total.
+    pub tokens: TokenUsage,
+    /// Finished runs that reported none — killed, crashed, or budget-cut. Shown next to the sum
+    /// so it reads as the lower bound it is.
+    pub uncounted_runs: u64,
     pub ticks: u64,
     pub last_tick_at: Option<i64>,
     pub last_error: Option<String>,
@@ -312,8 +316,7 @@ impl Scheduler {
                 &r.run_id,
                 outcome.label(),
                 p.turns,
-                p.in_tok,
-                p.out_tok,
+                p.tokens,
             )?;
             self.store.add_turns(&issue_id, p.turns)?;
             self.apply_outcome(&issue_id, &r, outcome)?;
@@ -546,15 +549,11 @@ impl Scheduler {
         let outcome = r.handle.kill(KILL_GRACE_MS);
         tracing::debug!(issue_id, ?outcome, "worker stopped");
 
+        // `p.tokens` is `None` here in every case but one: a run that had already reported its
+        // result when the tracker moved the ticket, so the kill found nothing left to stop.
+        // For the rest there is no total and none is invented.
         let p = r.handle.progress();
-        self.store.finish_run(
-            self.clock.as_ref(),
-            &r.run_id,
-            "killed",
-            p.turns,
-            p.in_tok,
-            p.out_tok,
-        )?;
+        self.store.finish_run(self.clock.as_ref(), &r.run_id, "killed", p.turns, p.tokens)?;
         self.store.add_turns(issue_id, p.turns)?;
 
         if cleanup && let Err(e) = self.workspace.remove(issue_id, &r.issue.identifier) {
@@ -847,7 +846,7 @@ impl Scheduler {
         let states = self.store.all()?;
         let retries: HashMap<String, i64> =
             self.store.all_retries()?.into_iter().map(|r| (r.issue_id, r.due_at)).collect();
-        let (in_tok, out_tok) = self.store.token_totals()?;
+        let totals = self.store.token_totals()?;
 
         // One query for every issue's history, not one per row: this runs on every tick, and
         // under `--tui` four times a second on top of that.
@@ -871,8 +870,7 @@ impl Scheduler {
                 phase: st.phase,
                 attempt: st.attempt,
                 turns: if run.is_some() { progress.turns } else { st.cumulative_turns },
-                in_tok: progress.in_tok,
-                out_tok: progress.out_tok,
+                tokens: progress.tokens,
                 age_ms: run.map(|r| now_mono.saturating_since(r.started)).unwrap_or(0),
                 retry_in_ms: retries.get(&st.issue_id).map(|d| d - now_wall),
                 quarantined: st.is_quarantined(),
@@ -901,8 +899,8 @@ impl Scheduler {
             limit: self.cfg.agent.max_concurrent,
             retrying: retries.len(),
             quarantined: states.iter().filter(|s| s.is_quarantined()).count(),
-            in_tok,
-            out_tok,
+            tokens: totals.counted,
+            uncounted_runs: totals.uncounted_runs,
             ticks: self.ticks,
             last_tick_at: Some(now_wall),
             last_error: self.last_error.clone(),
@@ -924,8 +922,7 @@ impl Scheduler {
                 phase: r.phase,
                 attempt: r.attempt,
                 cumulative_turns: r.turns,
-                in_tok: r.in_tok,
-                out_tok: r.out_tok,
+                tokens: r.tokens,
                 workspace: r.workspace.clone(),
                 retry_due_at: r.retry_in_ms.map(|d| snap.generated_at + d),
                 quarantined: r.quarantined,

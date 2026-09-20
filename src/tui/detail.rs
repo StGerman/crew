@@ -4,6 +4,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::{fmt_count, fmt_ms};
+use crate::model::Phase;
 use crate::sched::Row;
 
 fn field<'a>(label: &'a str, value: impl Into<String>) -> Line<'a> {
@@ -43,7 +44,14 @@ pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
                 n => format!("{} (attempt {n})", r.turns),
             },
         ),
-        field("tokens", format!("{} in / {} out", fmt_count(r.in_tok), fmt_count(r.out_tok))),
+        field(
+            "tokens",
+            match r.tokens {
+                Some(t) => format!("{} in / {} out", fmt_count(t.input), fmt_count(t.output)),
+                None if r.phase == Phase::Running => "not yet reported".into(),
+                None => "not reported".into(),
+            },
+        ),
     ];
 
     if let Some(ws) = &r.workspace {

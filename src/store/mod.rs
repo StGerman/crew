@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::clock::{Clock, Wall};
 use crate::model::{ErrorClass, Phase};
+use crate::worker::TokenUsage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueState {
@@ -59,8 +60,10 @@ pub struct RunRecord {
     pub outcome: Option<String>,
     pub session_id: Option<String>,
     pub turns: u32,
-    pub in_tok: u64,
-    pub out_tok: u64,
+    /// `None` when the run ended without the CLI reporting a total — killed,
+    /// crashed, or cut off by the session turn budget. Not zero: unknown.
+    pub in_tok: Option<u64>,
+    pub out_tok: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +83,13 @@ impl Store {
         let conn = Connection::open(path)?;
         schema::migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Wraps a connection the caller has already migrated. For tests that need to stage a
+    /// database at an older schema version before letting `migrate` run on it.
+    #[cfg(test)]
+    pub(crate) fn from_connection(conn: Connection) -> Self {
+        Self { conn: Mutex::new(conn) }
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
@@ -178,8 +188,9 @@ impl Store {
     ///
     /// A run row opens before the worker exists and closes in `finish_run`. A process killed
     /// mid-run closes nothing, so the row reads as in-flight forever. Recovery closes it with
-    /// what is actually known — the counters stay zero, because the turns and tokens that run
-    /// spent died with the process that was counting them.
+    /// what is actually known: the turn count stays where it was, and the token columns stay
+    /// NULL, because the total that run would have reported died with the process that was
+    /// waiting for it. It lands in `token_totals`'s uncounted tally, same as a killed run.
     pub fn close_open_runs(
         &self,
         clock: &dyn Clock,
@@ -460,20 +471,29 @@ impl Store {
         Ok(())
     }
 
+    /// `tokens` is `None` for a run that ended without reporting a total — killed, crashed, or
+    /// cut off by the turn budget. It is stored as NULL, never as zero: a zero would read as a
+    /// free run in every sum, and a run that was killed mid-stream is not free, it is uncounted.
     pub fn finish_run(
         &self,
         clock: &dyn Clock,
         run_id: &str,
         outcome: &str,
         turns: u32,
-        in_tok: u64,
-        out_tok: u64,
+        tokens: Option<TokenUsage>,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE run SET ended_at = ?2, outcome = ?3, turns = ?4, in_tok = ?5, out_tok = ?6
              WHERE run_id = ?1",
-            params![run_id, clock.wall().0, outcome, turns as i64, in_tok as i64, out_tok as i64],
+            params![
+                run_id,
+                clock.wall().0,
+                outcome,
+                turns as i64,
+                tokens.map(|t| t.input as i64),
+                tokens.map(|t| t.output as i64),
+            ],
         )?;
         Ok(())
     }
@@ -503,21 +523,44 @@ impl Store {
                 outcome: r.get(4)?,
                 session_id: r.get(5)?,
                 turns: r.get::<_, i64>(6)? as u32,
-                in_tok: r.get::<_, i64>(7)? as u64,
-                out_tok: r.get::<_, i64>(8)? as u64,
+                in_tok: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                out_tok: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
             })
         })?;
         rows.collect()
     }
 
-    pub fn token_totals(&self) -> rusqlite::Result<(u64, u64)> {
+    /// Sums over the runs that reported a total, and counts the finished ones that did not. The
+    /// count travels with the sum because the sum is only meaningful alongside it: "12k tokens
+    /// across 3 runs, 2 more uncounted" is a cost figure; "12k tokens" alone is a lower bound
+    /// dressed up as a total.
+    pub fn token_totals(&self) -> rusqlite::Result<TokenTotals> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT COALESCE(SUM(in_tok),0), COALESCE(SUM(out_tok),0) FROM run",
+            "SELECT COALESCE(SUM(in_tok),0), COALESCE(SUM(out_tok),0),
+                    COUNT(*) FILTER (WHERE ended_at IS NOT NULL AND in_tok IS NULL)
+             FROM run",
             [],
-            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            |r| {
+                Ok(TokenTotals {
+                    counted: TokenUsage {
+                        input: r.get::<_, i64>(0)? as u64,
+                        output: r.get::<_, i64>(1)? as u64,
+                    },
+                    uncounted_runs: r.get::<_, i64>(2)? as u64,
+                })
+            },
         )
     }
+}
+
+/// What the store can say about cost across every run it has seen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenTotals {
+    /// Summed over the runs that reported a total.
+    pub counted: TokenUsage,
+    /// Finished runs that reported none. Each is real spend the sum does not include.
+    pub uncounted_runs: u64,
 }
 
 #[cfg(test)]
@@ -602,7 +645,8 @@ mod tests {
         for n in 1..=4 {
             c.advance_ms(1_000);
             s.start_run(&c, &format!("run-1-{n}"), "id-1", "sess-1").unwrap();
-            s.finish_run(&c, &format!("run-1-{n}"), "done", n, 10 * n as u64, n as u64).unwrap();
+            let tok = TokenUsage { input: 10 * n as u64, output: n as u64 };
+            s.finish_run(&c, &format!("run-1-{n}"), "done", n, Some(tok)).unwrap();
         }
         s.start_run(&c, "run-2-1", "id-2", "sess-2").unwrap();
 
@@ -620,6 +664,21 @@ mod tests {
         assert_eq!(for_2.len(), 1);
         assert!(for_2[0].ended_at.is_none(), "a run still in flight has no end");
         assert_eq!(for_2[0].outcome, None);
+    }
+
+    /// Schema v3 made the token columns nullable; `recent_runs` reads them on every tick, via
+    /// `snapshot`. SQLite hands a NULL to a non-null integer read as an error, not a zero — so
+    /// one budget-cut run would have turned every later tick into a failed one.
+    #[test]
+    fn a_run_that_reported_no_total_still_appears_in_history() {
+        let (s, c) = setup();
+        s.start_run(&c, "run-a", "id-1", "sess-1").unwrap();
+        s.finish_run(&c, "run-a", "killed", 2, None).unwrap();
+
+        let runs = s.recent_runs(5).unwrap();
+        let run = runs.iter().find(|r| r.run_id == "run-a").expect("it is still history");
+        assert_eq!(run.in_tok, None, "unknown, which is not the same as zero");
+        assert_eq!(run.out_tok, None);
     }
 
     #[test]
@@ -663,13 +722,67 @@ mod tests {
     fn closing_open_runs_touches_only_the_ones_still_in_flight() {
         let (s, c) = setup();
         s.start_run(&c, "run-a", "id-1", "sess-a").unwrap();
-        s.finish_run(&c, "run-a", "done", 3, 10, 20).unwrap();
+        s.finish_run(&c, "run-a", "done", 3, Some(TokenUsage { input: 10, output: 20 })).unwrap();
         s.start_run(&c, "run-b", "id-1", "sess-b").unwrap();
 
         // Only the run the kill interrupted; the one that reported for itself keeps its verdict.
         assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 1);
         assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 0, "and it is idempotent");
-        assert_eq!(s.token_totals().unwrap(), (10, 20), "a run nobody counted contributes none");
+        assert_eq!(
+            s.token_totals().unwrap(),
+            TokenTotals { counted: TokenUsage { input: 10, output: 20 }, uncounted_runs: 1 },
+            "a run nobody counted contributes nothing to the sum and one to the uncounted tally"
+        );
+    }
+
+    #[test]
+    fn a_run_that_ended_without_a_total_is_uncounted_rather_than_free() {
+        // Three runs end: one reports, one is killed before reporting, one is still open. The
+        // sum must cover exactly the first, and the uncounted tally exactly the second — an
+        // in-flight run is not yet anything.
+        let (s, c) = setup();
+        s.start_run(&c, "run-a", "id-1", "sess-a").unwrap();
+        s.finish_run(&c, "run-a", "done", 4, Some(TokenUsage { input: 300, output: 40 })).unwrap();
+        s.start_run(&c, "run-b", "id-1", "sess-b").unwrap();
+        s.finish_run(&c, "run-b", "killed", 2, None).unwrap();
+        s.start_run(&c, "run-c", "id-1", "sess-c").unwrap();
+
+        assert_eq!(
+            s.token_totals().unwrap(),
+            TokenTotals { counted: TokenUsage { input: 300, output: 40 }, uncounted_runs: 1 }
+        );
+    }
+
+    #[test]
+    fn migrating_a_v2_database_drops_the_totals_it_recorded_and_keeps_everything_else() {
+        // A store from before v3 holds per-event sums that are wrong by the turn count. The
+        // migration must not carry them forward as if they were totals — and must not lose the
+        // run rows themselves, which are what `close_open_runs` and the turn budget read.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in &schema::MIGRATIONS[..2] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO issue_state (issue_id, identifier, worktree_key, updated_at)
+               VALUES ('id-1', 'MT-1', 'MT-1-abc', 0);
+             INSERT INTO run (run_id, issue_id, started_at, ended_at, outcome, turns, in_tok, out_tok)
+               VALUES ('run-old', 'id-1', 1, 2, 'done', 83, 10231371, 441);
+             INSERT INTO run (run_id, issue_id, started_at, turns)
+               VALUES ('run-open', 'id-1', 3, 1);",
+        )
+        .unwrap();
+
+        schema::migrate(&conn).unwrap();
+        let s = Store::from_connection(conn);
+
+        assert_eq!(
+            s.token_totals().unwrap(),
+            TokenTotals { counted: TokenUsage::default(), uncounted_runs: 1 },
+            "the inflated figures are gone; the finished run now reads as uncounted"
+        );
+        let c = FakeClock::new();
+        assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 1, "run rows survived");
     }
 
     #[test]

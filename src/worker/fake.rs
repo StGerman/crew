@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{KillResult, Progress, RunHandle, Session, ToolEndpoint, Worker};
+use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
 use crate::clock::{Clock, Mono};
 use crate::model::{ErrorClass, Issue, Outcome};
 
@@ -19,8 +19,9 @@ use crate::model::{ErrorClass, Issue, Outcome};
 pub struct Script {
     pub duration_ms: u64,
     pub turns: u32,
-    pub in_tok_per_turn: u64,
-    pub out_tok_per_turn: u64,
+    /// Reported once the run completes on its own, the way the real worker only learns its
+    /// totals from the CLI's terminal event. A run that stalls or is killed never reports them.
+    pub tokens: TokenUsage,
     pub outcome: Outcome,
     /// Stop emitting progress at this point while never finishing — a stalled agent.
     pub silent_after_ms: Option<u64>,
@@ -31,8 +32,7 @@ impl Script {
         Self {
             duration_ms: ms,
             turns: 3,
-            in_tok_per_turn: 400,
-            out_tok_per_turn: 250,
+            tokens: TokenUsage { input: 1_200, output: 750 },
             outcome: Outcome::Done,
             silent_after_ms: None,
         }
@@ -47,8 +47,7 @@ impl Script {
         Self {
             duration_ms: u64::MAX, // never completes on its own
             turns: 2,
-            in_tok_per_turn: 300,
-            out_tok_per_turn: 120,
+            tokens: TokenUsage { input: 600, output: 240 },
             outcome: Outcome::Failed { class: ErrorClass::Stall, msg: "no output".into() },
             silent_after_ms: Some(ms),
         }
@@ -154,6 +153,13 @@ impl FakeRun {
             None => raw,
         }
     }
+
+    /// Ran to its scripted end under its own power. A killed run is finished too, but the way
+    /// a real one is finished when SIGTERM lands: with no terminal event and no totals.
+    fn completed(&self) -> bool {
+        !self.killed.load(Ordering::SeqCst)
+            && self.clock.mono().saturating_since(self.started) >= self.script.duration_ms
+    }
 }
 
 impl RunHandle for FakeRun {
@@ -170,8 +176,8 @@ impl RunHandle for FakeRun {
 
         Progress {
             turns,
-            in_tok: turns as u64 * self.script.in_tok_per_turn,
-            out_tok: turns as u64 * self.script.out_tok_per_turn,
+            events: turns as u64,
+            tokens: self.completed().then_some(self.script.tokens),
             last_event: Some(if turns == 0 { "starting" } else { "turn_completed" }.into()),
         }
     }
@@ -244,16 +250,33 @@ mod tests {
     }
 
     #[test]
-    fn progress_accumulates_turns_and_tokens_as_time_passes() {
+    fn progress_accumulates_turns_as_time_passes_and_totals_appear_only_at_completion() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
 
         let p0 = h.progress();
-        c.advance_ms(4_000);
+        c.advance_ms(3_999);
         let p1 = h.progress();
         assert!(p1.turns > p0.turns);
-        assert!(p1.in_tok > p0.in_tok && p1.out_tok > p0.out_tok);
+        assert_eq!(p1.tokens, None, "in flight: nothing authoritative to report yet");
+
+        c.advance_ms(1);
+        assert_eq!(h.progress().tokens, Some(TokenUsage { input: 1_200, output: 750 }));
+    }
+
+    #[test]
+    fn a_killed_run_reports_no_token_total() {
+        // Mirrors the real worker: SIGTERM lands before the CLI's result event, so there is no
+        // total, and the fake must not hand the scheduler one the real thing never would.
+        let c = Arc::new(FakeClock::new());
+        let w = FakeWorker::new(c.clone());
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
+
+        c.advance_ms(2_000);
+        assert_eq!(h.kill(1_000), KillResult::Stopped);
+        c.advance_ms(10_000);
+        assert_eq!(h.progress().tokens, None, "even once the scripted duration has elapsed");
     }
 
     #[test]

@@ -81,7 +81,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use super::{KillResult, Progress, RunHandle, Session, ToolEndpoint, Worker};
+use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
 use crate::model::{ErrorClass, Issue, Outcome};
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
@@ -332,15 +332,18 @@ fn run_reader(
         };
         saw_valid_line = true;
 
+        // Every parsed event, whatever its type, is evidence the child is alive. Bumping this
+        // before the type dispatch is what lets a tool result or a rate-limit notice count as
+        // progress to `detect_stalls` — an agent an hour into a long `cargo test` is working,
+        // not stalled, and its only output in that hour is `user` events carrying tool results.
+        state.0.lock().unwrap().progress.events += 1;
+
         match value.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
                 turns += 1;
-                let (in_tok, out_tok) = extract_usage(&value);
                 let last_event = extract_text(&value);
                 let mut g = state.0.lock().unwrap();
                 g.progress.turns = turns;
-                g.progress.in_tok += in_tok;
-                g.progress.out_tok += out_tok;
                 if let Some(t) = last_event {
                     g.progress.last_event = Some(t);
                 }
@@ -360,6 +363,10 @@ fn run_reader(
             }
             Some("result") => {
                 let mut g = state.0.lock().unwrap();
+                // The one place totals come from. A budget cut or a kill never reaches here —
+                // confirmed on a real install: SIGTERM mid-run ends the stream with no `result`
+                // — so `tokens` stays `None` for those, which is the intended report.
+                g.progress.tokens = extract_usage(&value);
                 g.outcome = Some(interpret_result(&value));
                 drop(g);
                 break;
@@ -423,12 +430,22 @@ fn extract_marker(text: &str, kind: &str) -> Option<String> {
     })
 }
 
-fn extract_usage(v: &serde_json::Value) -> (u64, u64) {
-    let usage = v.pointer("/message/usage");
-    let get = |k: &str| usage.and_then(|u| u.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
-    let in_tok =
-        get("input_tokens") + get("cache_creation_input_tokens") + get("cache_read_input_tokens");
-    (in_tok, get("output_tokens"))
+/// Reads the totals off a `result` event's top-level `usage` block. Only that block: the
+/// per-event `message.usage` on `assistant` events is what this replaced, and `modelUsage` on
+/// the same `result` carries the same totals keyed by model, which would only matter if the
+/// split were wanted.
+///
+/// `None` when the block is missing rather than a zeroed total — a `result` without `usage` is
+/// an unknown cost, and the dashboard must not show it as a free run.
+fn extract_usage(v: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = v.get("usage")?.as_object()?;
+    let get = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    Some(TokenUsage {
+        input: get("input_tokens")
+            + get("cache_creation_input_tokens")
+            + get("cache_read_input_tokens"),
+        output: get("output_tokens"),
+    })
 }
 
 fn extract_text(v: &serde_json::Value) -> Option<String> {
@@ -583,7 +600,9 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_done_stream_reports_done_and_matches_reported_tokens() {
+    fn a_completed_run_records_the_totals_the_result_event_reports_not_a_sum_of_events() {
+        // The fixture's assistant events sum to 18 in / 8 out; its result event says 312 / 60.
+        // The two disagree on purpose, so this test can only pass by reading the right one.
         let ws = tmp_workspace("done");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
         let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
@@ -591,8 +610,45 @@ mod tests {
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let p = h.progress();
         assert_eq!(p.turns, 2);
-        assert_eq!(p.in_tok, 18, "10 + 8 across the two assistant events");
-        assert_eq!(p.out_tok, 8, "5 + 3 across the two assistant events");
+        assert_eq!(
+            p.tokens,
+            Some(TokenUsage { input: 312, output: 60 }),
+            "input is the result's input + cache creation + cache read; output is its own"
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn liveness_moves_on_every_stream_event_not_only_on_turns() {
+        // clean_done.sh emits system, assistant, user (a tool result), assistant, result. Two of
+        // those are turns; all five are proof of life. Stall detection compares Progress between
+        // ticks, so the count it sees has to move on the tool result too, or an agent inside a
+        // long tool call reads as silent.
+        let ws = tmp_workspace("events");
+        let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+
+        wait_for_finish(&h);
+        let p = h.progress();
+        assert_eq!(p.turns, 2);
+        assert_eq!(p.events, 5, "every parsed event counts, not just the assistant ones");
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_run_that_dies_before_its_result_event_reports_no_token_total() {
+        // The stream carried one assistant event with a usage block. Summing it would give a
+        // number; the number would be wrong by the turn count, so the honest report is none.
+        let ws = tmp_workspace("no-total");
+        let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+
+        wait_for_finish(&h);
+        let p = h.progress();
+        assert!(p.turns > 0, "there was usage on the stream to be tempted by");
+        assert_eq!(p.tokens, None, "and it must not have been used");
 
         std::fs::remove_dir_all(&ws).ok();
     }
@@ -734,6 +790,9 @@ mod tests {
             wait_for_finish(&h),
             Outcome::Continue { why: "session turn budget reached".into() }
         );
+        // The cut happens before the CLI's result event, so there is no total to report. This
+        // is the common way a run ends without one; it must read as unknown, not as zero.
+        assert_eq!(h.progress().tokens, None);
 
         std::fs::remove_dir_all(&ws).ok();
     }

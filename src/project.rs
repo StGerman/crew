@@ -10,6 +10,7 @@
 //! Slice 1 shipped the seam and [`NoopProjector`]. Slice 2 adds the real writer.
 
 use crate::model::Phase;
+use crate::worker::TokenUsage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedIssue {
@@ -21,8 +22,9 @@ pub struct ProjectedIssue {
     pub phase: Phase,
     pub attempt: u32,
     pub cumulative_turns: u32,
-    pub in_tok: u64,
-    pub out_tok: u64,
+    /// The current run's reported totals; `None` until its result event arrives, and for any
+    /// issue not running.
+    pub tokens: Option<TokenUsage>,
     pub workspace: Option<String>,
     pub retry_due_at: Option<i64>,
     pub quarantined: bool,
@@ -152,7 +154,10 @@ impl TasksProjector {
             format!("phase: {}", issue.phase.label()),
             format!("attempt: {}", issue.attempt),
             format!("turns: {}", issue.cumulative_turns),
-            format!("tokens: {} in / {} out", issue.in_tok, issue.out_tok),
+            match issue.tokens {
+                Some(t) => format!("tokens: {} in / {} out", t.input, t.output),
+                None => "tokens: not reported".to_string(),
+            },
         ];
         if let Some(ws) = &issue.workspace {
             lines.push(format!("workspace: {ws}"));
@@ -268,8 +273,7 @@ mod tests {
             phase,
             attempt: 1,
             cumulative_turns: 3,
-            in_tok: 100,
-            out_tok: 50,
+            tokens: Some(TokenUsage { input: 100, output: 50 }),
             workspace: Some("/tmp/ws/x".into()),
             retry_due_at: None,
             quarantined: false,

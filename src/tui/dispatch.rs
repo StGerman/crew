@@ -3,7 +3,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Row as TRow, Table, TableState};
 
-use super::{fmt_count, fmt_ms};
+use super::{fmt_ms, fmt_tokens};
 use crate::model::Phase;
 use crate::sched::Snapshot;
 
@@ -56,7 +56,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, selected: usize) {
                 Cell::from(r.phase.label()).style(style),
                 Cell::from(if r.attempt > 0 { r.attempt.to_string() } else { "-".into() }),
                 Cell::from(r.turns.to_string()),
-                Cell::from(format!("{}/{}", fmt_count(r.in_tok), fmt_count(r.out_tok))),
+                Cell::from(fmt_tokens(r.tokens)),
                 Cell::from(if r.age_ms > 0 { fmt_ms(r.age_ms) } else { "-".into() }),
                 Cell::from(note).style(Style::default().fg(if r.quarantined {
                     Color::Red
