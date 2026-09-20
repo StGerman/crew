@@ -13,14 +13,14 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-Slices 1–2 are complete and green: a deterministic core with a fake behind every external
-seam, then real git worktrees and a real `~/.claude/tasks` projection behind those same
-seams. A real tracker and real workers are the open issues.
+Slices 1–3 are complete and green: a deterministic core with a fake behind every external
+seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
+Issues tracker. Real workers are the open issue.
 
 ## Commands
 
 ```bash
-cargo test                                 # 57 unit + 20 integration
+cargo test                                 # 75 unit + 20 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # integration only
 cargo test a_permanent_failure             # one test; the arg is a substring match
@@ -45,6 +45,16 @@ under `~/.claude/tasks/<derived-session-id>/`. Both are best-effort seams — a 
 projection failure degrades the run, it does not stop it — but they are real disk and git
 state, not a simulation, so use the env overrides above when you just want to watch the
 scheduler and don't want the side effects.
+
+```bash
+GITHUB_TOKEN=$(gh auth token) cargo run -- --config symphony.github.toml --max-ticks 3
+```
+
+points the tracker at this repo's own real Issues instead of the fake demo data —
+`symphony.github.toml` is checked in and ready to use, no token in it. Today that lists this
+repo's five open, `agent`-labelled issues and dispatches none of them, because none has an
+assignee yet (see `src/tracker/github.rs`'s module doc for the dispatchability rule and the
+state-label convention).
 
 `dashboard_preview` is the fastest way to see a layout change: it renders a canned `Snapshot`
 through ratatui's `TestBackend`, so there is no terminal and no scheduler involved.
@@ -103,6 +113,31 @@ bare existence — a plain directory there, e.g. left by a prior `DirWorkspace` 
 same root, must surface through git's own "already exists" error rather than being silently
 trusted as an already-prepared worktree.
 
+`Tracker` gets its third implementation in [src/tracker/github.rs](src/tracker/github.rs):
+`GithubTracker<H: Http>`, generic over a small `Http` seam (`FakeHttp` in tests, `UreqHttp` —
+over `ureq` with `rustls`, no C toolchain needed — in `main.rs`). GitHub has no workflow
+states beyond open/closed; the module doc there is the write-up of that mapping (a
+`state:<name>` label convention) and should be read before touching it. Two contract details
+worth knowing before changing either `Tracker` impl: `by_ids` must fail the whole call on
+anything other than a clean 404 — a transport error silently dropped from the result would be
+indistinguishable from the id having genuinely disappeared, which is exactly the ambiguity
+`refresh_miss_grace` exists to bound, and bounding it needs the *real* miss count, not one
+deflated by swallowed errors. And `ureq`'s default turns a non-2xx response into an `Err` that
+discards the headers and body this adapter classifies on (rate-limit header, error message) —
+`UreqHttp::default()` disables that (`http_status_as_error(false)`) so every status code
+arrives as an ordinary response. `FakeHttp`-based tests are structurally blind to that class
+of bug — they hand `GithubTracker` an already-correct `HttpResponse` — which is why
+`ureq_http_tests` in the same file talks to a raw `TcpListener` instead.
+
+A tracker failure has no issue to quarantine against — `by_states`/`by_ids` are batch calls,
+not scoped to one ticket — so `TrackerError::class()` ([src/tracker/mod.rs](src/tracker/mod.rs))
+reuses `ErrorClass::retryable()` only to pick a log level: `dispatch_new`, `dispatch_due_retries`
+and `refresh_running` all skip the tick and try again either way, but a bad credential now logs
+at `error` with a "will not resolve on its own" hint instead of blending into the same `warn` a
+rate limit gets. That is the honest version of "an auth failure stops trying and gets loud" at
+this scope; a literal per-issue quarantine here would be quarantining tickets a bad token had
+nothing to do with.
+
 ## Invariants
 
 Each of these closes a defect found in the original spec, and each has a test that fails
@@ -141,13 +176,13 @@ hold. They cover different paths; keep all three.
 The backlog is GitHub Issues on this repository, labelled `agent` — which is exactly the shape
 `TrackerConfig.required_labels` filters on. Work is picked up from there, not from a plan file.
 
-The worktree and projection slices have landed: `main.rs` wires `GitWorktreeWorkspace`
-(`workspace.repo`, defaulting to `.`) and `TasksProjector` by default, so a headless run
-against this repo creates real worktrees under `.symphony/workspaces` and real files under
-`~/.claude/tasks`. A real tracker and real workers are what remain before `symphony-cc` can
-poll this repository and dispatch against its own backlog end to end. Until the tracker
-lands, `symphony.toml` stays on `kind = "fake"`. When you change scheduler behaviour, ask
-whether the change would still be correct when the agent running it is working on this repo.
+The worktree, projection and tracker slices have landed: `main.rs` wires
+`GitWorktreeWorkspace`, `TasksProjector`, and — when `tracker.kind = "github"` —
+`GithubTracker` by default. `symphony.github.toml` points at this repo; real workers are what
+remain before `symphony-cc` can dispatch against its own backlog end to end, so
+`symphony.toml`, the default config, stays on `kind = "fake"` until then. When you change
+scheduler behaviour, ask whether the change would still be correct when the agent running it
+is working on this repo.
 
 [.mcp.json](.mcp.json) hands the agent rust-analyzer over MCP, so navigation in this repo is
 LSP rather than grep — which is what makes the invariant table above checkable: whether

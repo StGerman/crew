@@ -1,0 +1,35 @@
+# Points at this repo's own real GitHub Issues backlog. Requires GITHUB_TOKEN in the
+# environment — never put a token in this file, it is checked in.
+#
+# The backlog has not adopted the `state:<name>` label convention yet (see
+# src/tracker/github.rs's module doc), so every open, `agent`-labelled issue reports as
+# state "open" — active_states reflects that rather than inventing labels that do not exist.
+# Once issues start carrying `state:*` labels, active_states/terminal_states should switch to
+# that vocabulary instead.
+
+[tracker]
+kind = "github"
+owner = "StGerman"
+repo = "symphony-cc"
+active_states = ["open"]
+terminal_states = ["closed"]
+required_labels = ["agent"]
+
+# 30s at max_concurrent = 2 is (1 + 2) requests per poll * 120 polls/hour = 360/hour, well
+# under the 5000/hour authenticated budget — see the rate-limit budget math in
+# src/tracker/github.rs's module doc before tightening this.
+[polling]
+interval_ms = 30000
+
+[workspace]
+root = ".symphony/workspaces"
+repo = "."
+
+[agent]
+max_concurrent = 2
+max_turns_per_session = 20
+max_turns_per_issue = 40
+max_retry_backoff_ms = 60000
+stall_timeout_ms = 15000
+quarantine_after_identical = 3
+refresh_miss_grace = 2

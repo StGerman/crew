@@ -14,7 +14,9 @@ use symphony_cc::config::Config;
 use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use symphony_cc::sched::{Scheduler, Snapshot};
 use symphony_cc::store::Store;
+use symphony_cc::tracker::Tracker;
 use symphony_cc::tracker::fake::FakeTracker;
+use symphony_cc::tracker::github::{GithubTracker, UreqHttp};
 use symphony_cc::tui::{Ui, UiAction};
 use symphony_cc::worker::fake::{FakeWorker, Script};
 use symphony_cc::workspace::GitWorktreeWorkspace;
@@ -83,11 +85,25 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Slice 1 is fakes end to end. The tracker and worker are still fakes — slices 3 and 4
-    // swap these two lines for real implementations without the scheduler noticing.
-    let tracker = Arc::new(FakeTracker::demo());
+    // The worker is still a fake — slice 4 swaps this line for a real implementation without
+    // the scheduler noticing.
     let worker = Arc::new(FakeWorker::new(clock.clone()));
-    seed_demo_scripts(&worker);
+
+    let tracker: Arc<dyn Tracker> = if cfg.tracker.kind.trim().eq_ignore_ascii_case("github") {
+        let token = std::env::var("GITHUB_TOKEN")
+            .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
+        Arc::new(GithubTracker::new(
+            UreqHttp::default(),
+            &cfg.tracker.owner,
+            &cfg.tracker.repo,
+            &token,
+            &cfg.tracker.required_labels,
+        ))
+    } else {
+        let fake = Arc::new(FakeTracker::demo());
+        seed_demo_scripts(&worker);
+        fake
+    };
 
     tracing::info!(
         config = %args.config.display(),

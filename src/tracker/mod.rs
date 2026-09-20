@@ -5,8 +5,9 @@
 //! host-executed tools (slice 5), not to this trait.
 
 pub mod fake;
+pub mod github;
 
-use crate::model::Issue;
+use crate::model::{ErrorClass, Issue};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TrackerError {
@@ -20,6 +21,22 @@ pub enum TrackerError {
     Response(String),
     #[error("auth failed: {0}")]
     Auth(String),
+}
+
+impl TrackerError {
+    /// Reuses the scheduler's own retryable/permanent split rather than a second one, so a
+    /// tracker failure and a workspace or run failure read the same way in a log line. A
+    /// malformed payload is treated as retryable alongside a bad status: in practice it is
+    /// almost always a transient truncation or provider hiccup, not a permanent schema break
+    /// worth escalating identically to a bad credential.
+    pub fn class(&self) -> ErrorClass {
+        match self {
+            TrackerError::Request(_) => ErrorClass::TrackerRequest,
+            TrackerError::Status(_) | TrackerError::Response(_) => ErrorClass::TrackerStatus,
+            TrackerError::RateLimited => ErrorClass::RateLimited,
+            TrackerError::Auth(_) => ErrorClass::AuthFailed,
+        }
+    }
 }
 
 pub trait Tracker: Send + Sync {
@@ -36,4 +53,21 @@ pub trait Tracker: Send + Sync {
     /// omission as "not visible", and applies a grace count before acting on it. A successful
     /// result is complete for that call; partial success must surface as an error instead.
     fn by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_auth_failure_is_permanent() {
+        assert!(TrackerError::Request(String::new()).class().retryable());
+        assert!(TrackerError::Status(String::new()).class().retryable());
+        assert!(TrackerError::Response(String::new()).class().retryable());
+        assert!(TrackerError::RateLimited.class().retryable());
+        assert!(
+            !TrackerError::Auth(String::new()).class().retryable(),
+            "a bad credential will not fix itself on retry"
+        );
+    }
 }

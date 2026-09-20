@@ -47,7 +47,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrackerConfig {
-    /// Selects an adapter. Slice 1 supports only `fake`.
+    /// Selects an adapter: `fake` or `github`.
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
@@ -56,6 +56,12 @@ pub struct TrackerConfig {
     pub terminal_states: Vec<String>,
     #[serde(default)]
     pub required_labels: Vec<String>,
+    /// `kind = "github"` only: the repository owner and name to poll. The token comes from
+    /// `GITHUB_TOKEN` in the environment, never from this file.
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub repo: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +172,13 @@ impl Config {
         if self.tracker.kind.trim().is_empty() {
             return Err(ConfigError::Invalid("tracker.kind is required".into()));
         }
+        if self.tracker.kind.trim().eq_ignore_ascii_case("github")
+            && (self.tracker.owner.trim().is_empty() || self.tracker.repo.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "tracker.owner and tracker.repo are required when tracker.kind = \"github\"".into(),
+            ));
+        }
         // The spec omits this, so a service with no active states polls forever, dispatches
         // nothing, logs nothing, and looks perfectly healthy.
         if self.tracker.active_states.is_empty() {
@@ -225,6 +238,8 @@ mod tests {
                 active_states: vec!["In Progress".into()],
                 terminal_states: vec!["Done".into()],
                 required_labels: vec![],
+                owner: String::new(),
+                repo: String::new(),
             },
             polling: Default::default(),
             workspace: Default::default(),
@@ -254,6 +269,17 @@ mod tests {
         let mut c = base();
         c.tracker.terminal_states.push("in progress".into());
         assert!(c.preflight().is_err());
+    }
+
+    #[test]
+    fn a_github_tracker_without_owner_and_repo_is_rejected() {
+        let mut c = base();
+        c.tracker.kind = "github".into();
+        assert!(c.preflight().is_err());
+        c.tracker.owner = "o".into();
+        assert!(c.preflight().is_err(), "repo is still missing");
+        c.tracker.repo = "r".into();
+        assert!(c.preflight().is_ok());
     }
 
     #[test]

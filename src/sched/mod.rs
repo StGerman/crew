@@ -18,12 +18,25 @@ use crate::config::Config;
 use crate::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::Store;
-use crate::tracker::Tracker;
+use crate::tracker::{Tracker, TrackerError};
 use crate::worker::{Progress, RunHandle, Worker};
 use crate::workspace::Workspace;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
 const KILL_GRACE_MS: u64 = 10_000;
+
+/// A tracker failure never stops the tick — every call site here already returns `Ok(())` and
+/// tries again next poll — but a permanent one (a bad credential, most likely) will not
+/// resolve itself, and retrying it silently at the poll interval forever looks identical to a
+/// transient blip on `warn`-level logs alone. This is the one place that distinction is made,
+/// so every call site sees it without repeating the branch.
+fn log_tracker_failure(context: &str, e: &TrackerError) {
+    if e.class().retryable() {
+        tracing::warn!(error = %e, "{context}; will retry next poll");
+    } else {
+        tracing::error!(error = %e, "{context}; will not resolve on its own — check tracker credentials/config");
+    }
+}
 
 struct Running {
     run_id: String,
@@ -331,7 +344,7 @@ impl Scheduler {
             Ok(v) => v,
             Err(e) => {
                 // Keep workers running; a tracker blip must not cancel real work.
-                tracing::warn!(error = %e, "running-state refresh failed; keeping workers");
+                log_tracker_failure("running-state refresh failed; keeping workers", &e);
                 self.last_error = Some(format!("refresh: {e}"));
                 return Ok(());
             }
@@ -438,7 +451,7 @@ impl Scheduler {
         let refreshed = match self.tracker.by_ids(&ids) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "retry refresh failed; will try next tick");
+                log_tracker_failure("retry refresh failed", &e);
                 self.last_error = Some(format!("retry refresh: {e}"));
                 return Ok(());
             }
@@ -487,7 +500,7 @@ impl Scheduler {
         let candidates = match self.tracker.by_states(&self.cfg.tracker.active_states) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "candidate fetch failed; skipping dispatch");
+                log_tracker_failure("candidate fetch failed; skipping dispatch", &e);
                 self.last_error = Some(format!("candidates: {e}"));
                 return Ok(());
             }

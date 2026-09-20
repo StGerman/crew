@@ -60,6 +60,8 @@ fn harness(issues: Vec<Issue>, tune: impl FnOnce(&mut Config)) -> Harness {
             active_states: vec!["in progress".into()],
             terminal_states: vec!["done".into()],
             required_labels: vec![],
+            owner: String::new(),
+            repo: String::new(),
         },
         polling: PollingConfig { interval_ms: 30_000 },
         workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
