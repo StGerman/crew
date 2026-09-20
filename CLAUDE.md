@@ -221,8 +221,13 @@ still be correct when the agent running it is working on this repo.
 [.mcp.json](.mcp.json) hands the agent rust-analyzer over MCP, so navigation in this repo is
 LSP rather than grep — which is what makes the invariant table above checkable: whether
 `guard_within` is still reached from both `prepare` and `remove` is a find-references
-question. It needs `rustup component add rust-analyzer rust-src` plus
-`cargo install rust-analyzer-mcp` on the host. Being committed, it is inherited by every
+question. It needs three pieces on the host — the `rust-analyzer` server, `rust-src`, and the
+`rust-analyzer-mcp` bridge — and how you install the first two depends on whether the
+toolchain came from rustup or Homebrew, which is why `.claude/skills/setup-rust-analyzer`
+exists rather than a command line here. A `SessionStart` hook
+([.claude/hooks/rust-analyzer-check.sh](.claude/hooks/rust-analyzer-check.sh)) probes for all
+three and names whichever is missing; without it the only symptom is an ENOENT at connect
+time, which says nothing about which piece to install. Being committed, it is inherited by every
 worktree under `.symphony/workspaces`, so each dispatched agent indexes its own copy of the
 tree. That is intended, but it is not free — budget roughly 1-2 GB resident and one
 `cargo check` per concurrent run when setting `agent.max_concurrent`.
