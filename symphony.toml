@@ -26,3 +26,13 @@ refresh_miss_grace = 2
 # Cap a busy state independently of the global limit.
 [agent.max_concurrent_by_state]
 "in review" = 1
+
+# Host-side tracker tools for the agent (src/broker/). The demo tracker has nothing to write
+# to, so calls are recorded and dropped — which still exercises scoping, budgets and the audit
+# log without a network.
+[broker]
+enabled = true
+max_calls_per_run = 20
+# Across *all* of an issue's runs. The per-run cap alone bounds nothing, because every
+# continuation opens a fresh run with a fresh allowance.
+max_calls_per_issue = 100

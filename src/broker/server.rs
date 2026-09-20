@@ -88,11 +88,19 @@ pub fn serve(broker: Arc<Broker>, listener: TcpListener) {
             match stream {
                 Ok(s) => {
                     let broker = Arc::clone(&broker);
-                    std::thread::spawn(move || {
-                        if let Err(e) = handle_conn(&broker, s) {
-                            tracing::debug!(error = %e, "broker connection ended");
-                        }
-                    });
+                    // `Builder::spawn` rather than `thread::spawn`: the latter panics when the
+                    // process is out of threads, and a panic on this thread would take the
+                    // whole orchestrator down over a connection it could simply have refused.
+                    let spawned = std::thread::Builder::new()
+                        .name("symphony-broker-conn".into())
+                        .spawn(move || {
+                            if let Err(e) = handle_conn(&broker, s) {
+                                tracing::debug!(error = %e, "broker connection ended");
+                            }
+                        });
+                    if let Err(e) = spawned {
+                        tracing::warn!(error = %e, "broker could not serve a connection");
+                    }
                 }
                 Err(e) => tracing::warn!(error = %e, "broker accept failed"),
             }

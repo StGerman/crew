@@ -570,6 +570,15 @@ impl Drop for BrokerSession {
     }
 }
 
+impl Drop for Broker {
+    /// Remove the config directory, which every session has already emptied of its own file.
+    /// `remove_dir` rather than `remove_dir_all` on purpose: if anything is still in there, a
+    /// session did not clean up after itself, and leaving the evidence beats destroying it.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.config_dir);
+    }
+}
+
 /// 32 bytes of kernel entropy, hex encoded.
 ///
 /// Not derived from the run id and clock like [`crate::model::session_id`] is: that one only
