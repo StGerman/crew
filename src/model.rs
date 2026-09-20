@@ -21,6 +21,10 @@ pub struct Issue {
     /// Human-readable key, e.g. `MT-649`. Used for display and workspace naming.
     pub identifier: String,
     pub title: String,
+    /// Free-text description, when the provider has one. The only field of the task the
+    /// worker's prompt has any real content from beyond the title — an adapter that can
+    /// populate it and doesn't is handing the agent a ticket with no description.
+    pub body: Option<String>,
     pub state: String,
     pub priority: Option<i32>,
     pub url: Option<String>,

@@ -1,0 +1,604 @@
+//! `Worker` over `claude -p --output-format stream-json`.
+//!
+//! ## Invocation
+//!
+//! `-p --output-format stream-json --verbose --permission-mode bypassPermissions`, prompt
+//! piped on stdin — never as an argv element, so there is no argv length limit and no shell
+//! quoting to get wrong. `--permission-mode bypassPermissions` because there is no human on
+//! the other end of a permission prompt in a headless dispatch; a prompt nobody answers just
+//! hangs the run until the stall timeout kills it anyway, which is strictly worse than the
+//! bypass.
+//!
+//! Two things confirmed against a real install (`claude 2.1.268`) rather than assumed, because
+//! guessing them wrong would have meant a worker that silently never worked:
+//!
+//! * **There is no `--max-turns` flag.** [`AgentConfig::max_turns_per_session`]'s per-session
+//!   turn budget is enforced by this module instead — it counts `assistant` events as they
+//!   stream and sends `SIGTERM` once the count reaches the budget, reporting
+//!   [`Outcome::Continue`] itself rather than waiting for the CLI to enforce a limit it does
+//!   not have.
+//! * **`--bare` requires `ANTHROPIC_API_KEY`.** An operator authenticated via OAuth (the
+//!   default interactive login, and what this project's own dev machine uses) has no such key,
+//!   and `--bare` fails outright without one. This worker does not pass `--bare`, so it
+//!   inherits whatever hooks, plugins and MCP servers the operator's own `claude` config
+//!   already has — worth knowing before dispatching against a machine with heavy global hook
+//!   configuration, and worth revisiting once a dedicated API key exists for headless dispatch.
+//!
+//! [`AgentConfig::max_turns_per_session`]: crate::config::AgentConfig::max_turns_per_session
+//!
+//! ## The outcome convention
+//!
+//! `claude -p`'s own terminal `result` event gives exactly one structural verdict: `is_error`.
+//! That is enough to distinguish [`Outcome::Done`] from [`Outcome::Failed`], but this project
+//! also needs [`Outcome::Continue`] (real progress, wants another turn) and
+//! [`Outcome::Blocked`] (stuck, wants a human) — verdicts the CLI has no concept of. Until the
+//! MCP broker (slice 5) gives the agent a tool to report through, the only channel available is
+//! its own final text, so the prompt this worker sends asks the agent to end that text with:
+//!
+//! ```text
+//! SYMPHONY_OUTCOME: continue: <reason>
+//! SYMPHONY_OUTCOME: blocked: <reason>
+//! ```
+//!
+//! Absence of either line, with `is_error: false`, means `Done`. This is a text convention and
+//! therefore soft — an agent that forgets the marker just reads as `Done`, which is the safe
+//! default. A malformed line, a crash mid-stream, or a process that exits without ever
+//! producing a `result` event all fall through to `Failed { class: AgentCrash }`: absent an
+//! explicit verdict, nothing here infers `Continue` from a clean exit, which is the exact
+//! spec defect this whole project exists to not have.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+use super::{KillResult, Progress, RunHandle, Worker};
+use crate::model::{ErrorClass, Issue, Outcome};
+
+/// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
+/// any tracker credential and any API key. An operator on API-key auth adds `ANTHROPIC_API_KEY`
+/// to their own allowlist deliberately; it is not here by default.
+pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
+
+const OUTCOME_MARKER: &str = "SYMPHONY_OUTCOME:";
+
+/// Bounded by design: the last thing read from a crashing or malicious child should not become
+/// an unbounded log line or error message.
+const MAX_CAPTURED_BYTES: usize = 4096;
+
+pub struct ClaudeWorker {
+    bin: PathBuf,
+    env_allowlist: Vec<String>,
+    max_turns_per_session: u32,
+}
+
+impl ClaudeWorker {
+    pub fn new(
+        bin: impl Into<PathBuf>,
+        env_allowlist: Vec<String>,
+        max_turns_per_session: u32,
+    ) -> Self {
+        Self { bin: bin.into(), env_allowlist, max_turns_per_session }
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    progress: Progress,
+    outcome: Option<Outcome>,
+    /// Set only once the child has been reaped (`Child::wait` returned). `kill` must not
+    /// return before this is true — the caller deletes the workspace next.
+    reaped: bool,
+}
+
+type SharedState = Arc<(Mutex<Inner>, Condvar)>;
+
+struct ClaudeRun {
+    state: SharedState,
+    pid: i32,
+    /// Guards against sending SIGTERM twice on a double `kill()` call; does not by itself mean
+    /// the run is finished — `state.reaped` is the source of truth for that.
+    sent_term: AtomicBool,
+}
+
+impl ClaudeRun {
+    fn already_finished(&self) -> Option<Outcome> {
+        self.state.0.lock().unwrap().outcome.clone()
+    }
+}
+
+impl RunHandle for ClaudeRun {
+    fn progress(&self) -> Progress {
+        self.state.0.lock().unwrap().progress.clone()
+    }
+
+    fn finished(&self) -> Option<Outcome> {
+        self.state.0.lock().unwrap().outcome.clone()
+    }
+
+    fn kill(&self, grace_ms: u64) -> KillResult {
+        let (lock, cvar) = &*self.state;
+        let already_finished = self.already_finished().is_some();
+
+        {
+            let g = lock.lock().unwrap();
+            if g.reaped {
+                return KillResult::AlreadyDone;
+            }
+        }
+
+        // A run that already has a verdict is exiting on its own; do not signal it, just wait
+        // for the reader thread to reap it. One still in flight gets SIGTERM, once.
+        if !already_finished && !self.sent_term.swap(true, Ordering::SeqCst) {
+            unsafe { libc::kill(-self.pid, libc::SIGTERM) };
+        }
+
+        let g = lock.lock().unwrap();
+        let (g, timeout) =
+            cvar.wait_timeout_while(g, Duration::from_millis(grace_ms), |g| !g.reaped).unwrap();
+        if !timeout.timed_out() {
+            return if already_finished { KillResult::AlreadyDone } else { KillResult::Stopped };
+        }
+        drop(g);
+
+        // Still not reaped after the grace period: escalate. SIGKILL cannot be caught, ignored
+        // or blocked, so the reader thread's `wait()` should return promptly; this second wait
+        // is a bound against something having gone very wrong, not an expected path.
+        unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+        let g = lock.lock().unwrap();
+        let _ = cvar.wait_timeout_while(g, Duration::from_secs(5), |g| !g.reaped).unwrap();
+        KillResult::Forced
+    }
+}
+
+impl Worker for ClaudeWorker {
+    fn spawn(&self, issue: &Issue, workspace: &Path, _attempt: u32) -> Arc<dyn RunHandle> {
+        let prompt = build_prompt(issue);
+
+        let mut cmd = Command::new(&self.bin);
+        cmd.current_dir(workspace)
+            .env_clear()
+            .envs(
+                self.env_allowlist
+                    .iter()
+                    .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v))),
+            )
+            .args([
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "bypassPermissions",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // A new process group, rooted at this child, so `kill` can signal every descendant
+        // `claude` spawns — a wedged grandchild would otherwise hold the worktree open after
+        // the parent is gone.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let state: SharedState = Arc::new((
+                    Mutex::new(Inner {
+                        outcome: Some(Outcome::Failed {
+                            class: ErrorClass::AgentNotFound,
+                            msg: format!("spawning {}: {e}", self.bin.display()),
+                        }),
+                        reaped: true,
+                        ..Default::default()
+                    }),
+                    Condvar::new(),
+                ));
+                return Arc::new(ClaudeRun { state, pid: 0, sent_term: AtomicBool::new(true) });
+            }
+        };
+
+        let pid = child.id() as i32;
+        let mut stdin = child.stdin.take().expect("piped at spawn");
+        // Best-effort: a write failure here means the child is already gone or refusing input,
+        // which the reader thread will observe directly and turn into a Failed verdict.
+        let _ = stdin.write_all(prompt.as_bytes());
+        drop(stdin);
+
+        let stdout = child.stdout.take().expect("piped at spawn");
+        let stderr = child.stderr.take().expect("piped at spawn");
+
+        let state: SharedState = Arc::new((Mutex::new(Inner::default()), Condvar::new()));
+        let max_turns = self.max_turns_per_session;
+
+        {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || run_reader(child, stdout, stderr, state, pid, max_turns));
+        }
+
+        Arc::new(ClaudeRun { state, pid, sent_term: AtomicBool::new(false) })
+    }
+}
+
+/// Runs on its own thread for the life of one attempt. Reads stdout, updates shared progress
+/// and outcome as events arrive, drains stderr on a second thread so a chatty child cannot
+/// deadlock on a full pipe, then reaps the process and fills in a verdict if the stream never
+/// gave one.
+fn run_reader(
+    mut child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    state: SharedState,
+    pid: i32,
+    max_turns_per_session: u32,
+) {
+    let stderr_thread = std::thread::spawn(move || drain_capped(stderr));
+
+    let mut turns = 0u32;
+    let mut saw_any_line = false;
+    let mut saw_valid_line = false;
+
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        saw_any_line = true;
+
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                // Malformed JSON on a line is logged and skipped, not fatal — only a stream
+                // that is entirely unparseable ends in Failed.
+                tracing::warn!(error = %e, line, "malformed stream-json line; skipping");
+                continue;
+            }
+        };
+        saw_valid_line = true;
+
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                turns += 1;
+                let (in_tok, out_tok) = extract_usage(&value);
+                let last_event = extract_text(&value);
+                let mut g = state.0.lock().unwrap();
+                g.progress.turns = turns;
+                g.progress.in_tok += in_tok;
+                g.progress.out_tok += out_tok;
+                if let Some(t) = last_event {
+                    g.progress.last_event = Some(t);
+                }
+                drop(g);
+
+                if max_turns_per_session > 0 && turns >= max_turns_per_session {
+                    let mut g = state.0.lock().unwrap();
+                    g.outcome =
+                        Some(Outcome::Continue { why: "session turn budget reached".into() });
+                    drop(g);
+                    // SIGTERM only: this is this module's own budget, not a failure, and the
+                    // caller (the scheduler) still owns the decision to hard-kill on a grace
+                    // timeout via `RunHandle::kill`.
+                    unsafe { libc::kill(-pid, libc::SIGTERM) };
+                    break;
+                }
+            }
+            Some("result") => {
+                let mut g = state.0.lock().unwrap();
+                g.outcome = Some(interpret_result(&value));
+                drop(g);
+                break;
+            }
+            _ => {} // system/rate_limit_event/etc: nothing this module needs
+        }
+    }
+
+    let status = child.wait();
+    let stderr_tail = stderr_thread.join().unwrap_or_default();
+
+    let mut g = state.0.lock().unwrap();
+    if g.outcome.is_none() {
+        let msg = if !saw_any_line {
+            "process produced no output before exiting".to_string()
+        } else if !saw_valid_line {
+            "process output was entirely unparseable".to_string()
+        } else {
+            format!("process exited without a result event (status: {status:?})")
+        };
+        let msg =
+            if stderr_tail.is_empty() { msg } else { format!("{msg}; stderr: {stderr_tail}") };
+        g.outcome = Some(Outcome::Failed { class: ErrorClass::AgentCrash, msg });
+    }
+    g.reaped = true;
+    drop(g);
+    state.1.notify_all();
+}
+
+fn drain_capped(r: impl Read) -> String {
+    let mut buf = Vec::new();
+    let _ = r.take(MAX_CAPTURED_BYTES as u64).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).trim().to_string()
+}
+
+fn interpret_result(v: &serde_json::Value) -> Outcome {
+    let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(true);
+    let text = v.get("result").and_then(|x| x.as_str()).unwrap_or_default();
+
+    if is_error {
+        return Outcome::Failed { class: ErrorClass::AgentCrash, msg: truncate(text, 500) };
+    }
+    if let Some(why) = extract_marker(text, "continue") {
+        return Outcome::Continue { why };
+    }
+    if let Some(why) = extract_marker(text, "blocked") {
+        return Outcome::Blocked { why };
+    }
+    Outcome::Done
+}
+
+/// Looks for a `SYMPHONY_OUTCOME: <kind>: <reason>` line anywhere in the agent's final text —
+/// see the module doc for why this is a text convention rather than a structured signal.
+fn extract_marker(text: &str, kind: &str) -> Option<String> {
+    let prefix = format!("{OUTCOME_MARKER} {kind}:");
+    text.lines().find_map(|l| {
+        l.trim().strip_prefix(&prefix).map(|rest| {
+            let rest = rest.trim();
+            if rest.is_empty() { format!("agent reported {kind}") } else { rest.to_string() }
+        })
+    })
+}
+
+fn extract_usage(v: &serde_json::Value) -> (u64, u64) {
+    let usage = v.pointer("/message/usage");
+    let get = |k: &str| usage.and_then(|u| u.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
+    let in_tok =
+        get("input_tokens") + get("cache_creation_input_tokens") + get("cache_read_input_tokens");
+    (in_tok, get("output_tokens"))
+}
+
+fn extract_text(v: &serde_json::Value) -> Option<String> {
+    v.pointer("/message/content")
+        .and_then(|c| c.as_array())
+        .and_then(|blocks| blocks.iter().find_map(|b| b.get("text").and_then(|t| t.as_str())))
+        .map(|s| truncate(s, 120))
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn build_prompt(issue: &Issue) -> String {
+    let mut p = format!("You are working on issue {}: {}\n\n", issue.identifier, issue.title);
+    if let Some(url) = &issue.url {
+        p.push_str(&format!("Tracker URL: {url}\n\n"));
+    }
+    if let Some(body) = &issue.body {
+        p.push_str("Description:\n");
+        p.push_str(body);
+        p.push_str("\n\n");
+    }
+    p.push_str(
+        "Investigate and resolve this issue in the current working directory, committing your \
+         changes as you go. When you have fully completed the work, simply stop.\n\n\
+         If you have made real progress but need another turn to finish, end your final \
+         message with a line reading exactly:\n\
+         SYMPHONY_OUTCOME: continue: <one-sentence reason>\n\n\
+         If you are stuck and need a human to unblock you, end your final message with:\n\
+         SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
+    );
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_claude").join(name)
+    }
+
+    fn tmp_workspace(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "symphony-claude-worker-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn issue() -> Issue {
+        Issue {
+            id: "iss-1".into(),
+            identifier: "MT-1".into(),
+            title: "t".into(),
+            body: None,
+            state: "In Progress".into(),
+            priority: Some(1),
+            url: None,
+            labels: vec![],
+            dispatchable: true,
+            created_at: None,
+            native_ref: None,
+            blocked_by: vec![],
+        }
+    }
+
+    /// Polls rather than blocking on a channel: the point under test is the worker's own
+    /// behaviour, and a bounded poll fails loudly (panics) instead of hanging the suite if that
+    /// behaviour regresses to "never reports a verdict".
+    fn wait_for_finish(h: &Arc<dyn RunHandle>) -> Outcome {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(o) = h.finished() {
+                return o;
+            }
+            if Instant::now() > deadline {
+                panic!("run did not report a verdict within 10s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_clean_done_stream_reports_done_and_matches_reported_tokens() {
+        let ws = tmp_workspace("done");
+        let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0);
+
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+        let p = h.progress();
+        assert_eq!(p.turns, 2);
+        assert_eq!(p.in_tok, 18, "10 + 8 across the two assistant events");
+        assert_eq!(p.out_tok, 8, "5 + 3 across the two assistant events");
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_symphony_outcome_continue_marker_is_parsed_from_the_final_text() {
+        let ws = tmp_workspace("continue");
+        let w = ClaudeWorker::new(fixture("explicit_continue.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0);
+
+        assert_eq!(
+            wait_for_finish(&h),
+            Outcome::Continue { why: "need another turn to finish tests".into() }
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_crash_with_no_result_event_fails_rather_than_hanging_or_inferring_done() {
+        let ws = tmp_workspace("crash");
+        let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0);
+
+        let outcome = wait_for_finish(&h);
+        assert!(
+            matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }),
+            "got {outcome:?}"
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_partial_trailing_line_is_skipped_not_fatal_to_the_supervisor() {
+        let ws = tmp_workspace("partial");
+        let w = ClaudeWorker::new(fixture("partial_trailing_line.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0);
+
+        // The point under test is that a malformed final line does not panic or hang the
+        // reader thread — it still reaches a verdict (Failed, since no result event arrived).
+        let outcome = wait_for_finish(&h);
+        assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }));
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn killing_a_process_that_ignores_sigterm_forces_it_and_it_is_actually_gone() {
+        let ws = tmp_workspace("silence");
+        let w = ClaudeWorker::new(fixture("silence.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0);
+
+        // Give the script time to install its SIGTERM trap and write its own pid before we
+        // try to kill it.
+        let pid_file = ws.join("pid.txt");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() {
+            if Instant::now() > deadline {
+                panic!("fixture never wrote its pid");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(50)); // let the trap install before we signal
+
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+
+        assert_eq!(h.kill(300), KillResult::Forced);
+
+        // Assert on the pid, not just the return value: signal 0 checks existence without
+        // sending a real one.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the process must actually be gone after a forced kill");
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn no_tracker_credential_reaches_the_child_environment() {
+        let ws = tmp_workspace("env-leak");
+        // SAFETY: a unique key nothing else reads or writes, scoped to this one test.
+        unsafe {
+            std::env::set_var("SYMPHONY_TEST_TRACKER_TOKEN_MUST_NOT_LEAK", "super-secret-value");
+        }
+
+        let w = ClaudeWorker::new(fixture("dump_env.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0);
+        wait_for_finish(&h);
+
+        let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
+        assert!(!dump.contains("SYMPHONY_TEST_TRACKER_TOKEN_MUST_NOT_LEAK"));
+        assert!(!dump.contains("super-secret-value"));
+
+        // SAFETY: cleaning up the same unique key set above.
+        unsafe {
+            std::env::remove_var("SYMPHONY_TEST_TRACKER_TOKEN_MUST_NOT_LEAK");
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn the_session_turn_budget_is_self_enforced_and_reports_continue() {
+        // clean_done.sh emits two assistant turns; a budget of 1 must cut it off after the
+        // first and report Continue rather than waiting for (or trusting) the CLI's own exit.
+        let ws = tmp_workspace("budget");
+        let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 1);
+        let h = w.spawn(&issue(), &ws, 0);
+
+        assert_eq!(
+            wait_for_finish(&h),
+            Outcome::Continue { why: "session turn budget reached".into() }
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_missing_binary_reports_agent_not_found_immediately() {
+        let ws = tmp_workspace("missing-bin");
+        let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
+        let h = w.spawn(&issue(), &ws, 0);
+
+        let outcome = wait_for_finish(&h);
+        assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }));
+        assert_eq!(h.kill(100), KillResult::AlreadyDone);
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+}

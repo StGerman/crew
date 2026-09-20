@@ -13,14 +13,14 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-Slices 1–3 are complete and green: a deterministic core with a fake behind every external
+Slices 1–4 are complete and green: a deterministic core with a fake behind every external
 seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
-Issues tracker. Real workers are the open issue.
+Issues tracker, then a real `claude -p` worker. The MCP tool broker is the open issue.
 
 ## Commands
 
 ```bash
-cargo test                                 # 75 unit + 20 integration
+cargo test                                 # 83 unit + 21 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # integration only
 cargo test a_permanent_failure             # one test; the arg is a substring match
@@ -55,6 +55,15 @@ points the tracker at this repo's own real Issues instead of the fake demo data 
 repo's five open, `agent`-labelled issues and dispatches none of them, because none has an
 assignee yet (see `src/tracker/github.rs`'s module doc for the dispatchability rule and the
 state-label convention).
+
+`worker.kind = "claude"` is the other half — and it is a separate switch from the tracker on
+purpose (see `WorkerConfig`'s doc in [src/config.rs](src/config.rs)): a real tracker with the
+fake worker is a safe way to watch real dispatch decisions without spawning real agents,
+turning "point this at a real repo" into "start editing that repo" only when both are flipped
+deliberately. With it on, `cargo run` spawns real `claude -p` processes with
+`--permission-mode bypassPermissions` — no human answers a tool-use prompt in a headless
+dispatch — against real git worktrees. Treat `--max-ticks` on a config with `worker.kind =
+"claude"` as spawning real, tool-using agent processes, not a dry run.
 
 `dashboard_preview` is the fastest way to see a layout change: it renders a canned `Snapshot`
 through ratatui's `TestBackend`, so there is no terminal and no scheduler involved.
@@ -138,6 +147,30 @@ rate limit gets. That is the honest version of "an auth failure stops trying and
 this scope; a literal per-issue quarantine here would be quarantining tickets a bad token had
 nothing to do with.
 
+`Worker` gets its real implementation in [src/worker/claude.rs](src/worker/claude.rs):
+`ClaudeWorker`, over `claude -p --output-format stream-json`. Two things there were confirmed
+against a real install rather than assumed, because guessing wrong would have meant a worker
+that silently never worked: there is no `--max-turns` flag, so the per-session turn budget is
+self-enforced — the reader thread counts `assistant` events and sends `SIGTERM` once the count
+reaches `max_turns_per_session`, reporting `Outcome::Continue` itself; and `--bare` needs
+`ANTHROPIC_API_KEY`, which an OAuth-authenticated operator (this dev machine included) does not
+have, so it is not passed by default — the worker inherits whatever hooks and MCP servers the
+operator's own `claude` config has until a dedicated API key changes that trade-off. `Outcome`
+beyond done/failed — `Continue`, `Blocked` — has no structural signal from the CLI to key off,
+so the worker's prompt asks the agent to end its final message with `SYMPHONY_OUTCOME:
+continue: <reason>` or `SYMPHONY_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
+and it is a soft convention by design — an agent that forgets it just reads as `Done`.
+
+The first live end-to-end run of `ClaudeWorker` (real agent, real worktree, cut off mid-run by
+`--max-ticks`) left an orphaned `claude` process running after `cargo run` had already
+returned. `RunHandle` says plainly that dropping a handle does not stop the work, and nothing
+before this had ever exercised the "exit with a run still in flight" path — the scheduler's own
+tick loop calls `harvest_finished`/`terminate` for every state transition except "the process
+just quit." `Scheduler::shutdown()` (called from `main.rs` after the loop) and a `Drop for
+Scheduler` safety net (for a panic or an early `?` return that skips the explicit call) both
+terminate every run still in `self.running` before letting the process end. If you add another
+place `main.rs` can exit, check that this still runs.
+
 ## Invariants
 
 Each of these closes a defect found in the original spec, and each has a test that fails
@@ -176,13 +209,14 @@ hold. They cover different paths; keep all three.
 The backlog is GitHub Issues on this repository, labelled `agent` — which is exactly the shape
 `TrackerConfig.required_labels` filters on. Work is picked up from there, not from a plan file.
 
-The worktree, projection and tracker slices have landed: `main.rs` wires
-`GitWorktreeWorkspace`, `TasksProjector`, and — when `tracker.kind = "github"` —
-`GithubTracker` by default. `symphony.github.toml` points at this repo; real workers are what
-remain before `symphony-cc` can dispatch against its own backlog end to end, so
-`symphony.toml`, the default config, stays on `kind = "fake"` until then. When you change
-scheduler behaviour, ask whether the change would still be correct when the agent running it
-is working on this repo.
+Every seam symphony-cc needs to dispatch against its own backlog now has a real
+implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`
+(`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`). `symphony.github.toml`
+sets the first three; flipping `worker.kind` to `"claude"` in that same file is what turns
+"list this repo's backlog" into "work it" — a decision left to whoever runs it, not a default.
+`symphony.toml`, the default config, stays on `kind = "fake"` for both so the quickstart
+experience is unchanged. When you change scheduler behaviour, ask whether the change would
+still be correct when the agent running it is working on this repo.
 
 [.mcp.json](.mcp.json) hands the agent rust-analyzer over MCP, so navigation in this repo is
 LSP rather than grep — which is what makes the invariant table above checkable: whether
@@ -200,17 +234,21 @@ that has already been broken. Only `rename` (which refuses outright) and `diagno
 (which carries a `complete` flag) wait for a quiescent workspace. Ask again until an answer
 is non-empty before concluding anything from one.
 
-## Constraints for the worker and broker slices
+## Constraints for the worker and broker
 
-Decisions already taken that are expensive to rediscover:
+Decisions already taken that are expensive to rediscover. The first two are implemented in
+[src/worker/claude.rs](src/worker/claude.rs); the third is still slice 5:
 
-- Build the worker's child environment from an explicit **allowlist**. Do not inherit and
-  scrub — a denylist is fragile, and one missed variable leaks a tracker credential into a
-  coding agent.
-- **Never launch a worker via `bash -lc`.** A login shell re-imports from the operator's
-  dotfiles exactly the secrets that were just scrubbed.
-- The MCP tool broker executes tracker writes host-side while holding the credential. The
-  worker receives results, never a raw token.
+- The worker's child environment is built from an explicit **allowlist**
+  (`DEFAULT_ENV_ALLOWLIST`) — not inherit-and-scrub. A denylist is fragile, and one missed
+  variable leaks a tracker credential into a coding agent. Notably absent by default: any
+  tracker credential and any API key — an operator on API-key auth adds `ANTHROPIC_API_KEY`
+  deliberately, it is not there by default.
+- The worker execs the `claude` binary directly (`Command::new`, never a shell). **No `bash
+  -lc`.** A login shell re-imports from the operator's dotfiles exactly the secrets that were
+  just scrubbed.
+- The MCP tool broker (slice 5, not yet built) executes tracker writes host-side while holding
+  the credential. The worker receives results, never a raw token.
 
 ## Troubleshooting
 

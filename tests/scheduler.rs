@@ -37,6 +37,7 @@ fn issue(n: u32, state: &str, prio: Option<i32>) -> Issue {
         id: format!("iss-{n}"),
         identifier: format!("MT-{n}"),
         title: format!("issue {n}"),
+        body: None,
         state: state.to_string(),
         priority: prio,
         url: None,
@@ -66,6 +67,7 @@ fn harness(issues: Vec<Issue>, tune: impl FnOnce(&mut Config)) -> Harness {
         polling: PollingConfig { interval_ms: 30_000 },
         workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
         agent: AgentConfig::default(),
+        worker: Default::default(),
     };
     tune(&mut cfg);
     cfg.preflight().expect("test config must be valid");
@@ -407,6 +409,41 @@ fn a_ticket_leaving_the_active_set_stops_the_run_but_keeps_the_workspace() {
 
     assert_eq!(h.sched.running_count(), 0);
     assert!(PathBuf::from(&ws).exists(), "non-terminal exits must not discard warm state");
+}
+
+/// A `RunHandle` outlives the `Scheduler` unless something kills it explicitly — found
+/// empirically the first time a real worker process was left running after `cargo run`
+/// returned with a run still in flight, because nothing had ever called `terminate` on it.
+#[test]
+fn shutdown_stops_every_in_flight_run_without_discarding_its_workspace() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(1))], |c| {
+            c.agent.max_concurrent = 2;
+        });
+    h.worker.set_default(Script::succeeds_in(600_000));
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 2);
+    let workspaces: Vec<PathBuf> = h
+        .sched
+        .snapshot()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| PathBuf::from(r.workspace.clone().unwrap()))
+        .collect();
+
+    h.sched.shutdown().unwrap();
+
+    assert_eq!(h.sched.running_count(), 0);
+    for ws in &workspaces {
+        assert!(ws.exists(), "shutdown must not discard warm state, only stop the run");
+    }
+
+    // The claim must be released too, or the issue would never be dispatchable again.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 2, "a released issue is picked back up on the next tick");
 }
 
 /// The spec kills on the first refresh miss, so a single eventual-consistency blip destroys

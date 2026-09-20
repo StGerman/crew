@@ -132,6 +132,8 @@ struct GhIssue {
     number: u64,
     node_id: String,
     title: String,
+    #[serde(default)]
+    body: Option<String>,
     state: String,
     html_url: String,
     #[serde(default)]
@@ -180,6 +182,7 @@ fn to_issue(owner: &str, repo: &str, gh: GhIssue) -> Issue {
         id: format!("{owner}/{repo}#{}", gh.number),
         identifier: format!("#{}", gh.number),
         title: gh.title,
+        body: gh.body,
         state: derive_state(closed, &labels),
         priority: None, // GitHub has no native priority; an adapter over Projects v2 could add one.
         url: Some(gh.html_url),

@@ -43,6 +43,22 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub worker: WorkerConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    /// `fake` (default) or `claude`. Deliberately independent of `tracker.kind` — a real
+    /// tracker with a fake worker is a safe way to watch real dispatch decisions without
+    /// spawning real agents; making `claude` the default the moment a real tracker is
+    /// configured would turn "point this at a real repo" into "start editing that repo" with
+    /// no separate decision in between.
+    #[serde(default)]
+    pub kind: String,
+    /// Only used when `kind = "claude"`. Defaults to `"claude"` — resolved via `PATH`.
+    #[serde(default)]
+    pub bin: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -244,6 +260,7 @@ mod tests {
             polling: Default::default(),
             workspace: Default::default(),
             agent: Default::default(),
+            worker: Default::default(),
         };
         c.normalize();
         c

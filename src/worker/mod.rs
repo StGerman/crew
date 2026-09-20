@@ -4,6 +4,7 @@
 //! "maybe continue" from a clean process exit and re-dispatches on a 1s timer, which is how it
 //! runs away; here the verdict is data, and only `Continue` earns another dispatch.
 
+pub mod claude;
 pub mod fake;
 
 use std::sync::Arc;

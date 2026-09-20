@@ -18,6 +18,8 @@ use symphony_cc::tracker::Tracker;
 use symphony_cc::tracker::fake::FakeTracker;
 use symphony_cc::tracker::github::{GithubTracker, UreqHttp};
 use symphony_cc::tui::{Ui, UiAction};
+use symphony_cc::worker::Worker;
+use symphony_cc::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
 use symphony_cc::worker::fake::{FakeWorker, Script};
 use symphony_cc::workspace::GitWorktreeWorkspace;
 use tokio::sync::{mpsc, watch};
@@ -85,11 +87,30 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // The worker is still a fake — slice 4 swaps this line for a real implementation without
-    // the scheduler noticing.
-    let worker = Arc::new(FakeWorker::new(clock.clone()));
+    let use_real_worker = cfg.worker.kind.trim().eq_ignore_ascii_case("claude");
+    let use_github_tracker = cfg.tracker.kind.trim().eq_ignore_ascii_case("github");
 
-    let tracker: Arc<dyn Tracker> = if cfg.tracker.kind.trim().eq_ignore_ascii_case("github") {
+    // Deliberately independent of the tracker: see WorkerConfig's doc for why a real tracker
+    // does not imply a real worker.
+    let worker: Arc<dyn Worker> = if use_real_worker {
+        let bin = cfg.worker.bin.clone().unwrap_or_else(|| "claude".to_string());
+        Arc::new(ClaudeWorker::new(
+            bin,
+            DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
+            cfg.agent.max_turns_per_session,
+        ))
+    } else {
+        let fake = Arc::new(FakeWorker::new(clock.clone()));
+        // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
+        // silently ignored, since none of those ids would ever be dispatched) against a real
+        // tracker's real ids.
+        if !use_github_tracker {
+            seed_demo_scripts(&fake);
+        }
+        fake
+    };
+
+    let tracker: Arc<dyn Tracker> = if use_github_tracker {
         let token = std::env::var("GITHUB_TOKEN")
             .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
         Arc::new(GithubTracker::new(
@@ -100,10 +121,15 @@ async fn main() -> anyhow::Result<()> {
             &cfg.tracker.required_labels,
         ))
     } else {
-        let fake = Arc::new(FakeTracker::demo());
-        seed_demo_scripts(&worker);
-        fake
+        Arc::new(FakeTracker::demo())
     };
+
+    if use_real_worker && use_github_tracker {
+        tracing::warn!(
+            "real tracker + real worker: this run will dispatch actual coding agents against \
+             real issues and let them commit to real worktrees"
+        );
+    }
 
     tracing::info!(
         config = %args.config.display(),
@@ -170,6 +196,12 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
         }
+    }
+
+    // A RunHandle outlives the Scheduler unless something kills it explicitly; exiting with
+    // runs still in flight would otherwise orphan real worker processes.
+    if let Err(e) = sched.shutdown() {
+        tracing::error!(error = %e, "shutdown cleanup failed");
     }
 
     if let Some(h) = ui {

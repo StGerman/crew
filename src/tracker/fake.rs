@@ -44,6 +44,7 @@ impl FakeTracker {
             id: format!("iss-{n:03}"),
             identifier: format!("MT-{}", 600 + n),
             title: title.to_string(),
+            body: Some(format!("Demo body text for {title}.")),
             state: state.to_string(),
             priority: prio,
             url: Some(format!("https://tracker.example/issues/MT-{}", 600 + n)),

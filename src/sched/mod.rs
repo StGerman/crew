@@ -758,4 +758,44 @@ impl Scheduler {
         self.store.unquarantine(self.clock.as_ref(), issue_id)?;
         Ok(())
     }
+
+    /// Stop every in-flight run before the process exits.
+    ///
+    /// A worker `RunHandle` outlives the `Scheduler` that spawned it unless something kills it
+    /// explicitly — dropping the handle does not stop the underlying process. Without this, a
+    /// real worker process (and its supervising threads) becomes orphaned the moment the
+    /// orchestrator exits with runs still in flight: caught empirically, not hypothetically —
+    /// the first live end-to-end run of the real worker left a `claude` process running after
+    /// `cargo run` returned, because nothing had ever called `terminate` on it. No cleanup: the
+    /// issue is not terminal, so the workspace is preserved for reuse on the next start, the
+    /// same as `detect_stalls`. The claim is released so the issue is dispatchable again too.
+    pub fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.terminate_all_running()
+    }
+
+    fn terminate_all_running(&mut self) -> anyhow::Result<()> {
+        let ids: Vec<String> = self.running.keys().cloned().collect();
+        for id in ids {
+            tracing::info!(issue_id = %id, "stopping in-flight run for shutdown");
+            self.terminate(&id, false)?;
+            self.store.release(self.clock.as_ref(), &id)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Scheduler {
+    /// Last-resort safety net for exit paths that skip the explicit `shutdown()` call — an
+    /// early return via `?`, a panic unwinding past the normal loop. `drop` cannot propagate a
+    /// `Result`, so a failure here is logged, not surfaced; the `is_empty` guard keeps this
+    /// silent on the expected path, where `shutdown()` already emptied `running`.
+    fn drop(&mut self) {
+        if self.running.is_empty() {
+            return;
+        }
+        tracing::warn!("scheduler dropped with runs still in flight; terminating them now");
+        if let Err(e) = self.terminate_all_running() {
+            tracing::warn!(error = %e, "cleanup on drop failed");
+        }
+    }
 }

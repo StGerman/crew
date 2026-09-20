@@ -188,6 +188,7 @@ mod tests {
             id: "iss-1".into(),
             identifier: "MT-1".into(),
             title: "t".into(),
+            body: None,
             state: "In Progress".into(),
             priority: Some(1),
             url: None,
