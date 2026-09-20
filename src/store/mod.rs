@@ -645,7 +645,8 @@ mod tests {
         for n in 1..=4 {
             c.advance_ms(1_000);
             s.start_run(&c, &format!("run-1-{n}"), "id-1", "sess-1").unwrap();
-            s.finish_run(&c, &format!("run-1-{n}"), "done", n, 10 * n as u64, n as u64).unwrap();
+            let tok = TokenUsage { input: 10 * n as u64, output: n as u64 };
+            s.finish_run(&c, &format!("run-1-{n}"), "done", n, Some(tok)).unwrap();
         }
         s.start_run(&c, "run-2-1", "id-2", "sess-2").unwrap();
 
@@ -663,6 +664,21 @@ mod tests {
         assert_eq!(for_2.len(), 1);
         assert!(for_2[0].ended_at.is_none(), "a run still in flight has no end");
         assert_eq!(for_2[0].outcome, None);
+    }
+
+    /// Schema v3 made the token columns nullable; `recent_runs` reads them on every tick, via
+    /// `snapshot`. SQLite hands a NULL to a non-null integer read as an error, not a zero — so
+    /// one budget-cut run would have turned every later tick into a failed one.
+    #[test]
+    fn a_run_that_reported_no_total_still_appears_in_history() {
+        let (s, c) = setup();
+        s.start_run(&c, "run-a", "id-1", "sess-1").unwrap();
+        s.finish_run(&c, "run-a", "killed", 2, None).unwrap();
+
+        let runs = s.recent_runs(5).unwrap();
+        let run = runs.iter().find(|r| r.run_id == "run-a").expect("it is still history");
+        assert_eq!(run.in_tok, None, "unknown, which is not the same as zero");
+        assert_eq!(run.out_tok, None);
     }
 
     #[test]

@@ -22,7 +22,7 @@ the published snapshot.
 ## Commands
 
 ```bash
-cargo test                                 # 130 unit + 37 integration
+cargo test                                 # 131 unit + 37 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -286,10 +286,10 @@ agent onto its worktree.
 
 ## Invariants
 
-Each of these closes a defect found in the original spec — bar the last five: two from the
-first dogfooding review, two from putting an operator surface on top of the same state, and one
-that is issue #1's acceptance criterion made executable, and one from the first live dispatch
-— and each has a test that fails without it. Several only fail in
+Each of these closes a defect found in the original spec — bar the last six: two from the first
+dogfooding review, two from putting an operator surface on top of the same state, one that is
+issue #1's acceptance criterion made executable, and one from the first live dispatch — and each
+has a test that fails without it. Several only fail in
 the exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
 
