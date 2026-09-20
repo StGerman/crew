@@ -62,7 +62,7 @@ fn harness(issues: Vec<Issue>, tune: impl FnOnce(&mut Config)) -> Harness {
             required_labels: vec![],
         },
         polling: PollingConfig { interval_ms: 30_000 },
-        workspace: WorkspaceConfig { root: Some(root.clone()) },
+        workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
         agent: AgentConfig::default(),
     };
     tune(&mut cfg);

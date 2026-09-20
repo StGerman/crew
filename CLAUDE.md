@@ -13,13 +13,14 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-Slice 1 — the deterministic core, with a fake behind every external seam — is complete and
-green. Real git worktrees, a real tracker and real workers are the open issues.
+Slices 1–2 are complete and green: a deterministic core with a fake behind every external
+seam, then real git worktrees and a real `~/.claude/tasks` projection behind those same
+seams. A real tracker and real workers are the open issues.
 
 ## Commands
 
 ```bash
-cargo test                                 # 42 unit + 20 integration
+cargo test                                 # 57 unit + 20 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # integration only
 cargo test a_permanent_failure             # one test; the arg is a substring match
@@ -33,8 +34,17 @@ cargo run --example dashboard_preview      # render the UI to stdout, no termina
 ```
 
 `SYMPHONY_DB=/tmp/x.db` points the store somewhere disposable — worth doing before any run
-that might write state you do not want kept. `RUST_LOG=symphony_cc=debug` raises the log
+that might write state you do not want kept. `SYMPHONY_TASKS_ROOT=/tmp/tasks` does the same
+for the `~/.claude/tasks` projection, so a smoke run's demo issues (`iss-001`, `MT-601`, ...)
+don't land in your real Claude Code task list. `RUST_LOG=symphony_cc=debug` raises the log
 level; logs always go to stderr, because under `--tui` the alternate screen owns stdout.
+
+Headless runs now create real `git worktree`s under `workspace.root` (default
+`.symphony/workspaces`, gitignored) against `workspace.repo` (default `.`) and real files
+under `~/.claude/tasks/<derived-session-id>/`. Both are best-effort seams — a worktree or
+projection failure degrades the run, it does not stop it — but they are real disk and git
+state, not a simulation, so use the env overrides above when you just want to watch the
+scheduler and don't want the side effects.
 
 `dashboard_preview` is the fastest way to see a layout change: it renders a canned `Snapshot`
 through ratatui's `TestBackend`, so there is no terminal and no scheduler involved.
@@ -74,7 +84,9 @@ stranding the runs already in flight. Do not move the `preflight()` call earlier
 4. The projection is one-way ([src/project.rs](src/project.rs)). The orchestrator writes to
    `~/.claude/tasks` and never reads it back for a scheduling decision — it is Claude Code's
    internal store with no published schema, so a change there must cost a dashboard, not the
-   scheduler.
+   scheduler. `TasksProjector` probes one existing task file's shape at startup and disables
+   itself with a warning if the keys it depends on are missing; that probe is the one read this
+   type performs, and its result only ever flips this type's own on/off switch.
 
 **The store is a cache of judgment, not a system of record.** Losing `symphony.db` degrades
 to stateless re-polling, never to incorrect behaviour.
@@ -83,7 +95,13 @@ to stateless re-polling, never to incorrect behaviour.
 mutates the same `running` map as dispatch, so splitting it meant threading the whole
 scheduler through a free function. The `Tracker` trait is deliberately a two-method read
 kernel (`by_states`, `by_ids`); ticket *mutations* belong to the agent through host-executed
-tools, not to this trait.
+tools, not to this trait. `Workspace` has two implementations behind the trait:
+`DirWorkspace` (plain directories, what the scheduler tests use — real git is slower and adds
+nothing to a test that fakes the worker too) and `GitWorktreeWorkspace` (real, what `main.rs`
+wires by default). Reuse in the latter checks for a `.git` *file* at the target path, not
+bare existence — a plain directory there, e.g. left by a prior `DirWorkspace` run against the
+same root, must surface through git's own "already exists" error rather than being silently
+trusted as an already-prepared worktree.
 
 ## Invariants
 
@@ -123,9 +141,12 @@ hold. They cover different paths; keep all three.
 The backlog is GitHub Issues on this repository, labelled `agent` — which is exactly the shape
 `TrackerConfig.required_labels` filters on. Work is picked up from there, not from a plan file.
 
-Once the worktree, tracker and worker slices land, `symphony-cc` polls this repository and
-dispatches against its own backlog, with `~/.claude/tasks` as the operator-visible surface.
-Until then `symphony.toml` stays on `kind = "fake"`. When you change scheduler behaviour, ask
+The worktree and projection slices have landed: `main.rs` wires `GitWorktreeWorkspace`
+(`workspace.repo`, defaulting to `.`) and `TasksProjector` by default, so a headless run
+against this repo creates real worktrees under `.symphony/workspaces` and real files under
+`~/.claude/tasks`. A real tracker and real workers are what remain before `symphony-cc` can
+poll this repository and dispatch against its own backlog end to end. Until the tracker
+lands, `symphony.toml` stays on `kind = "fake"`. When you change scheduler behaviour, ask
 whether the change would still be correct when the agent running it is working on this repo.
 
 [.mcp.json](.mcp.json) hands the agent rust-analyzer over MCP, so navigation in this repo is

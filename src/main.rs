@@ -11,13 +11,13 @@ use anyhow::Context;
 use clap::Parser;
 use symphony_cc::clock::{Clock, SystemClock};
 use symphony_cc::config::Config;
-use symphony_cc::project::NoopProjector;
+use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use symphony_cc::sched::{Scheduler, Snapshot};
 use symphony_cc::store::Store;
 use symphony_cc::tracker::fake::FakeTracker;
 use symphony_cc::tui::{Ui, UiAction};
 use symphony_cc::worker::fake::{FakeWorker, Script};
-use symphony_cc::workspace::DirWorkspace;
+use symphony_cc::workspace::GitWorktreeWorkspace;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
@@ -64,10 +64,27 @@ async fn main() -> anyhow::Result<()> {
         .root
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("symphony_workspaces"));
-    let workspace = Arc::new(DirWorkspace::new(&ws_root)?);
+    let repo = cfg.workspace.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+    let workspace = Arc::new(GitWorktreeWorkspace::new(&ws_root, &repo)?);
 
-    // Slice 1 is fakes end to end. Slice 2 swaps these two lines for real implementations
-    // without the scheduler noticing.
+    let tasks_root = std::env::var_os("SYMPHONY_TASKS_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude/tasks")))
+        .unwrap_or_else(|| PathBuf::from(".claude/tasks"));
+    // The session id is derived from the canonical workspace root rather than generated fresh,
+    // so a restart of the same deployment updates one directory instead of littering a new one
+    // on every process start.
+    let session_id = derive_session_id(&workspace.root().display().to_string());
+    let projector: Arc<dyn Projector> = match TasksProjector::new(&tasks_root, &session_id) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "task projection setup failed; running without it");
+            Arc::new(NoopProjector)
+        }
+    };
+
+    // Slice 1 is fakes end to end. The tracker and worker are still fakes — slices 3 and 4
+    // swap these two lines for real implementations without the scheduler noticing.
     let tracker = Arc::new(FakeTracker::demo());
     let worker = Arc::new(FakeWorker::new(clock.clone()));
     seed_demo_scripts(&worker);
@@ -82,15 +99,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let interval_ms = cfg.polling.interval_ms;
-    let mut sched = Scheduler::new(
-        cfg,
-        clock.clone(),
-        store,
-        tracker,
-        worker,
-        workspace,
-        Arc::new(NoopProjector),
-    );
+    let mut sched =
+        Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
     let (act_tx, mut act_rx) = mpsc::unbounded_channel::<UiAction>();
