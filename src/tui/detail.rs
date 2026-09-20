@@ -1,0 +1,75 @@
+//! Detail pane for the selected issue.
+
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+use super::{fmt_count, fmt_ms};
+use crate::sched::Row;
+
+fn field<'a>(label: &'a str, value: impl Into<String>) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(Color::DarkGray)),
+        Span::raw(value.into()),
+    ])
+}
+
+pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" detail ", Style::default().add_modifier(Modifier::BOLD)));
+
+    let Some(r) = row else {
+        let p = Paragraph::new("no issues tracked yet")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(block);
+        f.render_widget(p, area);
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                r.identifier.clone(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::raw(r.title.clone()),
+        ]),
+        field("state", format!("{}  ·  {}", r.tracker_state, r.phase.label())),
+        field(
+            "turns",
+            match r.attempt {
+                0 => format!("{} (first attempt)", r.turns),
+                n => format!("{} (attempt {n})", r.turns),
+            },
+        ),
+        field("tokens", format!("{} in / {} out", fmt_count(r.in_tok), fmt_count(r.out_tok))),
+    ];
+
+    if let Some(ws) = &r.workspace {
+        lines.push(field("workspace", ws.clone()));
+    }
+    if let Some(url) = &r.url {
+        lines.push(field("url", url.clone()));
+    }
+    if let Some(due) = r.retry_in_ms {
+        lines.push(field(
+            "retry",
+            if due > 0 { format!("in {}", fmt_ms(due as u64)) } else { "due now".into() },
+        ));
+    }
+    if let Some(err) = &r.last_error {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<12}", "error"), Style::default().fg(Color::DarkGray)),
+            Span::styled(err.clone(), Style::default().fg(Color::Red)),
+        ]));
+    }
+    if r.quarantined {
+        lines.push(Line::from(Span::styled(
+            "quarantined — press u to clear",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
+}

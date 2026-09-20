@@ -1,0 +1,28 @@
+# Development config: fake tracker, simulated workers, fast tick so the dashboard moves.
+
+[tracker]
+kind = "fake"
+active_states = ["In Progress", "In Review"]
+terminal_states = ["Done", "Cancelled"]
+required_labels = ["agent"]
+
+[polling]
+interval_ms = 2000
+
+[workspace]
+root = ".symphony/workspaces"
+
+[agent]
+max_concurrent = 3
+max_turns_per_session = 20
+# The cross-session budget. `max_turns_per_session` alone cannot bound an issue, because each
+# continuation starts a fresh session with its own allowance.
+max_turns_per_issue = 40
+max_retry_backoff_ms = 60000
+stall_timeout_ms = 15000
+quarantine_after_identical = 3
+refresh_miss_grace = 2
+
+# Cap a busy state independently of the global limit.
+[agent.max_concurrent_by_state]
+"in review" = 1
