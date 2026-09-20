@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use symphony_cc::broker::fake::FakeWrites;
+use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
 use symphony_cc::config::Config;
 use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
@@ -94,11 +96,14 @@ async fn main() -> anyhow::Result<()> {
     // does not imply a real worker.
     let worker: Arc<dyn Worker> = if use_real_worker {
         let bin = cfg.worker.bin.clone().unwrap_or_else(|| "claude".to_string());
-        Arc::new(ClaudeWorker::new(
-            bin,
-            DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
-            cfg.agent.max_turns_per_session,
-        ))
+        // An operator-supplied list replaces the default outright rather than extending it, so
+        // what reaches the child is exactly what the config says.
+        let env_allowlist = cfg
+            .worker
+            .env_allowlist
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
+        Arc::new(ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session))
     } else {
         let fake = Arc::new(FakeWorker::new(clock.clone()));
         // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
@@ -110,18 +115,30 @@ async fn main() -> anyhow::Result<()> {
         fake
     };
 
-    let tracker: Arc<dyn Tracker> = if use_github_tracker {
+    // One adapter, two traits: the GitHub tracker reads for the scheduler and writes for the
+    // broker over the same credential, which never leaves this process either way.
+    let (tracker, writes): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>) = if use_github_tracker {
         let token = std::env::var("GITHUB_TOKEN")
             .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
-        Arc::new(GithubTracker::new(
+        let gh = Arc::new(GithubTracker::new(
             UreqHttp::default(),
             &cfg.tracker.owner,
             &cfg.tracker.repo,
             &token,
             &cfg.tracker.required_labels,
-        ))
+        ));
+        (gh.clone(), gh)
     } else {
-        Arc::new(FakeTracker::demo())
+        // The demo tracker has nothing to write to, so broker calls are recorded and dropped.
+        // That still exercises the whole path — scoping, budgets, audit — without a network.
+        (Arc::new(FakeTracker::demo()), Arc::new(FakeWrites::new()))
+    };
+
+    let broker = if cfg.broker.enabled {
+        start_broker(&cfg, writes, clock.clone())
+    } else {
+        tracing::info!("broker disabled by config; agents run without tracker tools");
+        None
     };
 
     if use_real_worker && use_github_tracker {
@@ -143,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let interval_ms = cfg.polling.interval_ms;
     let mut sched =
         Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
+    sched.set_broker(broker);
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
     let (act_tx, mut act_rx) = mpsc::unbounded_channel::<UiAction>();
@@ -208,6 +226,50 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.join();
     }
     Ok(())
+}
+
+/// Bind the broker's loopback listener and start serving.
+///
+/// Every failure here returns `None` rather than propagating: a broker that cannot start is an
+/// agent without tracker tools, which is a degrade the whole design allows for. Failing startup
+/// over it would turn an optional capability into a required one.
+fn start_broker(
+    cfg: &Config,
+    writes: Arc<dyn TrackerWrites>,
+    clock: Arc<dyn Clock>,
+) -> Option<Arc<Broker>> {
+    let listener = match broker::server::bind() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "broker could not bind; agents run without tracker tools");
+            return None;
+        }
+    };
+    let addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "broker listener has no address; running without tools");
+            return None;
+        }
+    };
+
+    // Per-process, so two orchestrators on one host cannot collide or read each other's tokens.
+    let config_dir = std::env::temp_dir().join(format!("symphony-mcp-{}", std::process::id()));
+    let limits = BrokerLimits {
+        max_calls_per_run: cfg.broker.max_calls_per_run,
+        max_calls_per_issue: cfg.broker.max_calls_per_issue,
+    };
+
+    let broker = match Broker::new(writes, clock, limits, cfg.known_states(), addr, &config_dir) {
+        Ok(b) => Arc::new(b),
+        Err(e) => {
+            tracing::warn!(error = %e, "broker setup failed; agents run without tracker tools");
+            return None;
+        }
+    };
+    broker::server::serve(Arc::clone(&broker), listener);
+    tracing::info!(%addr, states = ?cfg.known_states(), "tool broker listening");
+    Some(broker)
 }
 
 /// Give the demo tracker a spread of behaviours so the dashboard shows every state worth

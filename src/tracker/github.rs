@@ -41,10 +41,12 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::{Tracker, TrackerError};
+use crate::broker::TrackerWrites;
 use crate::model::Issue;
 
 const API_BASE: &str = "https://api.github.com";
@@ -71,14 +73,28 @@ impl HttpResponse {
 #[error("http transport error: {0}")]
 pub struct HttpTransportError(pub String);
 
-/// Everything `GithubTracker` needs from the network, and nothing more — one authenticated GET.
-/// No POST/PATCH: this adapter is read-only by design (see [`super`]'s module doc), so nothing
-/// on this trait can mutate a ticket.
+/// Everything `GithubTracker` needs from the network: one authenticated read, one
+/// authenticated write.
+///
+/// The write half arrived with the tool broker and is used only by this type's
+/// [`TrackerWrites`] impl — never by [`Tracker`], which stays a read kernel. Keeping them as
+/// separate methods rather than one general `request` is what makes that split visible at the
+/// seam: a fake can answer reads and refuse writes, and a reader can see at a glance which
+/// call sites can mutate a ticket.
 pub trait Http: Send + Sync {
     fn get(
         &self,
         url: &str,
         headers: &[(&str, String)],
+    ) -> Result<HttpResponse, HttpTransportError>;
+
+    /// `method` is `POST`, `PATCH` or `PUT`; `body` is a JSON document.
+    fn send_json(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &[u8],
     ) -> Result<HttpResponse, HttpTransportError>;
 }
 
@@ -111,6 +127,39 @@ impl Http for UreqHttp {
             req = req.header(*k, v);
         }
         let mut resp = req.call().map_err(|e| HttpTransportError(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or_default().to_string()))
+            .collect();
+        let body = resp
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| HttpTransportError(format!("reading response body: {e}")))?;
+        Ok(HttpResponse { status, headers, body })
+    }
+
+    fn send_json(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpTransportError> {
+        let mut req = match method {
+            "POST" => self.agent.post(url),
+            "PATCH" => self.agent.patch(url),
+            "PUT" => self.agent.put(url),
+            other => return Err(HttpTransportError(format!("unsupported method {other}"))),
+        };
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        let mut resp = req
+            .header("Content-Type", "application/json")
+            .send(body)
+            .map_err(|e| HttpTransportError(e.to_string()))?;
         let status = resp.status().as_u16();
         let headers = resp
             .headers()
@@ -231,20 +280,29 @@ impl<H: Http> GithubTracker<H> {
     /// as absence rather than as an error.
     fn request(&self, url: &str) -> Result<HttpResponse, TrackerError> {
         let resp = self.http.get(url, &self.headers()).map_err(|e| TrackerError::Request(e.0))?;
+        classify(resp)
+    }
 
-        if (200..300).contains(&resp.status) {
-            return Ok(resp);
-        }
-        if resp.status == 401 {
-            return Err(TrackerError::Auth(body_snippet(&resp)));
-        }
-        let rate_limited = resp.status == 403 || resp.status == 429;
-        let rate_limit_signal = resp.header("retry-after").is_some()
-            || resp.header("x-ratelimit-remaining").is_some_and(|v| v == "0");
-        if rate_limited && rate_limit_signal {
-            return Err(TrackerError::RateLimited);
-        }
-        Err(TrackerError::Status(format!("{}: {}", resp.status, body_snippet(&resp))))
+    /// One authenticated write, classified the same way a read is — so a broker tool failing
+    /// on a bad credential and a poll failing on one produce the same `TrackerError` variant
+    /// and the same log level.
+    fn write(&self, method: &str, url: &str, body: &Value) -> Result<HttpResponse, TrackerError> {
+        let payload =
+            serde_json::to_vec(body).map_err(|e| TrackerError::Response(e.to_string()))?;
+        let resp = self
+            .http
+            .send_json(method, url, &self.headers(), &payload)
+            .map_err(|e| TrackerError::Request(e.0))?;
+        classify(resp)
+    }
+
+    fn number_for(&self, issue_id: &str) -> Result<u64, TrackerError> {
+        parse_dispatch_id(issue_id, &self.owner, &self.repo).ok_or_else(|| {
+            TrackerError::Status(format!(
+                "{issue_id} is not an issue in {}/{}",
+                self.owner, self.repo
+            ))
+        })
     }
 
     fn parse_issues(resp: &HttpResponse) -> Result<Vec<GhIssue>, TrackerError> {
@@ -348,6 +406,97 @@ impl<H: Http> Tracker for GithubTracker<H> {
     }
 }
 
+/// Maps a response onto [`TrackerError`]. Shared by the read and write paths so they cannot
+/// drift — a 401 must mean `Auth` for both, or the scheduler's retryable/permanent split stops
+/// being trustworthy for half the calls.
+fn classify(resp: HttpResponse) -> Result<HttpResponse, TrackerError> {
+    if (200..300).contains(&resp.status) {
+        return Ok(resp);
+    }
+    if resp.status == 401 {
+        return Err(TrackerError::Auth(body_snippet(&resp)));
+    }
+    let rate_limited = resp.status == 403 || resp.status == 429;
+    let rate_limit_signal = resp.header("retry-after").is_some()
+        || resp.header("x-ratelimit-remaining").is_some_and(|v| v == "0");
+    if rate_limited && rate_limit_signal {
+        return Err(TrackerError::RateLimited);
+    }
+    Err(TrackerError::Status(format!("{}: {}", resp.status, body_snippet(&resp))))
+}
+
+/// Ticket mutations, for the broker only.
+///
+/// The state mapping is the read path's run backwards: `by_states` derives a state from a
+/// `state:<name>` label with `closed` overriding it, so moving an issue means rewriting that
+/// label *and* the open/closed flag together. Doing only one of the two would produce an issue
+/// whose state depends on which of the two signals you looked at — precisely the ambiguity the
+/// "closed always wins" rule in the module doc exists to resolve.
+///
+/// `set_state` costs three requests (read labels, replace labels, set open/closed) rather than
+/// one. That is the price of the label convention and it is charged only when an agent moves
+/// its own ticket, which is bounded by the broker's own call budget — see the rate-limit budget
+/// note in the module doc before assuming it is free.
+impl<H: Http> TrackerWrites for GithubTracker<H> {
+    fn comment(&self, issue_id: &str, body: &str) -> Result<String, TrackerError> {
+        let number = self.number_for(issue_id)?;
+        let url = format!("{API_BASE}/repos/{}/{}/issues/{number}/comments", self.owner, self.repo);
+        let resp = self.write("POST", &url, &json!({ "body": body }))?;
+        Ok(created_url(&resp).unwrap_or_else(|| format!("commented on {issue_id}")))
+    }
+
+    fn set_state(&self, issue_id: &str, state: &str) -> Result<String, TrackerError> {
+        let number = self.number_for(issue_id)?;
+
+        // Read-modify-write, because GitHub's label endpoint replaces the whole set: anything
+        // not sent back is removed, and `required_labels` (the `agent` label this repo
+        // dispatches on) living in that set means a blind write would make the issue
+        // undispatchable.
+        let current = self
+            .by_ids(std::slice::from_ref(&issue_id.to_string()))?
+            .pop()
+            .ok_or_else(|| TrackerError::Status(format!("{issue_id} is not visible")))?;
+
+        let closed = state == "closed";
+        let mut labels: Vec<String> =
+            current.labels.into_iter().filter(|l| !l.starts_with("state:")).collect();
+        // `open` and `closed` are carried by the flag itself, so they get no label of their own
+        // — a `state:open` label would be a second, disagreeing source of truth.
+        if !closed && state != "open" {
+            labels.push(format!("state:{state}"));
+        }
+
+        let labels_url =
+            format!("{API_BASE}/repos/{}/{}/issues/{number}/labels", self.owner, self.repo);
+        self.write("PUT", &labels_url, &json!({ "labels": labels }))?;
+
+        let issue_url = format!("{API_BASE}/repos/{}/{}/issues/{number}", self.owner, self.repo);
+        let want = if closed { "closed" } else { "open" };
+        self.write("PATCH", &issue_url, &json!({ "state": want }))?;
+
+        Ok(format!("{issue_id} is now {state}"))
+    }
+
+    fn link_pr(&self, issue_id: &str, url: &str) -> Result<String, TrackerError> {
+        // GitHub has no "linked PR" field on an issue that is writable from the Issues API —
+        // the real association is the cross-reference GitHub creates when the URL is mentioned,
+        // and a comment is what creates one. Saying so plainly beats a `linked_prs` field that
+        // silently means "we left a comment".
+        let number = self.number_for(issue_id)?;
+        let comments =
+            format!("{API_BASE}/repos/{}/{}/issues/{number}/comments", self.owner, self.repo);
+        let body = format!("Pull request: {url}");
+        let resp = self.write("POST", &comments, &json!({ "body": body }))?;
+        Ok(created_url(&resp).unwrap_or_else(|| format!("linked {url} to {issue_id}")))
+    }
+}
+
+/// The `html_url` of whatever was just created, when the response carries one — a comment URL
+/// is the most useful thing the agent can be handed back.
+fn created_url(resp: &HttpResponse) -> Option<String> {
+    serde_json::from_slice::<Value>(&resp.body).ok()?.get("html_url")?.as_str().map(str::to_string)
+}
+
 fn parse_dispatch_id(id: &str, owner: &str, repo: &str) -> Option<u64> {
     let rest = id.strip_prefix(owner)?.strip_prefix('/')?.strip_prefix(repo)?.strip_prefix('#')?;
     rest.parse().ok()
@@ -386,6 +535,7 @@ mod tests {
     struct FakeHttpInner {
         responses: VecDeque<Result<HttpResponse, HttpTransportError>>,
         calls: Vec<String>,
+        writes: Vec<(String, String, Value)>,
     }
 
     impl FakeHttp {
@@ -400,6 +550,11 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.inner.lock().unwrap().calls.clone()
         }
+
+        /// Method, URL and parsed body of every write, in order.
+        fn writes(&self) -> Vec<(String, String, Value)> {
+            self.inner.lock().unwrap().writes.clone()
+        }
     }
 
     impl Http for FakeHttp {
@@ -410,6 +565,21 @@ mod tests {
         ) -> Result<HttpResponse, HttpTransportError> {
             let mut g = self.inner.lock().unwrap();
             g.calls.push(url.to_string());
+            g.responses
+                .pop_front()
+                .unwrap_or_else(|| Err(HttpTransportError("no scripted response".into())))
+        }
+
+        fn send_json(
+            &self,
+            method: &str,
+            url: &str,
+            _headers: &[(&str, String)],
+            body: &[u8],
+        ) -> Result<HttpResponse, HttpTransportError> {
+            let mut g = self.inner.lock().unwrap();
+            let parsed = serde_json::from_slice(body).unwrap_or(Value::Null);
+            g.writes.push((method.to_string(), url.to_string(), parsed));
             g.responses
                 .pop_front()
                 .unwrap_or_else(|| Err(HttpTransportError("no scripted response".into())))
@@ -581,6 +751,108 @@ mod tests {
         assert_eq!(derive_state(true, &["state:in-progress".to_string()]), "closed");
         assert_eq!(derive_state(false, &["state:in-progress".to_string()]), "in-progress");
         assert_eq!(derive_state(false, &[]), "open");
+    }
+
+    // ---- the write path (broker tools) -------------------------------------
+
+    #[test]
+    fn a_comment_is_a_single_post_to_the_issue_it_was_scoped_to() {
+        let http = FakeHttp::new();
+        http.push(ok(serde_json::json!({
+            "html_url": "https://github.com/o/r/issues/7#issuecomment-1"
+        })));
+        let t = tracker(http);
+
+        let out = t.comment("o/r#7", "an update").unwrap();
+
+        let w = t.http.writes();
+        assert_eq!(w.len(), 1, "one comment must cost one write");
+        assert_eq!(w[0].0, "POST");
+        assert_eq!(w[0].1, "https://api.github.com/repos/o/r/issues/7/comments");
+        assert_eq!(w[0].2["body"], "an update");
+        assert!(out.contains("issuecomment-1"), "the agent gets a reference back: {out}");
+    }
+
+    #[test]
+    fn an_id_from_another_repository_is_refused_before_any_request() {
+        // Defence in depth behind the broker's own scoping: even handed a foreign id directly,
+        // this adapter must not construct a URL for a repo it was not configured with.
+        let t = tracker(FakeHttp::new());
+        assert!(t.comment("other/repo#7", "hi").is_err());
+        assert!(t.http.writes().is_empty(), "no request may leave for a foreign repo");
+    }
+
+    #[test]
+    fn set_state_preserves_labels_it_does_not_own() {
+        // GitHub's label endpoint replaces the whole set, and `required_labels` lives in that
+        // set — a blind write would strip `agent` and make the issue undispatchable, which is
+        // a failure that would only show up as the issue silently never being picked up again.
+        let http = FakeHttp::new();
+        http.push(ok(serde_json::json!(gh_issue(
+            7,
+            &["agent", "state:in-progress", "bug"],
+            "open",
+            true
+        ))));
+        http.push(ok(serde_json::json!({}))); // PUT labels
+        http.push(ok(serde_json::json!({}))); // PATCH state
+        let t = tracker(http);
+
+        t.set_state("o/r#7", "in-review").unwrap();
+
+        let w = t.http.writes();
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].0, "PUT");
+        assert_eq!(w[0].1, "https://api.github.com/repos/o/r/issues/7/labels");
+        let mut labels: Vec<String> = w[0].2["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect();
+        labels.sort();
+        assert_eq!(labels, vec!["agent", "bug", "state:in-review"]);
+        assert!(!labels.contains(&"state:in-progress".to_string()), "the old state must go");
+    }
+
+    #[test]
+    fn closing_an_issue_sets_the_flag_rather_than_only_a_label() {
+        // `closed` always wins over a `state:*` label when reading, so writing only the label
+        // would produce an issue that reads as closed to nobody.
+        let http = FakeHttp::new();
+        http.push(ok(serde_json::json!(gh_issue(7, &["agent", "state:in-review"], "open", true))));
+        http.push(ok(serde_json::json!({})));
+        http.push(ok(serde_json::json!({})));
+        let t = tracker(http);
+
+        t.set_state("o/r#7", "closed").unwrap();
+
+        let w = t.http.writes();
+        let labels = w[0].2["labels"].as_array().unwrap();
+        assert!(
+            labels.iter().all(|l| l.as_str().unwrap() != "state:closed"),
+            "closed is carried by the flag, not by a second disagreeing label"
+        );
+        assert_eq!(w[1].0, "PATCH");
+        assert_eq!(w[1].1, "https://api.github.com/repos/o/r/issues/7");
+        assert_eq!(w[1].2["state"], "closed");
+    }
+
+    #[test]
+    fn a_write_classifies_failures_the_same_way_a_read_does() {
+        // The scheduler's retryable/permanent split has to mean the same thing on both paths,
+        // or a bad credential on a tool call reads as a transient blip.
+        let http = FakeHttp::new();
+        http.push(Ok(HttpResponse {
+            status: 401,
+            headers: HashMap::new(),
+            body: b"Bad credentials".to_vec(),
+        }));
+        let t = tracker(http);
+
+        let e = t.comment("o/r#7", "hi").unwrap_err();
+        assert!(matches!(e, TrackerError::Auth(_)), "got {e:?}");
+        assert!(!e.class().retryable());
     }
 }
 

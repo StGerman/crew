@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use symphony_cc::broker::fake::FakeWrites;
+use symphony_cc::broker::{Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, FakeClock};
 use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
 use symphony_cc::model::{ErrorClass, Issue, Outcome, Phase};
@@ -82,6 +84,7 @@ fn harness_over(
         workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
         agent: AgentConfig::default(),
         worker: Default::default(),
+        broker: Default::default(),
     };
     tune(&mut cfg);
     cfg.preflight().expect("test config must be valid");
@@ -101,6 +104,99 @@ fn harness_over(
     );
 
     Harness { sched, clock, tracker, worker, root }
+}
+
+/// A broker with nothing real behind it, for asserting on what the scheduler hands a run.
+fn test_broker(clock: Arc<FakeClock>) -> (Arc<Broker>, Arc<FakeWrites>) {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("symphony-sched-mcp-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let writes = Arc::new(FakeWrites::new());
+    let w: Arc<dyn TrackerWrites> = writes.clone();
+    let b = Broker::new(
+        w,
+        clock,
+        BrokerLimits::default(),
+        vec!["in progress".into(), "done".into()],
+        "127.0.0.1:1".parse().unwrap(),
+        dir,
+    )
+    .unwrap();
+    (Arc::new(b), writes)
+}
+
+// ---- tool broker ------------------------------------------------------------
+
+#[test]
+fn a_dispatched_run_is_handed_a_broker_endpoint_scoped_to_its_own_issue() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let (broker, writes) = test_broker(h.clock.clone());
+    h.sched.set_broker(Some(broker.clone()));
+
+    h.sched.tick().unwrap();
+
+    let endpoints = h.worker.endpoints_for("iss-1");
+    assert_eq!(endpoints.len(), 1);
+    let ep = endpoints[0].as_ref().expect("a broker was attached, so the run gets tools");
+    assert_eq!(ep.server, "symphony");
+    assert!(ep.config_path.exists(), "the worker needs a file to pass to --mcp-config");
+    assert_eq!(ep.qualified("comment"), "mcp__symphony__comment");
+
+    // The endpoint is only useful if the token inside it reaches this issue and no other. Read
+    // it back the way the agent would, rather than trusting the scheduler's bookkeeping.
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&ep.config_path).unwrap()).unwrap();
+    let url = cfg["mcpServers"]["symphony"]["url"].as_str().unwrap();
+    let token = url.rsplit('/').next().unwrap();
+
+    broker.call(token, "comment", &serde_json::json!({ "body": "from the agent" })).unwrap();
+    assert_eq!(writes.count(), 1);
+    assert_eq!(writes.writes()[0].issue_id(), "iss-1");
+}
+
+#[test]
+fn dispatch_without_a_broker_still_runs_the_agent_just_without_tools() {
+    // The degrade the whole design turns on: a broker that could not start costs the agent a
+    // capability, never a dispatch.
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.sched.running_count(), 1, "the run happens regardless");
+    assert_eq!(h.worker.endpoints_for("iss-1"), vec![None]);
+}
+
+#[test]
+fn a_run_that_ends_takes_its_broker_authority_with_it() {
+    // A token that outlived its run would let an orphaned agent keep writing to a ticket the
+    // orchestrator has already released.
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let (broker, writes) = test_broker(h.clock.clone());
+    h.sched.set_broker(Some(broker.clone()));
+
+    h.sched.tick().unwrap();
+    let ep = h.worker.endpoints_for("iss-1")[0].clone().unwrap();
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&ep.config_path).unwrap()).unwrap();
+    let url = cfg["mcpServers"]["symphony"]["url"].as_str().unwrap().to_string();
+    let token = url.rsplit('/').next().unwrap().to_string();
+    assert_eq!(broker.open_sessions(), 1);
+
+    // Let the scripted run finish and be harvested.
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        h.sched.running_count(),
+        0,
+        "the run must actually be over for this to mean anything"
+    );
+
+    assert_eq!(broker.open_sessions(), 0, "the session died with the run");
+    assert!(!ep.config_path.exists(), "and so did the file carrying its token");
+    assert!(broker.call(&token, "comment", &serde_json::json!({ "body": "late" })).is_err());
+    assert_eq!(writes.count(), 0);
 }
 
 // ---- dispatch ---------------------------------------------------------------

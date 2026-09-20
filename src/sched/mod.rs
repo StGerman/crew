@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::broker::{Broker, BrokerSession};
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
 use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
@@ -48,6 +49,11 @@ struct Running {
     last_progress_at: Mono,
     /// Tracker state when this run began, to tell real progress from spinning.
     state_at_start: String,
+    /// This run's authority to write to the tracker, held for exactly as long as the run is in
+    /// the `running` map. Never read — dropping it is the point. Every path that ends a run
+    /// removes the entry, so every path revokes the token and deletes the config file without
+    /// having to remember to.
+    _broker: Option<BrokerSession>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,6 +101,9 @@ pub struct Scheduler {
     worker: Arc<dyn Worker>,
     workspace: Arc<dyn Workspace>,
     projector: Arc<dyn Projector>,
+    /// `None` when the broker could not start, or the operator turned it off. Dispatch carries
+    /// on either way — an agent without tracker tools is a degrade, not a failure.
+    broker: Option<Arc<Broker>>,
     running: HashMap<String, Running>,
     /// Latest issue snapshot seen for each id, for display and routing checks.
     seen: HashMap<String, Issue>,
@@ -125,6 +134,7 @@ impl Scheduler {
             worker,
             workspace,
             projector,
+            broker: None,
             running: HashMap::new(),
             seen: HashMap::new(),
             no_progress: HashMap::new(),
@@ -132,6 +142,18 @@ impl Scheduler {
             ticks: 0,
             last_error: None,
         }
+    }
+
+    /// Attach a tool broker.
+    ///
+    /// A setter rather than a ninth constructor argument: it is optional by nature, and every
+    /// existing caller — the scheduler's whole test suite included — is correct without it.
+    pub fn set_broker(&mut self, broker: Option<Arc<Broker>>) {
+        self.broker = broker;
+    }
+
+    pub fn broker(&self) -> Option<&Arc<Broker>> {
+        self.broker.as_ref()
     }
 
     pub fn running_count(&self) -> usize {
@@ -742,7 +764,29 @@ impl Scheduler {
         };
         self.store.start_run(self.clock.as_ref(), &run_id, &issue.id, session.id())?;
 
-        let handle = self.worker.spawn(issue, &prepared.path, attempt, &session);
+        // Opened before the worker exists, for the same reason the claim and the session name
+        // are: the token has to be inside the config file the child reads at startup, so it
+        // cannot be something the child reports back afterwards.
+        let broker_session = self.broker.as_ref().and_then(|b| match b.open(issue, &run_id) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                // Degrade, never fail: the acceptance criterion for an unavailable broker is
+                // an agent without tools, not a run that did not happen.
+                tracing::warn!(
+                    issue_id = %issue.id, error = %e,
+                    "broker session could not be opened; dispatching without tracker tools"
+                );
+                None
+            }
+        });
+
+        let handle = self.worker.spawn(
+            issue,
+            &prepared.path,
+            attempt,
+            &session,
+            broker_session.as_ref().map(|s| s.endpoint()),
+        );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
         let now = self.clock.mono();
@@ -757,6 +801,7 @@ impl Scheduler {
             branch = prepared.branch.as_deref().unwrap_or("-"),
             session = session.id(),
             resumed = session.is_resume(),
+            tools = broker_session.is_some(),
             "dispatched"
         );
 
@@ -771,6 +816,7 @@ impl Scheduler {
                 workspace: prepared.path,
                 last_progress: Progress::default(),
                 last_progress_at: now,
+                _broker: broker_session,
             },
         );
         Ok(())
