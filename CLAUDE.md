@@ -38,6 +38,15 @@ cargo run --example dashboard_preview      # render the UI to stdout, no termina
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
 
+The first three are the commit gate, and [.github/workflows/ci.yml](.github/workflows/ci.yml)
+now runs them on every push and pull request rather than trusting whoever remembers — which is
+the only version that survives a dispatched agent leaving a branch behind. `rust-toolchain.toml`
+pins the compiler so CI, this machine and every worktree agree on what "it compiles" means, and
+CI builds `--locked` so a drifted `Cargo.lock` fails rather than being quietly rewritten. One
+thing to preserve if you edit that workflow: it must never *run* an example. `broker_live`
+spawns a real `claude` and spends tokens, and only a Cargo default (examples are `test = false`)
+keeps `cargo test` from calling it — the workflow says so at the top.
+
 `SYMPHONY_DB=/tmp/x.db` points the store somewhere disposable — worth doing before any run
 that might write state you do not want kept. `SYMPHONY_TASKS_ROOT=/tmp/tasks` does the same
 for the `~/.claude/tasks` projection, so a smoke run's demo issues (`iss-001`, `MT-601`, ...)
