@@ -631,11 +631,14 @@ impl Scheduler {
         // setup time inside its own timeout must not eat the agent's stall budget.
         let now = self.clock.mono();
 
+        // The branch is logged alongside the directory because it, not the directory, is what
+        // a reviewer goes looking for once the run is over.
         tracing::info!(
             issue_id = %issue.id,
             identifier = %issue.identifier,
             attempt,
             workspace = %prepared.path.display(),
+            branch = prepared.branch.as_deref().unwrap_or("-"),
             "dispatched"
         );
 

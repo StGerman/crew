@@ -120,7 +120,12 @@ nothing to a test that fakes the worker too) and `GitWorktreeWorkspace` (real, w
 wires by default). Reuse in the latter checks for a `.git` *file* at the target path, not
 bare existence — a plain directory there, e.g. left by a prior `DirWorkspace` run against the
 same root, must surface through git's own "already exists" error rather than being silently
-trusted as an already-prepared worktree.
+trusted as an already-prepared worktree. The branch, not the directory, is what a run leaves
+behind: `remove` deletes the worktree but only deletes the branch when git's own merged check
+says it carries nothing `repo`'s HEAD does not already have, and `prepare` attaches to an
+existing branch that does carry commits rather than `-B`-resetting it. Cleanup is triggered by
+a ticket reaching a terminal state, and closing a ticket is not a decision to throw away the
+work done under it. `Prepared.branch` reports that name upwards so it reaches the dispatch log.
 
 `Tracker` gets its third implementation in [src/tracker/github.rs](src/tracker/github.rs):
 `GithubTracker<H: Http>`, generic over a small `Http` seam (`FakeHttp` in tests, `UreqHttp` —
@@ -173,10 +178,10 @@ place `main.rs` can exit, check that this still runs.
 
 ## Invariants
 
-Each of these closes a defect found in the original spec, and each has a test that fails
-without it. Several only fail in the exact scenario they were written for, so a regression
-here can pass a casual `cargo test` reading — check the named test is still meaningful, not
-just still green.
+Each of these closes a defect found in the original spec — bar the last, which came out of the
+first dogfooding review — and each has a test that fails without it. Several only fail in the
+exact scenario they were written for, so a regression here can pass a casual `cargo test`
+reading — check the named test is still meaningful, not just still green.
 
 | Invariant | Mechanism | Guard test |
 |---|---|---|
@@ -187,6 +192,7 @@ just still green.
 | No workspace is deleted under a live agent | `kill(grace)` blocks until confirmed stopped, *then* `remove` | `a_ticket_moving_to_terminal_stops_the_run_and_cleans_up` |
 | One tracker blip cannot kill a run | `refresh_miss_grace`, reset on reappearance | `one_invisible_refresh_is_survivable_but_two_are_not` |
 | A workspace path cannot escape its root | `guard()` on **both** `prepare` and `remove` | `hostile_identifiers_stay_inside_the_root` |
+| Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
 
 Three of these — the verdict, the per-issue turn budget and `parked_state` — are independent
 brakes on the same runaway. Removing any one of them looks safe because the other two still
