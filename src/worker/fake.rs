@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{KillResult, Progress, RunHandle, Worker};
+use super::{KillResult, Progress, RunHandle, Session, Worker};
 use crate::clock::{Clock, Mono};
 use crate::model::{ErrorClass, Issue, Outcome};
 
@@ -65,6 +65,10 @@ pub struct FakeWorker {
     clock: Arc<dyn Clock>,
     scripts: Mutex<HashMap<String, Script>>,
     default_script: Mutex<Script>,
+    /// Every session each issue was spawned under, in order. Whether a continuation resumed the
+    /// conversation or started a new one is invisible from outside the worker otherwise, and it
+    /// is exactly what the scheduler tests need to assert.
+    sessions: Mutex<HashMap<String, Vec<Session>>>,
 }
 
 impl FakeWorker {
@@ -73,6 +77,7 @@ impl FakeWorker {
             clock,
             scripts: Mutex::new(HashMap::new()),
             default_script: Mutex::new(Script::default()),
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,10 +89,23 @@ impl FakeWorker {
     pub fn set_default(&self, s: Script) {
         *self.default_script.lock().unwrap() = s;
     }
+
+    /// The sessions this issue has been spawned under, oldest first.
+    pub fn sessions_for(&self, issue_id: &str) -> Vec<Session> {
+        self.sessions.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
+    }
 }
 
 impl Worker for FakeWorker {
-    fn spawn(&self, issue: &Issue, _workspace: &Path, _attempt: u32) -> Arc<dyn RunHandle> {
+    fn spawn(
+        &self,
+        issue: &Issue,
+        _workspace: &Path,
+        _attempt: u32,
+        session: &Session,
+    ) -> Arc<dyn RunHandle> {
+        self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
+
         let script = self
             .scripts
             .lock()
@@ -204,7 +222,7 @@ mod tests {
     fn a_run_finishes_only_once_the_clock_reaches_its_duration() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()));
 
         assert!(h.finished().is_none());
         c.advance_ms(3_999);
@@ -217,7 +235,7 @@ mod tests {
     fn progress_accumulates_turns_and_tokens_as_time_passes() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()));
 
         let p0 = h.progress();
         c.advance_ms(4_000);
@@ -231,7 +249,7 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()));
 
         c.advance_ms(1_000);
         let frozen = h.progress();
@@ -245,7 +263,7 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()));
 
         c.advance_ms(5_000);
         assert_eq!(h.kill(1_000), KillResult::Forced);
@@ -256,7 +274,7 @@ mod tests {
     fn killing_an_already_finished_run_is_a_no_op() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()));
         c.advance_ms(4_000);
         assert_eq!(h.kill(1_000), KillResult::AlreadyDone);
         assert_eq!(h.finished(), Some(Outcome::Done), "verdict must not be rewritten");

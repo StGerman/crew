@@ -20,6 +20,31 @@ pub struct Progress {
     pub last_event: Option<String>,
 }
 
+/// Which conversation an attempt runs in.
+///
+/// The scheduler names it before the process exists, the same ordering as claim-before-spawn:
+/// a worker that reported its own id back afterwards would leave a window in which a run that
+/// died early could never be resumed, because nothing outside it ever learned the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Session {
+    /// Start a fresh conversation under this id.
+    New(String),
+    /// Continue the conversation already recorded under this id.
+    Resume(String),
+}
+
+impl Session {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::New(id) | Self::Resume(id) => id,
+        }
+    }
+
+    pub fn is_resume(&self) -> bool {
+        matches!(self, Self::Resume(_))
+    }
+}
+
 /// A run in flight. Dropping the handle does not stop the work — call [`RunHandle::kill`].
 pub trait RunHandle: Send + Sync {
     fn progress(&self) -> Progress;
@@ -44,6 +69,11 @@ pub enum KillResult {
 }
 
 pub trait Worker: Send + Sync {
-    fn spawn(&self, issue: &Issue, workspace: &std::path::Path, attempt: u32)
-    -> Arc<dyn RunHandle>;
+    fn spawn(
+        &self,
+        issue: &Issue,
+        workspace: &std::path::Path,
+        attempt: u32,
+        session: &Session,
+    ) -> Arc<dyn RunHandle>;
 }

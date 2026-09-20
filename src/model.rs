@@ -192,9 +192,44 @@ pub fn worktree_key(issue_id: &str, identifier: &str) -> String {
     format!("{stem}-{suffix}")
 }
 
+/// A UUID-shaped name for a `claude` conversation, derived rather than random so this crate
+/// keeps its dependency surface: blake3 is already here for [`worktree_key`], and the CLI only
+/// needs this to parse as a UUID.
+///
+/// `stamp` is what makes it unique per dispatch rather than per issue. An issue can be worked
+/// more than once, and reusing a name the CLI still holds a conversation under would collide
+/// with it rather than start something new.
+pub fn session_id(issue_id: &str, stamp: i64) -> String {
+    let mut b = *blake3::hash(format!("{issue_id}:{stamp}").as_bytes()).as_bytes();
+    // Version 4 and the RFC 4122 variant: the two fields a UUID parser actually checks.
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b[..16].iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_id_is_uuid_shaped_and_never_repeats_across_dispatches() {
+        let a = session_id("iss-1", 1_000);
+        assert_eq!(a.len(), 36);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{a} is not hex");
+        assert!(parts[2].starts_with('4'), "{a} is not version 4");
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "{a} does not carry the RFC 4122 variant"
+        );
+
+        // A second dispatch of the same issue must not land on the name the first one is
+        // already using.
+        assert_ne!(a, session_id("iss-1", 1_001));
+        assert_ne!(a, session_id("iss-2", 1_000));
+    }
 
     #[test]
     fn every_error_class_is_classified_and_round_trips() {

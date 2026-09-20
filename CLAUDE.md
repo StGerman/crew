@@ -108,7 +108,8 @@ stranding the runs already in flight. Do not move the `preflight()` call earlier
    type performs, and its result only ever flips this type's own on/off switch.
 
 **The store is a cache of judgment, not a system of record.** Losing `symphony.db` degrades
-to stateless re-polling, never to incorrect behaviour.
+to stateless re-polling, never to incorrect behaviour — the session id lives there too, so
+losing it costs cold continuations rather than a wrong conversation.
 
 **Worth knowing:** reconciliation lives in `sched/mod.rs` rather than its own module — it
 mutates the same `running` map as dispatch, so splitting it meant threading the whole
@@ -166,6 +167,13 @@ so the worker's prompt asks the agent to end its final message with `SYMPHONY_OU
 continue: <reason>` or `SYMPHONY_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
 and it is a soft convention by design — an agent that forgets it just reads as `Done`.
 
+A continuation resumes rather than restarts: the scheduler names the conversation with
+`--session-id` before the first attempt and passes `--resume <id>` for every attempt after, so
+the turn budget is not spent twice over on the same re-orientation. The name is written to the
+store before the process exists, for the same reason the claim is — the child cannot be what
+records it. A run that takes no turns drops the name, which is how a session the CLI no longer
+holds degrades to a cold start instead of failing every retry identically into quarantine.
+
 The first live end-to-end run of `ClaudeWorker` (real agent, real worktree, cut off mid-run by
 `--max-ticks`) left an orphaned `claude` process running after `cargo run` had already
 returned. `RunHandle` says plainly that dropping a handle does not stop the work, and nothing
@@ -178,9 +186,9 @@ place `main.rs` can exit, check that this still runs.
 
 ## Invariants
 
-Each of these closes a defect found in the original spec — bar the last, which came out of the
-first dogfooding review — and each has a test that fails without it. Several only fail in the
-exact scenario they were written for, so a regression here can pass a casual `cargo test`
+Each of these closes a defect found in the original spec — bar the last two, which came out of
+the first dogfooding review — and each has a test that fails without it. Several only fail in
+the exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
 
 | Invariant | Mechanism | Guard test |
@@ -193,6 +201,7 @@ reading — check the named test is still meaningful, not just still green.
 | One tracker blip cannot kill a run | `refresh_miss_grace`, reset on reappearance | `one_invisible_refresh_is_survivable_but_two_are_not` |
 | A workspace path cannot escape its root | `guard()` on **both** `prepare` and `remove` | `hostile_identifiers_stay_inside_the_root` |
 | Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
+| A dead session cannot strand an issue | drop the session name after a run with zero turns | `a_run_that_took_no_turns_is_not_retried_into_the_same_conversation` |
 
 Three of these — the verdict, the per-issue turn budget and `parked_state` — are independent
 brakes on the same runaway. Removing any one of them looks safe because the other two still

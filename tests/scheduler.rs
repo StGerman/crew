@@ -15,6 +15,7 @@ use symphony_cc::sched::Scheduler;
 use symphony_cc::store::Store;
 use symphony_cc::tracker::TrackerError;
 use symphony_cc::tracker::fake::FakeTracker;
+use symphony_cc::worker::Session;
 use symphony_cc::worker::fake::{FakeWorker, Script};
 use symphony_cc::workspace::DirWorkspace;
 
@@ -258,6 +259,62 @@ fn continuation_backs_off_instead_of_respawning_every_second() {
     h.sched.tick().unwrap();
     let due = h.sched.store().all_retries().unwrap()[0].due_at;
     assert_eq!(due - h.clock.wall().0, 30_000);
+}
+
+/// A continuation is only worth having if it continues something. Respawning `claude -p` cold
+/// makes the agent re-read the issue and re-explore the tree on every turn the budget buys, so
+/// the budget and the restart spend the same turns twice.
+#[test]
+fn a_continuation_resumes_the_conversation_the_first_attempt_started() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // harvest the Continue, queue the retry
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap(); // the continuation itself
+
+    let seen = h.worker.sessions_for("iss-1");
+    assert_eq!(seen.len(), 2, "expected a first attempt and a continuation, got {seen:?}");
+    assert!(matches!(seen[0], Session::New(_)), "the first attempt names a fresh conversation");
+    assert_eq!(
+        seen[1],
+        Session::Resume(seen[0].id().to_string()),
+        "the continuation must resume the conversation the first attempt started"
+    );
+}
+
+/// The degradation path. A session the CLI no longer holds is answered with "No conversation
+/// found with session ID" and no turns at all, so resuming the same name again fails identically
+/// every time — straight into quarantine, for an issue with nothing wrong with it.
+#[test]
+fn a_run_that_took_no_turns_is_not_retried_into_the_same_conversation() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(Script {
+        turns: 0,
+        outcome: Outcome::Failed {
+            class: ErrorClass::AgentCrash,
+            msg: "no conversation found with session id".into(),
+        },
+        ..Script::succeeds_in(1_000)
+    });
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // harvest the failure, queue the retry
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap(); // the retry
+
+    let seen = h.worker.sessions_for("iss-1");
+    assert_eq!(seen.len(), 2, "expected a first attempt and a retry, got {seen:?}");
+    assert!(
+        matches!(seen[1], Session::New(_)),
+        "a conversation that produced nothing must not be resumed into, got {seen:?}"
+    );
+    assert_ne!(seen[0].id(), seen[1].id(), "the retry needs a name of its own");
 }
 
 /// The other half of the brake: even a well-behaved `Continue` cannot run forever.

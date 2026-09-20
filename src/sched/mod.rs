@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
-use crate::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
+use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::Store;
 use crate::tracker::{Tracker, TrackerError};
-use crate::worker::{Progress, RunHandle, Worker};
+use crate::worker::{Progress, RunHandle, Session, Worker};
 use crate::workspace::Workspace;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
@@ -261,6 +261,17 @@ impl Scheduler {
             }
             Outcome::Failed { class, msg } => {
                 tracing::warn!(issue_id, class = class.as_str(), msg, "run failed");
+
+                // A run that never took a turn established nothing worth resuming into — and if
+                // it was resuming, its target is the likeliest reason it produced nothing at
+                // all: the CLI answers a name it no longer holds with "No conversation found
+                // with session ID" and exits. Dropping the name here is what keeps a dead
+                // session from failing every retry identically, straight into quarantine.
+                if r.handle.progress().turns == 0 {
+                    tracing::info!(issue_id, "run took no turns; dropping its session name");
+                    self.store.set_session(self.clock.as_ref(), issue_id, None)?;
+                }
+
                 let quarantined = self.store.record_failure(
                     self.clock.as_ref(),
                     issue_id,
@@ -624,9 +635,21 @@ impl Scheduler {
         };
 
         let run_id = format!("{}-{}", issue.id, self.clock.wall().0);
-        self.store.start_run(self.clock.as_ref(), &run_id, &issue.id)?;
 
-        let handle = self.worker.spawn(issue, &prepared.path, attempt);
+        // The conversation is named here, before the process exists, for the same reason the
+        // claim is written first: a run that dies early must still leave behind a name its
+        // continuation can resume, and the child cannot be the one to record it.
+        let session = match self.store.get(&issue.id)?.and_then(|s| s.session_id) {
+            Some(id) => Session::Resume(id),
+            None => {
+                let id = session_id(&issue.id, self.clock.wall().0);
+                self.store.set_session(self.clock.as_ref(), &issue.id, Some(&id))?;
+                Session::New(id)
+            }
+        };
+        self.store.start_run(self.clock.as_ref(), &run_id, &issue.id, session.id())?;
+
+        let handle = self.worker.spawn(issue, &prepared.path, attempt, &session);
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
         let now = self.clock.mono();
@@ -639,6 +662,8 @@ impl Scheduler {
             attempt,
             workspace = %prepared.path.display(),
             branch = prepared.branch.as_deref().unwrap_or("-"),
+            session = session.id(),
+            resumed = session.is_resume(),
             "dispatched"
         );
 

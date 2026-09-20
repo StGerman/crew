@@ -33,6 +33,8 @@ pub struct IssueState {
     pub last_error_class: Option<ErrorClass>,
     pub last_error: Option<String>,
     pub task_ref: Option<String>,
+    /// The conversation continuations for this issue resume into, once one has been named.
+    pub session_id: Option<String>,
 }
 
 impl IssueState {
@@ -93,7 +95,7 @@ impl Store {
         conn.query_row(
             "SELECT issue_id, identifier, worktree_key, phase, attempt, consecutive_fail,
                     last_fail_class, cumulative_turns, miss_count, parked_state, quarantined_at,
-                    last_error_class, last_error, task_ref
+                    last_error_class, last_error, task_ref, session_id
              FROM issue_state WHERE issue_id = ?1",
             params![issue_id],
             Self::row_to_state,
@@ -126,6 +128,7 @@ impl Store {
             last_error_class: last_err_class.as_deref().and_then(ErrorClass::parse),
             last_error: row.get(12)?,
             task_ref: row.get(13)?,
+            session_id: row.get(14)?,
         })
     }
 
@@ -134,7 +137,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT issue_id, identifier, worktree_key, phase, attempt, consecutive_fail,
                     last_fail_class, cumulative_turns, miss_count, parked_state, quarantined_at,
-                    last_error_class, last_error, task_ref
+                    last_error_class, last_error, task_ref, session_id
              FROM issue_state ORDER BY identifier",
         )?;
         let rows = stmt.query_map([], Self::row_to_state)?;
@@ -276,6 +279,25 @@ impl Store {
         Ok(())
     }
 
+    /// Name the conversation this issue's continuations resume into, or clear it.
+    ///
+    /// Clearing is the degradation path: a resume target the CLI no longer knows about fails
+    /// every attempt identically, so the run that discovers it drops the id and the next
+    /// attempt starts fresh instead of retrying its way into quarantine.
+    pub fn set_session(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        session_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET session_id = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, session_id, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
     pub fn add_turns(&self, issue_id: &str, turns: u32) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -371,11 +393,12 @@ impl Store {
         clock: &dyn Clock,
         run_id: &str,
         issue_id: &str,
+        session_id: &str,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO run (run_id, issue_id, started_at) VALUES (?1, ?2, ?3)",
-            params![run_id, issue_id, clock.wall().0],
+            "INSERT INTO run (run_id, issue_id, started_at, session_id) VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, issue_id, clock.wall().0, session_id],
         )?;
         Ok(())
     }
