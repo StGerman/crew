@@ -144,6 +144,35 @@ impl Store {
         rows.collect()
     }
 
+    /// Every issue the store currently holds a claim for.
+    ///
+    /// At startup this is the set of runs the *previous* process was executing, because
+    /// nothing else can write the claim: a scheduler releases every claim it holds on the way
+    /// out. Filtering in Rust rather than SQL keeps the column list in one place, and this
+    /// table carries one row per issue ever seen — it is read whole on every tick already.
+    pub fn claimed(&self) -> rusqlite::Result<Vec<IssueState>> {
+        Ok(self.all()?.into_iter().filter(|s| s.phase == Phase::Running).collect())
+    }
+
+    /// Close every still-open run row for an issue, returning how many there were.
+    ///
+    /// A run row opens before the worker exists and closes in `finish_run`. A process killed
+    /// mid-run closes nothing, so the row reads as in-flight forever. Recovery closes it with
+    /// what is actually known — the counters stay zero, because the turns and tokens that run
+    /// spent died with the process that was counting them.
+    pub fn close_open_runs(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        outcome: &str,
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE run SET ended_at = ?2, outcome = ?3 WHERE issue_id = ?1 AND ended_at IS NULL",
+            params![issue_id, clock.wall().0, outcome],
+        )
+    }
+
     pub fn set_phase(
         &self,
         clock: &dyn Clock,
@@ -500,6 +529,46 @@ mod tests {
         assert!(s.due_retries(c.wall()).unwrap().is_empty());
         c.advance_ms(10_000);
         assert_eq!(s.due_retries(c.wall()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_claimed_issues_are_reported_as_claimed() {
+        let (s, c) = setup();
+        s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
+        assert!(s.claimed().unwrap().is_empty(), "nothing is claimed before anything claims it");
+
+        s.claim(&c, "id-1").unwrap();
+        let held: Vec<String> = s.claimed().unwrap().into_iter().map(|x| x.issue_id).collect();
+        assert_eq!(held, vec!["id-1"], "a claim is visible; an untouched issue is not");
+
+        s.release(&c, "id-1").unwrap();
+        assert!(s.claimed().unwrap().is_empty(), "and it stops being visible once released");
+    }
+
+    #[test]
+    fn a_retrying_or_quarantined_issue_is_not_mistaken_for_a_claimed_one() {
+        // Recovery releases every claim it finds, so anything it can see that is merely *queued*
+        // behind a timer would have its retry row deleted out from under it.
+        let (s, c) = setup();
+        s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
+
+        s.schedule_retry(&c, "id-1", Wall(c.wall().0 + 10_000), 1, "backoff").unwrap();
+        s.record_failure(&c, "id-2", ErrorClass::AuthFailed, "401", 3).unwrap();
+
+        assert!(s.claimed().unwrap().is_empty());
+    }
+
+    #[test]
+    fn closing_open_runs_touches_only_the_ones_still_in_flight() {
+        let (s, c) = setup();
+        s.start_run(&c, "run-a", "id-1", "sess-a").unwrap();
+        s.finish_run(&c, "run-a", "done", 3, 10, 20).unwrap();
+        s.start_run(&c, "run-b", "id-1", "sess-b").unwrap();
+
+        // Only the run the kill interrupted; the one that reported for itself keeps its verdict.
+        assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 1);
+        assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 0, "and it is idempotent");
+        assert_eq!(s.token_totals().unwrap(), (10, 20), "a run nobody counted contributes none");
     }
 
     #[test]

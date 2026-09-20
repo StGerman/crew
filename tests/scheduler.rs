@@ -4,7 +4,7 @@
 //! moves when a test moves it, so there are no sleeps and nothing to flake. Each test names the
 //! invariant it defends; several of them correspond directly to defects found in the spec.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use symphony_cc::clock::{Clock, FakeClock};
@@ -17,7 +17,7 @@ use symphony_cc::tracker::TrackerError;
 use symphony_cc::tracker::fake::FakeTracker;
 use symphony_cc::worker::Session;
 use symphony_cc::worker::fake::{FakeWorker, Script};
-use symphony_cc::workspace::DirWorkspace;
+use symphony_cc::workspace::{DirWorkspace, GitWorktreeWorkspace, Workspace};
 
 struct Harness {
     sched: Scheduler,
@@ -56,6 +56,19 @@ fn harness(issues: Vec<Issue>, tune: impl FnOnce(&mut Config)) -> Harness {
     let root = std::env::temp_dir().join(format!("symphony-sched-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
+    let workspace = Arc::new(DirWorkspace::new(&root).unwrap());
+    harness_over(issues, root, Store::open_in_memory().unwrap(), workspace, tune)
+}
+
+/// A harness whose durable state the caller names, so a second one can be built over the same
+/// database and workspace root — which is all a restart is.
+fn harness_over(
+    issues: Vec<Issue>,
+    root: PathBuf,
+    store: Store,
+    workspace: Arc<dyn Workspace>,
+    tune: impl FnOnce(&mut Config),
+) -> Harness {
     let mut cfg = Config {
         tracker: TrackerConfig {
             kind: "fake".into(),
@@ -76,12 +89,11 @@ fn harness(issues: Vec<Issue>, tune: impl FnOnce(&mut Config)) -> Harness {
     let clock = Arc::new(FakeClock::new());
     let tracker = Arc::new(FakeTracker::new(issues));
     let worker = Arc::new(FakeWorker::new(clock.clone()));
-    let workspace = Arc::new(DirWorkspace::new(&root).unwrap());
 
     let sched = Scheduler::new(
         cfg,
         clock.clone(),
-        Store::open_in_memory().unwrap(),
+        store,
         tracker.clone(),
         worker.clone(),
         workspace,
@@ -586,4 +598,168 @@ fn nothing_is_dispatched_twice_across_repeated_ticks() {
     assert_eq!(h.sched.running_count(), 3, "claims must make re-dispatch impossible");
     let snap = h.sched.snapshot().unwrap();
     assert_eq!(snap.rows.iter().filter(|r| r.phase == Phase::Running).count(), 3);
+}
+
+// ---- startup recovery -------------------------------------------------------
+
+fn tmp_dir(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("symphony-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn git(at: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git").arg("-C").arg(at).args(args).output().unwrap();
+    assert!(out.status.success(), "git {args:?} failed");
+}
+
+/// A throwaway repo with one commit, so `git worktree add` has a HEAD to branch from. Identity
+/// is set repo-local rather than relying on the machine having a global one.
+fn git_repo(at: &Path) -> PathBuf {
+    std::fs::create_dir_all(at).unwrap();
+    git(at, &["init", "-q", "-b", "main"]);
+    git(at, &["config", "user.email", "test@example.com"]);
+    git(at, &["config", "user.name", "test"]);
+    git(at, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    at.canonicalize().unwrap()
+}
+
+/// Commit inside a worktree, standing in for work a dispatched agent finished before the kill.
+fn commit_in(worktree: &Path, file: &str, msg: &str) {
+    std::fs::write(worktree.join(file), msg.as_bytes()).unwrap();
+    git(worktree, &["add", file]);
+    git(worktree, &["commit", "-q", "-m", msg]);
+}
+
+/// A restarted process gets a `FakeClock` that starts where the dead one's did, which no real
+/// restart does. Run ids are `issue_id`-plus-wall-millisecond, so without this the re-dispatch
+/// collides with the row the interrupted run left behind.
+fn restart_took_time(h: &Harness) {
+    h.clock.advance_ms(1_000);
+}
+
+/// A `SIGKILL` runs no destructor. `shutdown()`, `Drop for Scheduler` and the interrupt arm in
+/// `main` all release in-flight claims; a hard kill, an OOM kill and a host reboot reach none of
+/// them. `mem::forget` is the faithful simulation: the store keeps the claim, the disk keeps the
+/// worktree, and the in-memory `running` map dies with the process that owned it.
+#[test]
+fn a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup() {
+    let dir = tmp_dir("hard-kill");
+    let db = dir.join("symphony.db");
+    let root = dir.join("workspaces");
+
+    let ws = {
+        let mut h = harness_over(
+            vec![issue(1, "In Progress", Some(1))],
+            root.clone(),
+            Store::open(&db).unwrap(),
+            Arc::new(DirWorkspace::new(&root).unwrap()),
+            |_| {},
+        );
+        h.worker.set_default(Script::succeeds_in(600_000));
+        h.sched.tick().unwrap();
+        assert_eq!(h.sched.running_count(), 1);
+
+        let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+        // Stands in for whatever the kill catches an agent half-way through writing.
+        std::fs::write(ws.join("half-written.txt"), b"caught mid-run").unwrap();
+
+        std::mem::forget(h); // the kill: no shutdown, no Drop, nothing released
+        ws
+    };
+
+    // What the dead process left behind: a claim no live run can ever match again.
+    let phase = Store::open(&db).unwrap().get("iss-1").unwrap().unwrap().phase;
+    assert_eq!(phase, Phase::Running, "the claim outlives the process that took it");
+
+    // The restart. Recovery runs inside the first tick, so this is the ordinary startup path
+    // rather than a call some second entry point has to remember to make.
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open(&db).unwrap(),
+        Arc::new(DirWorkspace::new(&root).unwrap()),
+        |_| {},
+    );
+    h.worker.set_default(Script::succeeds_in(600_000));
+    restart_took_time(&h);
+    h.sched.tick().unwrap();
+
+    // Being dispatchable at all is the point: without recovery `claim()` refuses forever.
+    assert_eq!(h.sched.running_count(), 1, "a stranded issue must be dispatched again");
+    assert!(
+        !ws.join("half-written.txt").exists(),
+        "the orphaned worktree must be reconciled, not handed on as the kill left it"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cleanup that frees a stranded issue must not be what discards what the killed run had
+/// already committed. The directory is scratch space; the branch is the deliverable.
+#[test]
+fn a_hard_killed_runs_commits_survive_the_recovery_that_frees_its_issue() {
+    let dir = tmp_dir("hard-kill-git");
+    let db = dir.join("symphony.db");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+
+    let ws = {
+        let mut h = harness_over(
+            vec![issue(1, "In Progress", Some(1))],
+            root.clone(),
+            Store::open(&db).unwrap(),
+            Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+            |_| {},
+        );
+        h.worker.set_default(Script::succeeds_in(600_000));
+        h.sched.tick().unwrap();
+
+        let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+        commit_in(&ws, "work.txt", "what the agent finished before the kill");
+        std::fs::write(ws.join("scratch.txt"), b"never committed").unwrap();
+
+        std::mem::forget(h);
+        ws
+    };
+
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open(&db).unwrap(),
+        Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+        |_| {},
+    );
+    h.worker.set_default(Script::succeeds_in(600_000));
+    restart_took_time(&h);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.sched.running_count(), 1, "the stranded issue must be dispatchable again");
+    // The uncommitted file proves the worktree really was removed and rebuilt, so the committed
+    // one coming back proves the branch it was removed with outlived the reconciliation.
+    assert!(!ws.join("scratch.txt").exists(), "the orphaned worktree itself must be reconciled");
+    assert!(ws.join("work.txt").exists(), "but the commits it held must survive that");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The filter that makes recovery safe to run at all: a claim is stale only when *this* process
+/// has no run for it. Drop the check and a recovery pass reconciles away the live work it was
+/// added to rescue.
+#[test]
+fn recovery_leaves_the_claims_of_runs_this_process_is_still_executing_alone() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(Script::succeeds_in(600_000));
+
+    h.sched.tick().unwrap();
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+
+    h.sched.recover().unwrap();
+
+    assert_eq!(h.sched.running_count(), 1, "a live run must not be reconciled away");
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Running);
+    assert!(ws.exists(), "nor its workspace removed out from under it");
 }

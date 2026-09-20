@@ -20,7 +20,7 @@ Issues tracker, then a real `claude -p` worker. The MCP tool broker is the open 
 ## Commands
 
 ```bash
-cargo test                                 # 83 unit + 21 integration
+cargo test                                 # 93 unit + 26 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # integration only
 cargo test a_permanent_failure             # one test; the arg is a substring match
@@ -78,6 +78,8 @@ no sleeps and nothing to flake — time only moves when a test moves it.
 **Tick order is load-bearing** ([src/sched/mod.rs](src/sched/mod.rs)):
 
 ```
+recover()                                        ← first tick only
+                 ↓
 harvest_finished → detect_stalls → refresh_running   ← unconditional
                  ↓
             cfg.preflight()                          ← gate: on failure, return here
@@ -87,6 +89,13 @@ dispatch_due_retries → dispatch_new → publish
 
 Reconciliation runs before the gate so that a broken config stops *new* dispatch without also
 stranding the runs already in flight. Do not move the `preflight()` call earlier.
+
+`recover()` is startup reconciliation, and it runs ahead of the gate for the same reason: a
+claim stranded by the last process must not stay stranded behind a config typo. It lives inside
+`tick()` rather than in `main.rs` on purpose — recovery a second entry point can forget to call
+is recovery that silently does not happen, which is the exact failure it exists to fix. It is
+callable directly (`Scheduler::recover`) and idempotent, so a caller that wants it eagerly can
+have it.
 
 **Four rules that bind everywhere:**
 
@@ -109,7 +118,12 @@ stranding the runs already in flight. Do not move the `preflight()` call earlier
 
 **The store is a cache of judgment, not a system of record.** Losing `symphony.db` degrades
 to stateless re-polling, never to incorrect behaviour — the session id lives there too, so
-losing it costs cold continuations rather than a wrong conversation.
+losing it costs cold continuations rather than a wrong conversation. The claim is the one entry
+that could invert that, because *keeping* it across a hard kill is what went wrong: an issue
+marked `running` with nothing running is refused by `claim()` forever, is invisible to
+`detect_stalls`, and has no retry row to bring it back. `Scheduler::recover` is what holds the
+contract — it releases those claims at startup and reconciles their worktrees, so the worst a
+surviving database can do is still cost a re-poll.
 
 **Worth knowing:** reconciliation lives in `sched/mod.rs` rather than its own module — it
 mutates the same `running` map as dispatch, so splitting it meant threading the whole
@@ -202,6 +216,7 @@ reading — check the named test is still meaningful, not just still green.
 | A workspace path cannot escape its root | `guard()` on **both** `prepare` and `remove` | `hostile_identifiers_stay_inside_the_root` |
 | Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
 | A dead session cannot strand an issue | drop the session name after a run with zero turns | `a_run_that_took_no_turns_is_not_retried_into_the_same_conversation` |
+| A hard kill cannot strand a claim | startup `recover()`: a claim with no live run is stale, because `running` cannot cross a process boundary | `a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup` |
 
 Three of these — the verdict, the per-issue turn budget and `parked_state` — are independent
 brakes on the same runaway. Removing any one of them looks safe because the other two still

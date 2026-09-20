@@ -100,6 +100,8 @@ pub struct Scheduler {
     seen: HashMap<String, Issue>,
     /// Consecutive `Continue` verdicts with no tracker state change, per issue.
     no_progress: HashMap<String, u32>,
+    /// Whether startup reconciliation has run. See [`Scheduler::recover`].
+    recovered: bool,
     ticks: u64,
     last_error: Option<String>,
 }
@@ -126,6 +128,7 @@ impl Scheduler {
             running: HashMap::new(),
             seen: HashMap::new(),
             no_progress: HashMap::new(),
+            recovered: false,
             ticks: 0,
             last_error: None,
         }
@@ -145,6 +148,14 @@ impl Scheduler {
         self.ticks += 1;
         self.last_error = None;
 
+        // Once, ahead of everything else — including the config gate, because a stranded claim
+        // must not stay stranded behind a typo in the config. Living here rather than in
+        // `main` is deliberate: recovery that a second entry point can forget to call is
+        // recovery that silently does not happen, which is the failure this exists to fix.
+        if !self.recovered {
+            self.recover()?;
+        }
+
         // Unconditional: in-flight runs are reconciled even when config is broken.
         self.harvest_finished()?;
         self.detect_stalls()?;
@@ -160,6 +171,88 @@ impl Scheduler {
         self.dispatch_due_retries()?;
         self.dispatch_new()?;
         self.publish()?;
+        Ok(())
+    }
+
+    // ---- startup recovery ----------------------------------------------------
+
+    /// Release the claims of runs that did not survive the previous process.
+    ///
+    /// `running` is in-memory and the claim is in the store, so the two can only disagree
+    /// across a process boundary. Every ordinary exit reconciles them — `shutdown()`, `Drop for
+    /// Scheduler`, the interrupt arm in `main` — and a `SIGKILL`, an OOM kill or a host reboot
+    /// reaches none of those. What is left afterwards is an issue marked `running` in a
+    /// database with nothing running: [`Store::claim`] refuses it forever, `detect_stalls`
+    /// iterates `running` and never sees it, and no retry row exists to bring it back. The
+    /// issue silently stops being picked up, with no log line marking the moment it did.
+    ///
+    /// That inverts the store's contract. Losing `symphony.db` degrades to stateless
+    /// re-polling; *keeping* it across a hard kill is what produces incorrect behaviour.
+    ///
+    /// Adopting the work is not on the table — the agent went down with its parent and there is
+    /// no handle left to supervise it through — so the claim is released and the worktree
+    /// reconciled, which leaves the issue to be dispatched again from its branch.
+    ///
+    /// The conversation is not dropped with the claim. `release` leaves `session_id` alone, so
+    /// the re-dispatch resumes what the killed agent was part-way through rather than
+    /// re-orienting from cold; a name the CLI no longer holds still degrades through the
+    /// zero-turn path that exists for exactly that.
+    pub fn recover(&mut self) -> anyhow::Result<()> {
+        self.recovered = true;
+
+        // A claim matched by a live run is not stale. Nothing has populated `running` before
+        // the first tick, so this filter is a no-op on the startup path it exists for; it is
+        // what makes the method safe to call at any other point rather than only once.
+        let stale: Vec<_> = self
+            .store
+            .claimed()?
+            .into_iter()
+            .filter(|s| !self.running.contains_key(&s.issue_id))
+            .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            count = stale.len(),
+            "claims held with no live run to match them; the last process did not exit cleanly"
+        );
+
+        for st in stale {
+            let open_runs =
+                self.store.close_open_runs(self.clock.as_ref(), &st.issue_id, "orphaned")?;
+
+            // Removed rather than reused: a directory a kill caught mid-write is in whatever
+            // half-applied state it was in at the time, and `git worktree prune` cannot
+            // reconcile it because the directory itself still exists. The commits are not in
+            // the directory — `Workspace::remove` deletes the branch only when git's own merged
+            // check says it carries nothing HEAD already has, so a killed run's work survives
+            // this and the next `prepare` attaches straight back to it.
+            let workspace_removed = match self.workspace.remove(&st.issue_id, &st.identifier) {
+                Ok(()) => true,
+                Err(e) => {
+                    // Not fatal, deliberately. A worktree that cannot be removed must not be
+                    // what keeps the claim held, or this would reproduce the bug it fixes.
+                    tracing::warn!(
+                        issue_id = %st.issue_id, error = %e,
+                        "orphaned workspace cleanup failed; releasing the claim anyway"
+                    );
+                    false
+                }
+            };
+
+            // Released last. A second kill part-way through leaves the claim in place, so the
+            // next startup sees the issue again and retries the cleanup; releasing first would
+            // discard the only record that this issue still has a worktree to reconcile.
+            self.store.release(self.clock.as_ref(), &st.issue_id)?;
+
+            tracing::warn!(
+                issue_id = %st.issue_id,
+                identifier = %st.identifier,
+                open_runs,
+                workspace_removed,
+                "recovered a claim stranded by a hard kill; the issue is dispatchable again"
+            );
+        }
         Ok(())
     }
 
