@@ -22,7 +22,7 @@ the published snapshot.
 ## Commands
 
 ```bash
-cargo test                                 # 131 unit + 37 integration
+cargo test                                 # 132 unit + 37 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -286,10 +286,11 @@ agent onto its worktree.
 
 ## Invariants
 
-Each of these closes a defect found in the original spec — bar the last six: two from the first
-dogfooding review, two from putting an operator surface on top of the same state, one that is
-issue #1's acceptance criterion made executable, and one from the first live dispatch — and each
-has a test that fails without it. Several only fail in
+Each of these closes a defect found in the original spec — bar the last seven, which came from
+dogfooding this orchestrator against its own backlog: two from the first review, two from putting
+an operator surface on top of the same state, one from issue #1's acceptance criterion made
+executable, one from the first live dispatch, and one from the review of that one — and each has
+a test that fails without it. Several only fail in
 the exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
 
@@ -312,6 +313,7 @@ reading — check the named test is still meaningful, not just still green.
 | A slow HTTP client cannot delay a tick | one task per connection, a `oneshot` reply the scheduler never waits on, and a bounded read timeout | `a_client_that_never_finishes_its_request_cannot_delay_a_tick` |
 | The projection cannot become load-bearing | `publish` logs a projector error and returns `Ok`; nothing written is ever read back | `the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off` |
 | A killed run cannot record a fabricated cost | totals are read only from the `result` event; a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total` |
+| A half-applied migration cannot stop the store opening | each migration and the `user_version` bump that records it commit in one transaction | `a_migration_that_fails_partway_leaves_no_trace_and_does_not_advance_the_version` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the

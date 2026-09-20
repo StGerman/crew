@@ -49,7 +49,13 @@ impl ToolEndpoint {
 pub struct Progress {
     pub turns: u32,
     /// Stream events observed so far, of every type — a tool result counts as much as a turn.
-    /// A working agent inside a long tool call is not silent, and this is what says so.
+    ///
+    /// The bound on what this can prove: events arrive when the CLI *emits* one, and a tool
+    /// result is emitted when the tool returns. A single command that runs longer than
+    /// `stall_timeout_ms` therefore still reads as a stall, because that interval genuinely
+    /// produces no output. What this fixes is the narrower case of an agent that is emitting
+    /// steadily — tool results, system events — without producing `assistant` turns. The long
+    /// single build is handled by sizing `stall_timeout_ms` above it, not by this counter.
     pub events: u64,
     /// The run's token totals, once it has reported them. `None` while the run is in flight and
     /// `None` forever for a run that ended without a `result` event: killed, crashed, or cut off
