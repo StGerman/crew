@@ -22,6 +22,10 @@ max_retry_backoff_ms = 60000
 stall_timeout_ms = 15000
 quarantine_after_identical = 3
 refresh_miss_grace = 2
+# How often finished (parked) issues are re-read to see whether their ticket has closed, so the
+# worktree can be reclaimed. Slower than the poll on purpose: a parked issue is not urgent, and
+# each sweep costs one tracker read per issue still parked. 0 disables the sweep.
+parked_sweep_interval_ms = 60000
 
 # Cap a busy state independently of the global limit.
 [agent.max_concurrent_by_state]

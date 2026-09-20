@@ -40,6 +40,10 @@ pub const DEFAULT_API_BIND: &str = "127.0.0.1:8787";
 fn d_api_bind() -> String {
     DEFAULT_API_BIND.to_string()
 }
+
+fn d_parked_sweep() -> u64 {
+    300_000
+}
 fn d_broker_enabled() -> bool {
     true
 }
@@ -277,6 +281,15 @@ pub struct AgentConfig {
     /// the first miss, so one eventual-consistency blip destroys in-flight work.
     #[serde(default = "d_miss_grace")]
     pub refresh_miss_grace: u32,
+    /// How often parked issues are re-read from the tracker to see whether they have since
+    /// closed, so their worktrees can be reclaimed. A parked issue is one the scheduler has
+    /// finished with and is no longer watching: it is out of `running`, has no retry row, and
+    /// once its ticket closes the active-state poll never returns it again. Without this sweep
+    /// its worktree and branch stay on disk for good. The sweep costs one `by_ids` batch per
+    /// interval over every issue still parked, so this is deliberately slower than
+    /// `polling.interval_ms` — a parked issue is not urgent. `0` disables the sweep.
+    #[serde(default = "d_parked_sweep")]
+    pub parked_sweep_interval_ms: u64,
 }
 
 impl Default for AgentConfig {
@@ -290,6 +303,7 @@ impl Default for AgentConfig {
             stall_timeout_ms: d_stall(),
             quarantine_after_identical: d_quarantine_after(),
             refresh_miss_grace: d_miss_grace(),
+            parked_sweep_interval_ms: d_parked_sweep(),
         }
     }
 }
