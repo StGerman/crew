@@ -46,3 +46,8 @@ refresh_miss_grace = 2
 enabled = true
 max_calls_per_run = 10
 max_calls_per_issue = 40
+# Inspect a headless run without attaching a terminal:
+#   curl -s localhost:8787/api/v1/snapshot | jq '.rows[] | {identifier, phase, turns}'
+[api]
+enabled = false
+bind = "127.0.0.1:8787"

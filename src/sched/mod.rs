@@ -14,17 +14,27 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::broker::{Broker, BrokerSession};
+use serde::Serialize;
+
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
 use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
-use crate::store::Store;
+use crate::store::{RunRecord, Store};
 use crate::tracker::{Tracker, TrackerError};
 use crate::worker::{Progress, RunHandle, Session, Worker};
 use crate::workspace::Workspace;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
 const KILL_GRACE_MS: u64 = 10_000;
+
+/// How much of an issue's run history the snapshot carries.
+///
+/// Deep enough to read a retry pattern — the same failure three times over, or a continuation
+/// that keeps coming back — and shallow enough that a view rebuilt on every tick stays cheap.
+/// An operator who needs more than this is asking a question for the database, not the
+/// dashboard.
+const RUNS_PER_ISSUE: usize = 5;
 
 /// A tracker failure never stops the tick — every call site here already returns `Ok(())` and
 /// tries again next poll — but a permanent one (a bad credential, most likely) will not
@@ -56,7 +66,7 @@ struct Running {
     _broker: Option<BrokerSession>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Row {
     pub issue_id: String,
     pub identifier: String,
@@ -74,11 +84,18 @@ pub struct Row {
     pub last_error: Option<String>,
     pub last_event: Option<String>,
     pub workspace: Option<String>,
+    /// This issue's most recent runs, newest first, at most [`RUNS_PER_ISSUE`].
+    pub runs: Vec<RunRecord>,
 }
 
-/// Immutable view published to the UI. The TUI renders this and never touches the store,
-/// which is what keeps the dashboard from becoming load-bearing.
-#[derive(Debug, Clone, Default)]
+/// Immutable view published to observers. The TUI renders this and never touches the store,
+/// and neither does the HTTP API ([`crate::api`]), which is what keeps either from becoming
+/// load-bearing.
+///
+/// It follows that this type is the *whole* published view: an observer that needs something
+/// it does not carry does not get a `Store`, it gets a new field here. That is why run history
+/// lives on [`Row`] rather than being read back out of the database by whoever wants it.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub generated_at: i64,
     pub rows: Vec<Row>,
@@ -832,6 +849,13 @@ impl Scheduler {
             self.store.all_retries()?.into_iter().map(|r| (r.issue_id, r.due_at)).collect();
         let (in_tok, out_tok) = self.store.token_totals()?;
 
+        // One query for every issue's history, not one per row: this runs on every tick, and
+        // under `--tui` four times a second on top of that.
+        let mut history: HashMap<String, Vec<RunRecord>> = HashMap::new();
+        for run in self.store.recent_runs(RUNS_PER_ISSUE)? {
+            history.entry(run.issue_id.clone()).or_default().push(run);
+        }
+
         let mut rows = Vec::new();
         for st in &states {
             let run = self.running.get(&st.issue_id);
@@ -855,6 +879,7 @@ impl Scheduler {
                 last_error: st.last_error.clone(),
                 last_event: progress.last_event,
                 workspace: run.map(|r| r.workspace.display().to_string()),
+                runs: history.remove(&st.issue_id).unwrap_or_default(),
             });
         }
 
@@ -921,9 +946,13 @@ impl Scheduler {
     }
 
     /// Operator action: clear quarantine so the issue becomes dispatchable again.
-    pub fn unquarantine(&self, issue_id: &str) -> anyhow::Result<()> {
-        self.store.unquarantine(self.clock.as_ref(), issue_id)?;
-        Ok(())
+    ///
+    /// Reports whether a quarantine was actually cleared. An issue that was not quarantined is
+    /// a no-op and says so — the caller wants to tell an operator "there was nothing to clear"
+    /// rather than an error, and rather than the silent phase reset an unguarded version would
+    /// perform on a live claim (see [`Store::unquarantine`]).
+    pub fn unquarantine(&self, issue_id: &str) -> anyhow::Result<bool> {
+        Ok(self.store.unquarantine(self.clock.as_ref(), issue_id)?)
     }
 
     /// Stop every in-flight run before the process exits.

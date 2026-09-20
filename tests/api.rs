@@ -1,0 +1,370 @@
+//! The ops HTTP API, end to end over a real socket against a real `Scheduler`.
+//!
+//! The harness below is `main`'s loop with the timer taken out: the same command channel, the
+//! same "publish, then answer" ordering, a real `Api` on a real loopback port, and a scheduler
+//! whose clock only moves when a test moves it. Nothing here fakes the HTTP layer, because the
+//! things most likely to break — framing, closing the connection, a request that never
+//! finishes — are invisible to a fake.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use serde_json::Value;
+use symphony_cc::api::{Api, Command};
+use symphony_cc::clock::FakeClock;
+use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
+use symphony_cc::model::{ErrorClass, Issue, Outcome};
+use symphony_cc::project::NoopProjector;
+use symphony_cc::sched::{Scheduler, Snapshot};
+use symphony_cc::store::Store;
+use symphony_cc::tracker::fake::FakeTracker;
+use symphony_cc::worker::fake::{FakeWorker, Script};
+use symphony_cc::workspace::DirWorkspace;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch};
+
+struct Harness {
+    addr: SocketAddr,
+    sched: Scheduler,
+    clock: Arc<FakeClock>,
+    worker: Arc<FakeWorker>,
+    snap_tx: watch::Sender<Snapshot>,
+    commands: mpsc::UnboundedReceiver<Command>,
+    root: PathBuf,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn issue(n: u32, state: &str) -> Issue {
+    Issue {
+        id: format!("iss-{n}"),
+        identifier: format!("MT-{n}"),
+        title: format!("issue {n}"),
+        body: None,
+        state: state.to_string(),
+        priority: Some(1),
+        url: Some(format!("https://example.invalid/{n}")),
+        labels: vec!["agent".into()],
+        dispatchable: true,
+        created_at: Some(1_000 + n as i64),
+        native_ref: None,
+        blocked_by: vec![],
+    }
+}
+
+impl Harness {
+    async fn new(issues: Vec<Issue>) -> Self {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("symphony-api-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let cfg = Config {
+            tracker: TrackerConfig {
+                kind: "fake".into(),
+                active_states: vec!["in progress".into()],
+                terminal_states: vec!["done".into()],
+                required_labels: vec![],
+                owner: String::new(),
+                repo: String::new(),
+            },
+            polling: PollingConfig { interval_ms: 30_000 },
+            workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
+            broker: Default::default(),
+            agent: AgentConfig::default(),
+            worker: Default::default(),
+            api: Default::default(),
+        };
+
+        let clock = Arc::new(FakeClock::new());
+        let worker = Arc::new(FakeWorker::new(clock.clone()));
+        let sched = Scheduler::new(
+            cfg,
+            clock.clone(),
+            Store::open_in_memory().unwrap(),
+            Arc::new(FakeTracker::new(issues)),
+            worker.clone(),
+            Arc::new(DirWorkspace::new(&root).unwrap()),
+            Arc::new(NoopProjector),
+        );
+
+        let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
+        let (cmd_tx, commands) = mpsc::unbounded_channel();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Api::new(snap_rx, cmd_tx).serve(listener));
+
+        Harness { addr, sched, clock, worker, snap_tx, commands, root }
+    }
+
+    /// One scheduler tick, published the way the loop in `main` publishes it.
+    fn tick(&mut self) {
+        self.sched.tick().unwrap();
+        self.snap_tx.send(self.sched.snapshot().unwrap()).unwrap();
+    }
+
+    /// Serve one request, pumping commands the way `main`'s loop does — so the write endpoints
+    /// reach a real scheduler rather than a stub that agrees with them.
+    async fn request(&mut self, method: &str, path: &str) -> (u16, Value) {
+        let addr = self.addr;
+        let raw =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        let mut client = tokio::spawn(async move { send(addr, &raw).await });
+
+        loop {
+            tokio::select! {
+                Some(cmd) = self.commands.recv() => self.apply(cmd),
+                done = &mut client => return done.unwrap(),
+            }
+        }
+    }
+
+    fn apply(&mut self, cmd: Command) {
+        match cmd {
+            Command::Tick(reply) => {
+                self.sched.tick().unwrap();
+                let snap = self.sched.snapshot();
+                if let Ok(s) = &snap {
+                    self.snap_tx.send(s.clone()).unwrap();
+                }
+                let _ = reply.send(snap);
+            }
+            Command::Unquarantine { issue_id, reply } => {
+                let cleared = self.sched.unquarantine(&issue_id);
+                self.snap_tx.send(self.sched.snapshot().unwrap()).unwrap();
+                let _ = reply.send(cleared);
+            }
+        }
+    }
+}
+
+/// Write one request and read until the server closes — which it always does, so a response
+/// that forgot `Connection: close` would hang this rather than passing quietly.
+async fn send(addr: SocketAddr, request: &str) -> (u16, Value) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8(raw).expect("responses are JSON over ASCII headers");
+
+    let (head, body) = text.split_once("\r\n\r\n").expect("a response has a head and a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("a status line");
+
+    assert!(head.contains("Content-Type: application/json"), "head was: {head}");
+    assert_eq!(
+        head.lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .and_then(|v| v.trim().parse::<usize>().ok()),
+        Some(body.len()),
+        "Content-Length must describe the body actually sent"
+    );
+
+    (status, serde_json::from_str(body).expect("every response body is JSON"))
+}
+
+fn rows(snapshot: &Value) -> &Vec<Value> {
+    snapshot["rows"].as_array().expect("rows is an array")
+}
+
+fn row<'a>(snapshot: &'a Value, identifier: &str) -> &'a Value {
+    rows(snapshot)
+        .iter()
+        .find(|r| r["identifier"] == identifier)
+        .unwrap_or_else(|| panic!("no row for {identifier}"))
+}
+
+/// Render a snapshot through the dashboard, without a terminal.
+fn as_dashboard(snap: &Snapshot) -> String {
+    let mut term = Terminal::new(TestBackend::new(110, 26)).unwrap();
+    term.draw(|f| symphony_cc::tui::render_snapshot(f, snap, 0)).unwrap();
+    term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+}
+
+#[tokio::test]
+async fn the_snapshot_endpoint_serves_what_the_dashboard_renders() {
+    let mut h = Harness::new(vec![issue(1, "In Progress"), issue(2, "In Progress")]).await;
+    h.tick();
+
+    let (status, body) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(status, 200);
+
+    // The same published snapshot reaches both surfaces, so anything the operator can read off
+    // the dashboard has to be answerable from the JSON.
+    let published = h.sched.snapshot().unwrap();
+    let screen = as_dashboard(&published);
+
+    assert_eq!(rows(&body).len(), published.rows.len());
+    for r in &published.rows {
+        assert!(screen.contains(&r.identifier), "the dashboard shows {}", r.identifier);
+        let json = row(&body, &r.identifier);
+        assert_eq!(json["phase"], r.phase.label());
+        assert_eq!(json["tracker_state"], r.tracker_state);
+        assert_eq!(json["title"], r.title);
+    }
+    assert_eq!(body["running"], published.running);
+    assert_eq!(body["limit"], published.limit);
+    assert_eq!(body["quarantined"], published.quarantined);
+    assert_eq!(body["ticks"], published.ticks);
+}
+
+#[tokio::test]
+async fn a_forced_refresh_advances_the_tick_count_by_exactly_one() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+
+    let (_, before) = h.request("GET", "/api/v1/snapshot").await;
+    let (status, after) = h.request("POST", "/api/v1/refresh").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        after["ticks"].as_u64().unwrap(),
+        before["ticks"].as_u64().unwrap() + 1,
+        "exactly one tick, and the response describes the one it ran"
+    );
+
+    // A read must not be a write: the tick count is unchanged by asking for it.
+    let (_, again) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(again["ticks"], after["ticks"]);
+}
+
+#[tokio::test]
+async fn an_issue_response_carries_its_state_and_its_run_history() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.worker.set_default(Script::succeeds_in(1_000));
+    h.tick();
+
+    let (status, running) = h.request("GET", "/api/v1/issues/MT-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(running["issue_id"], "iss-1");
+    assert_eq!(running["phase"], "running");
+    assert_eq!(running["url"], "https://example.invalid/1");
+    let in_flight = running["runs"].as_array().unwrap();
+    assert_eq!(in_flight.len(), 1, "the run in flight is already history");
+    assert!(in_flight[0]["ended_at"].is_null(), "and is not finished yet");
+
+    // Let it finish, and the same endpoint shows the verdict.
+    h.clock.advance_ms(1_000);
+    h.tick();
+    let (_, done) = h.request("GET", "/api/v1/issues/MT-1").await;
+    let runs = done["runs"].as_array().unwrap();
+    assert_eq!(runs[0]["outcome"], "done");
+    assert!(runs[0]["ended_at"].is_i64());
+
+    // A dispatch id is accepted in the same slot, for the case two issues share an identifier.
+    let (status, by_id) = h.request("GET", "/api/v1/issues/iss-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(by_id["identifier"], "MT-1");
+
+    let (status, missing) = h.request("GET", "/api/v1/issues/MT-404").await;
+    assert_eq!(status, 404, "an unknown issue is a 404, not a 500 and not an empty 200");
+    assert!(missing["error"].as_str().unwrap().contains("MT-404"));
+}
+
+#[tokio::test]
+async fn clearing_a_quarantine_that_is_not_there_is_a_no_op_with_a_plain_answer() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.worker.set_default(Script::succeeds_in(60_000));
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1, "the issue is running, not quarantined");
+
+    let (status, body) = h.request("POST", "/api/v1/unquarantine/MT-1").await;
+    assert_eq!(status, 200, "a no-op is not an error");
+    assert_eq!(body["cleared"], false);
+    assert_eq!(body["detail"], "not quarantined; nothing to clear");
+
+    // And it really was a no-op: an unguarded version would have released the live claim here,
+    // leaving the next tick free to dispatch a second agent onto the same worktree.
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1, "the live run is untouched");
+    let (_, snap) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(row(&snap, "MT-1")["phase"], "running");
+}
+
+#[tokio::test]
+async fn clearing_a_quarantine_returns_the_issue_to_service() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.worker.set_default(
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed { class: ErrorClass::AuthFailed, msg: "401".into() }),
+    );
+    h.tick();
+    h.clock.advance_ms(1_000);
+    h.tick();
+
+    let (_, snap) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(row(&snap, "MT-1")["quarantined"], true);
+    assert_eq!(snap["quarantined"], 1);
+
+    h.worker.set_default(Script::succeeds_in(1_000));
+    let (status, body) = h.request("POST", "/api/v1/unquarantine/MT-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["cleared"], true, "there was a quarantine, and it was cleared");
+    assert_eq!(body["issue_id"], "iss-1");
+
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1, "cleared issues become dispatchable again");
+
+    let (status, unknown) = h.request("POST", "/api/v1/unquarantine/MT-404").await;
+    assert_eq!(status, 404, "an issue that does not exist is not a silent success");
+    assert!(unknown["error"].is_string());
+}
+
+#[tokio::test]
+async fn a_client_that_never_finishes_its_request_cannot_delay_a_tick() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+
+    // A request head that never terminates. The connection stays open for the whole test:
+    // served from the accept loop, this alone would wedge every endpoint until the read
+    // timeout, and `POST /refresh` would be answered minutes after it was asked.
+    let mut stuck = TcpStream::connect(h.addr).await.unwrap();
+    stuck.write_all(b"GET /api/v1/snapshot HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
+    stuck.flush().await.unwrap();
+
+    // Deadlined deliberately: a server that accepted connections one at a time would still
+    // answer this — after the stuck client's read timeout expired, minutes into a real
+    // incident. "Eventually" is the bug, so the assertion is on the wait, not just the answer.
+    let deadline = std::time::Duration::from_secs(1);
+    let (status, body) = tokio::time::timeout(deadline, h.request("POST", "/api/v1/refresh"))
+        .await
+        .expect("a healthy client must not wait behind a stuck one");
+    assert_eq!(status, 200);
+    assert_eq!(body["ticks"].as_u64().unwrap(), 2, "and the tick it asked for really ran");
+
+    let (status, _) = tokio::time::timeout(deadline, h.request("GET", "/api/v1/snapshot"))
+        .await
+        .expect("nor does the next one");
+    assert_eq!(status, 200);
+
+    drop(stuck);
+}
+
+#[tokio::test]
+async fn the_wrong_method_on_a_real_endpoint_says_which_one_to_use() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+
+    let (status, body) = h.request("GET", "/api/v1/refresh").await;
+    assert_eq!(status, 405);
+    assert!(body["error"].as_str().unwrap().contains("POST"));
+
+    let (status, _) = h.request("DELETE", "/api/v1/snapshot").await;
+    assert_eq!(status, 405, "the read endpoints are read-only, including to an odd verb");
+
+    let (status, _) = h.request("GET", "/metrics").await;
+    assert_eq!(status, 404);
+}

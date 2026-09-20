@@ -48,13 +48,23 @@ impl Issue {
 }
 
 /// The orchestrator's claim state for an issue. Distinct from tracker state.
+///
+/// The serde spelling is pinned to [`Phase::label`], which is also what the store writes into
+/// its `phase` column and what the dashboard prints. One word per phase everywhere it is
+/// visible means an operator reading the HTTP API, the database and the TUI side by side never
+/// has to translate between three vocabularies for the same thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Phase {
+    #[serde(rename = "queued")]
     Queued,
+    #[serde(rename = "running")]
     Running,
+    #[serde(rename = "retry")]
     RetryQueued,
+    #[serde(rename = "quarantine")]
     Quarantined,
     #[default]
+    #[serde(rename = "released")]
     Released,
 }
 
@@ -229,6 +239,17 @@ mod tests {
         // already using.
         assert_ne!(a, session_id("iss-1", 1_001));
         assert_ne!(a, session_id("iss-2", 1_000));
+    }
+
+    #[test]
+    fn a_phase_serialises_to_the_one_word_the_store_and_the_dashboard_use() {
+        for p in
+            [Phase::Queued, Phase::Running, Phase::RetryQueued, Phase::Quarantined, Phase::Released]
+        {
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.label()), "serde and label disagree for {p:?}");
+            assert_eq!(serde_json::from_str::<Phase>(&json).unwrap(), p);
+        }
     }
 
     #[test]

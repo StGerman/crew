@@ -32,6 +32,9 @@ fn d_quarantine_after() -> u32 {
 fn d_miss_grace() -> u32 {
     2
 }
+fn d_api_bind() -> String {
+    "127.0.0.1:8787".to_string()
+}
 fn d_broker_enabled() -> bool {
     true
 }
@@ -56,6 +59,39 @@ pub struct Config {
     pub worker: WorkerConfig,
     #[serde(default)]
     pub broker: BrokerConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+}
+
+/// The ops HTTP surface ([`crate::api`]).
+///
+/// Off by default, and loopback when on: `POST /refresh` and `POST /unquarantine` control
+/// agent execution, so an orchestrator that grows a control plane merely by being upgraded, or
+/// that binds `0.0.0.0` because a field was left at a convenient default, is not something an
+/// operator asked for.
+///
+/// Deliberately absent from [`Config::preflight`]: preflight gates *dispatch*, so validating
+/// the bind address there would let a typo in a field the scheduler does not use stop the
+/// scheduler. The address is parsed once, by [`crate::api::bind`], where a failure costs the
+/// API and nothing else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `host:port`. Refused unless the host is loopback or `allow_public` is set.
+    #[serde(default = "d_api_bind")]
+    pub bind: String,
+    /// Permit a non-loopback bind — a deliberate decision to expose the write endpoints to
+    /// whatever can reach that interface, which is why it is a separate flag rather than an
+    /// inference from the address.
+    #[serde(default)]
+    pub allow_public: bool,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self { enabled: false, bind: d_api_bind(), allow_public: false }
+    }
 }
 
 /// The host-side tool broker (see [`crate::broker`]).
@@ -335,6 +371,7 @@ mod tests {
             agent: Default::default(),
             worker: Default::default(),
             broker: Default::default(),
+            api: Default::default(),
         };
         c.normalize();
         c

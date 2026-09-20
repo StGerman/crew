@@ -2,13 +2,20 @@
 //!
 //! Headless is the default; `--tui` opts into the dashboard. That asymmetry is deliberate —
 //! it keeps the UI a client of the same snapshot an operator could curl, rather than a
-//! privileged view that correctness quietly depends on.
+//! privileged view that correctness quietly depends on. `--api` makes the curl literal: the
+//! same published snapshot, over HTTP, with no second path to the store.
+//!
+//! The loop below is the one place that owns the `Scheduler`, which is why both operator
+//! surfaces reach it the same way — a message on a channel, never a handle. The dashboard's
+//! messages are fire-and-forget; the API's carry a `oneshot` to answer on, because an HTTP
+//! client is owed a response and a keypress is not.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use symphony_cc::api::{Api, Command};
 use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
@@ -40,6 +47,11 @@ struct Args {
     /// Stop after this many ticks. Useful for smoke tests in CI.
     #[arg(long)]
     max_ticks: Option<u64>,
+
+    /// Serve the ops HTTP API on this address, overriding `[api]` in the config. A
+    /// non-loopback address still needs `api.allow_public`.
+    #[arg(long, value_name = "ADDR")]
+    api: Option<String>,
 }
 
 #[tokio::main]
@@ -158,12 +170,38 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let interval_ms = cfg.polling.interval_ms;
+
+    // Read before the config moves into the scheduler; `--api` is an override of it, not a
+    // second source of truth.
+    let mut api_cfg = cfg.api.clone();
+    if let Some(addr) = args.api.clone() {
+        api_cfg.enabled = true;
+        api_cfg.bind = addr;
+    }
+
     let mut sched =
         Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
     sched.set_broker(broker);
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
     let (act_tx, mut act_rx) = mpsc::unbounded_channel::<UiAction>();
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+
+    // Publish once before anything can observe, so the window between start and the first tick
+    // shows the scheduler's real state rather than `Snapshot::default()` — whose `running 0/0`
+    // reports a concurrency limit this process never had.
+    let _ = snap_tx.send(sched.snapshot()?);
+
+    // Best-effort by contract: the API failing to start costs the API. Dispatch is not the
+    // scheduler's opinion of whether a port was free.
+    if api_cfg.enabled {
+        match symphony_cc::api::bind(&api_cfg).await {
+            Ok(listener) => {
+                tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
+            }
+            Err(e) => tracing::error!(error = %e, "ops API not started; scheduling continues"),
+        }
+    }
 
     let ui = args.tui.then(|| {
         let rx = snap_rx.clone();
@@ -203,9 +241,31 @@ async fn main() -> anyhow::Result<()> {
                         let _ = snap_tx.send(sched.snapshot()?);
                     }
                     UiAction::Unquarantine(id) => {
-                        tracing::info!(issue_id = %id, "operator cleared quarantine");
-                        sched.unquarantine(&id)?;
+                        let cleared = sched.unquarantine(&id)?;
+                        tracing::info!(issue_id = %id, cleared, "operator cleared quarantine");
                         let _ = snap_tx.send(sched.snapshot()?);
+                    }
+                }
+            }
+            Some(command) = cmd_rx.recv() => {
+                // Every arm publishes before it answers, so a client that reads
+                // `GET /snapshot` the instant its POST returns sees the effect it asked for.
+                // A dropped reply channel is an ordinary outcome, not an error: it means the
+                // client went away, and nothing here waits to find out.
+                match command {
+                    Command::Tick(reply) => {
+                        if let Err(e) = sched.tick() { tracing::error!(error = %e, "api tick failed"); }
+                        let snap = sched.snapshot();
+                        if let Ok(s) = &snap { let _ = snap_tx.send(s.clone()); }
+                        let _ = reply.send(snap);
+                    }
+                    Command::Unquarantine { issue_id, reply } => {
+                        let cleared = sched.unquarantine(&issue_id);
+                        if let Ok(c) = &cleared {
+                            tracing::info!(issue_id = %issue_id, cleared = c, "api cleared quarantine");
+                        }
+                        if let Ok(s) = sched.snapshot() { let _ = snap_tx.send(s); }
+                        let _ = reply.send(cleared);
                     }
                 }
             }

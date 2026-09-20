@@ -36,3 +36,9 @@ max_calls_per_run = 20
 # Across *all* of an issue's runs. The per-run cap alone bounds nothing, because every
 # continuation opens a fresh run with a fresh allowance.
 max_calls_per_issue = 100
+# The ops HTTP surface, off unless asked for — `--api 127.0.0.1:8787` flips it for one run
+# without editing this file. `POST /refresh` and `POST /unquarantine` control agent execution,
+# so a non-loopback `bind` additionally needs `allow_public = true`.
+[api]
+enabled = false
+bind = "127.0.0.1:8787"

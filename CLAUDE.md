@@ -13,17 +13,19 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-Slices 1–5 are complete and green: a deterministic core with a fake behind every external
+Slices 1–6 are complete and green: a deterministic core with a fake behind every external
 seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
 Issues tracker, then a real `claude -p` worker, then a host-side MCP tool broker that lets the
-agent write to its own ticket without ever holding the credential.
+agent write to its own ticket without ever holding the credential, and an HTTP ops API over
+the published snapshot.
 
 ## Commands
 
 ```bash
-cargo test                                 # 114 unit + 29 integration
+cargo test                                 # 124 unit + 36 integration
 cargo test --lib                           # unit only
-cargo test --test scheduler                # integration only
+cargo test --test scheduler                # scheduler integration only
+cargo test --test api                      # ops API integration only
 cargo test a_permanent_failure             # one test; the arg is a substring match
 
 cargo clippy --all-targets -- -D warnings  # the standing bar is zero warnings
@@ -31,6 +33,7 @@ cargo fmt --check
 
 cargo run -- --tui                         # dashboard against the fake tracker
 cargo run -- --max-ticks 20                # headless smoke run, then exit
+cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
@@ -114,9 +117,12 @@ have it.
 2. The claim commits before the worker exists: `ensure → claim → prepare → spawn`, in that
    order, in `launch()`. Spawning first leaves a window where a fast-exiting worker reports
    against state that was never written.
-3. The TUI never reads the store. The scheduler publishes an immutable `Snapshot` over a
-   `tokio::sync::watch` channel and the UI renders that and nothing else. Headless is the
-   default and `--tui` opts in, which is what keeps the dashboard from becoming load-bearing.
+3. No observer reads the store. The scheduler publishes an immutable `Snapshot` over a
+   `tokio::sync::watch` channel, and the TUI and the HTTP API render that and nothing else.
+   Headless is the default and `--tui` opts in, which is what keeps the dashboard from becoming
+   load-bearing. The rule cuts both ways: an observer that needs something the snapshot does
+   not carry does not get a `Store`, it gets a new field on `Snapshot` — which is why run
+   history lives on `Row`.
 4. The projection is one-way ([src/project.rs](src/project.rs)). The orchestrator writes to
    `~/.claude/tasks` and never reads it back for a scheduling decision — it is Claude Code's
    internal store with no published schema, so a change there must cost a dashboard, not the
@@ -232,10 +238,35 @@ Scheduler` safety net (for a panic or an early `?` return that skips the explici
 terminate every run still in `self.running` before letting the process end. If you add another
 place `main.rs` can exit, check that this still runs.
 
+The ops API ([src/api/mod.rs](src/api/mod.rs)) is the second observer of that same published
+snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v1/refresh`,
+`POST /api/v1/unquarantine/:identifier`. `Api` holds a `watch::Receiver` and a command sender
+and no `Store`, so rule 3 is enforced by the type rather than by discipline — and the two
+`POST`s can express nothing the dashboard's `r` and `u` keys cannot. Off by default (`[api]
+enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
+because those two routes control agent execution. Deliberately *not* validated in
+`Config::preflight`: preflight gates dispatch, so a typo in an address the scheduler never uses
+must not be what stops it — `api::bind` parses it once, and a failure there is logged and
+costs the API alone. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
+which is what keeps a hung client off the tick: the scheduler answers into a channel whose
+receiver may already be gone and never waits to find out. The HTTP is hand-rolled (~200 lines,
+no keep-alive, one response type) for the same reason the rest of this crate is small; the
+tests in [tests/api.rs](tests/api.rs) drive it over a real loopback socket against a real
+`Scheduler`, because framing and connection-close bugs are exactly what a fake would hide.
+
+Two notes for anyone adding an endpoint. `:identifier` resolves the dispatch id first and an
+identifier second, and answers `409` with the candidate ids when one identifier names two
+issues — identifiers are not unique, which is the same fact `worktree_key` exists for. And
+`POST /unquarantine` on an issue that is not quarantined is a `200` saying so, not an error:
+the guard lives in `Store::unquarantine`'s `WHERE` clause, because an unconditional version
+would reset a *running* issue's phase to `released` and let the next tick dispatch a second
+agent onto its worktree.
+
 ## Invariants
 
-Each of these closes a defect found in the original spec — bar the last two, which came out of
-the first dogfooding review — and each has a test that fails without it. Several only fail in
+Each of these closes a defect found in the original spec — bar the last four: two from the
+first dogfooding review, two from putting an operator surface on top of the same state — and
+each has a test that fails without it. Several only fail in
 the exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
 
@@ -254,6 +285,8 @@ reading — check the named test is still meaningful, not just still green.
 | An agent cannot write to another ticket | no tool takes an issue id; the target comes from the per-run token | `a_call_naming_a_different_issue_is_refused_and_the_refusal_is_audited` |
 | A looping agent cannot write without bound | per-run **and** per-issue budgets, charged on attempts not successes | `a_continuation_cannot_refresh_the_budget_by_opening_a_new_session` |
 | A finished run keeps no write authority | the session is an RAII guard living in the `running` entry | `a_run_that_ends_takes_its_broker_authority_with_it` |
+| Clearing a quarantine cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL` and reports what it did | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim` |
+| A slow HTTP client cannot delay a tick | one task per connection, a `oneshot` reply the scheduler never waits on, and a bounded read timeout | `a_client_that_never_finishes_its_request_cannot_delay_a_tick` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the

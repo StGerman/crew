@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 
 use crate::clock::{Clock, Wall};
 use crate::model::{ErrorClass, Phase};
@@ -41,6 +42,25 @@ impl IssueState {
     pub fn is_quarantined(&self) -> bool {
         self.quarantined_at.is_some()
     }
+}
+
+/// One dispatched run, as the published snapshot carries it.
+///
+/// `ended_at` and `outcome` are `None` while the run is in flight — and stay `None` for a run
+/// whose process was killed with the orchestrator, until the next startup's `recover()` closes
+/// it. The counters are what the run had reported by the time it ended, which is zero for a run
+/// that died with whatever was counting them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunRecord {
+    pub run_id: String,
+    pub issue_id: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub outcome: Option<String>,
+    pub session_id: Option<String>,
+    pub turns: u32,
+    pub in_tok: u64,
+    pub out_tok: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,16 +292,24 @@ impl Store {
         Ok(quarantine)
     }
 
-    pub fn unquarantine(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<()> {
+    /// Clear a quarantine, reporting whether there was one to clear.
+    ///
+    /// Guarded on `quarantined_at IS NOT NULL` rather than applied unconditionally, because
+    /// this also resets `phase` to `released`: run it against an issue that is *not*
+    /// quarantined and it drops a live claim out from under a running agent, and the next tick
+    /// dispatches a second one onto the same worktree. An operator action that names the wrong
+    /// issue must be a no-op, and the only place that can be decided without a race is here,
+    /// in the same statement that would have done the damage.
+    pub fn unquarantine(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let n = conn.execute(
             "UPDATE issue_state
              SET quarantined_at = NULL, phase = 'released', attempt = 0, consecutive_fail = 0,
                  last_fail_class = NULL, updated_at = ?2
-             WHERE issue_id = ?1",
+             WHERE issue_id = ?1 AND quarantined_at IS NOT NULL",
             params![issue_id, clock.wall().0],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     /// Park an issue in its current tracker state after a `Done` or `Blocked` verdict.
@@ -450,6 +478,38 @@ impl Store {
         Ok(())
     }
 
+    /// The latest runs of every issue, newest first, at most `per_issue` each.
+    ///
+    /// Bounded per issue rather than by a global `LIMIT`: one issue that has been retried
+    /// fifty times would otherwise crowd every other issue's history out of a view that is
+    /// published on every tick.
+    pub fn recent_runs(&self, per_issue: usize) -> rusqlite::Result<Vec<RunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id,
+                    turns, in_tok, out_tok
+             FROM (SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY issue_id ORDER BY started_at DESC, run_id DESC) AS rn
+                   FROM run)
+             WHERE rn <= ?1
+             ORDER BY issue_id, started_at DESC, run_id DESC",
+        )?;
+        let rows = stmt.query_map(params![per_issue as i64], |r| {
+            Ok(RunRecord {
+                run_id: r.get(0)?,
+                issue_id: r.get(1)?,
+                started_at: r.get(2)?,
+                ended_at: r.get(3)?,
+                outcome: r.get(4)?,
+                session_id: r.get(5)?,
+                turns: r.get::<_, i64>(6)? as u32,
+                in_tok: r.get::<_, i64>(7)? as u64,
+                out_tok: r.get::<_, i64>(8)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn token_totals(&self) -> rusqlite::Result<(u64, u64)> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -517,8 +577,49 @@ mod tests {
         let (s, c) = setup();
         s.record_failure(&c, "id-1", ErrorClass::AuthFailed, "401", 3).unwrap();
         assert!(!s.claim(&c, "id-1").unwrap());
-        s.unquarantine(&c, "id-1").unwrap();
+        assert!(s.unquarantine(&c, "id-1").unwrap(), "clearing a real quarantine reports it");
         assert!(s.claim(&c, "id-1").unwrap());
+    }
+
+    #[test]
+    fn clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim() {
+        // The operator action reachable from the dashboard and the HTTP API. Pointed at an
+        // issue that is merely running, an unguarded version would reset its phase to
+        // `released` — and the next tick would dispatch a second agent onto the same worktree.
+        let (s, c) = setup();
+        assert!(s.claim(&c, "id-1").unwrap());
+
+        assert!(!s.unquarantine(&c, "id-1").unwrap(), "nothing was quarantined; nothing to clear");
+
+        assert_eq!(s.get("id-1").unwrap().unwrap().phase, Phase::Running, "the claim must stand");
+        assert!(!s.claim(&c, "id-1").unwrap(), "and must still be exclusive");
+    }
+
+    #[test]
+    fn run_history_is_newest_first_and_bounded_per_issue() {
+        let (s, c) = setup();
+        s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
+        for n in 1..=4 {
+            c.advance_ms(1_000);
+            s.start_run(&c, &format!("run-1-{n}"), "id-1", "sess-1").unwrap();
+            s.finish_run(&c, &format!("run-1-{n}"), "done", n, 10 * n as u64, n as u64).unwrap();
+        }
+        s.start_run(&c, "run-2-1", "id-2", "sess-2").unwrap();
+
+        let runs = s.recent_runs(2).unwrap();
+        let for_1: Vec<_> = runs.iter().filter(|r| r.issue_id == "id-1").collect();
+        assert_eq!(
+            for_1.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            vec!["run-1-4", "run-1-3"],
+            "the two newest, newest first"
+        );
+        assert_eq!(for_1[0].turns, 4);
+
+        // A busy issue must not crowd out a quiet one's history.
+        let for_2: Vec<_> = runs.iter().filter(|r| r.issue_id == "id-2").collect();
+        assert_eq!(for_2.len(), 1);
+        assert!(for_2[0].ended_at.is_none(), "a run still in flight has no end");
+        assert_eq!(for_2[0].outcome, None);
     }
 
     #[test]

@@ -85,6 +85,7 @@ fn harness_over(
         agent: AgentConfig::default(),
         worker: Default::default(),
         broker: Default::default(),
+        api: Default::default(),
     };
     tune(&mut cfg);
     cfg.preflight().expect("test config must be valid");
