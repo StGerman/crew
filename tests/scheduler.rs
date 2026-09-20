@@ -12,7 +12,7 @@ use symphony_cc::broker::{Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, FakeClock};
 use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
 use symphony_cc::model::{ErrorClass, Issue, Outcome, Phase};
-use symphony_cc::project::NoopProjector;
+use symphony_cc::project::{NoopProjector, Projector, TasksProjector};
 use symphony_cc::sched::Scheduler;
 use symphony_cc::store::Store;
 use symphony_cc::tracker::TrackerError;
@@ -71,6 +71,19 @@ fn harness_over(
     workspace: Arc<dyn Workspace>,
     tune: impl FnOnce(&mut Config),
 ) -> Harness {
+    harness_full(issues, root, store, workspace, Arc::new(NoopProjector), tune)
+}
+
+/// The fully explicit builder. Every other harness reaches the scheduler through here, so a
+/// test that needs to swap one seam names it and inherits the rest.
+fn harness_full(
+    issues: Vec<Issue>,
+    root: PathBuf,
+    store: Store,
+    workspace: Arc<dyn Workspace>,
+    projector: Arc<dyn Projector>,
+    tune: impl FnOnce(&mut Config),
+) -> Harness {
     let mut cfg = Config {
         tracker: TrackerConfig {
             kind: "fake".into(),
@@ -101,7 +114,7 @@ fn harness_over(
         tracker.clone(),
         worker.clone(),
         workspace,
-        Arc::new(NoopProjector),
+        projector,
     );
 
     Harness { sched, clock, tracker, worker, root }
@@ -859,4 +872,134 @@ fn recovery_leaves_the_claims_of_runs_this_process_is_still_executing_alone() {
     assert_eq!(h.sched.running_count(), 1, "a live run must not be reconciled away");
     assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Running);
     assert!(ws.exists(), "nor its workspace removed out from under it");
+}
+
+// ---- projection -------------------------------------------------------------
+
+/// The projector every real deployment is one disk error away from.
+struct FailingProjector;
+
+impl Projector for FailingProjector {
+    fn project(&self, _issues: &[symphony_cc::project::ProjectedIssue]) -> anyhow::Result<()> {
+        anyhow::bail!("disk full")
+    }
+}
+
+/// Everything the scheduler decides, as one comparable value per tick: the store is its
+/// judgment, the retry table its timing, the snapshot what it tells the world. The snapshot
+/// has no `PartialEq`, so its `Debug` form stands in — every field in it is deterministic on a
+/// fake clock, including the timestamps. The one thing that legitimately differs between two
+/// otherwise identical lifetimes is where on disk each one lived, so the workspace root is
+/// masked out rather than letting it hide a real divergence behind an expected one.
+fn decision_trace(h: &Harness, root: &Path) -> String {
+    let store = h.sched.store();
+    format!(
+        "running={}\nstates={:?}\nretries={:?}\nsnapshot={:?}",
+        h.sched.running_count(),
+        store.all().unwrap(),
+        store.all_retries().unwrap(),
+        h.sched.snapshot().unwrap(),
+    )
+    .replace(&*root.to_string_lossy(), "<root>")
+}
+
+/// One scripted lifetime exercising every path `publish` runs after: a clean finish, a
+/// retryable failure with its retry coming due, an immediate quarantine, a continuation, and
+/// a ticket reaching a terminal state with the cleanup that triggers. Returns the trace after
+/// every tick, so a divergence names the tick it happened on.
+fn run_scripted_lifetime(projector: Arc<dyn Projector>, root: PathBuf) -> Vec<String> {
+    let workspace = Arc::new(DirWorkspace::new(&root).unwrap());
+    // `DirWorkspace` canonicalises, so the paths in the snapshot are the resolved form, not
+    // the one this function was handed — on macOS that is `/private/var/...` for `/var/...`.
+    let canonical_root = workspace.root().to_path_buf();
+    let mut h = harness_full(
+        vec![
+            issue(1, "In Progress", Some(1)),
+            issue(2, "In Progress", Some(2)),
+            issue(3, "In Progress", Some(3)),
+            issue(4, "In Progress", Some(4)),
+        ],
+        root,
+        Store::open_in_memory().unwrap(),
+        workspace,
+        projector,
+        |c| c.agent.max_concurrent = 4,
+    );
+    h.worker.script("iss-1", Script::succeeds_in(1_000));
+    h.worker.script(
+        "iss-2",
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed { class: ErrorClass::Stall, msg: "hung".into() }),
+    );
+    h.worker.script(
+        "iss-3",
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed { class: ErrorClass::AuthFailed, msg: "401".into() }),
+    );
+    h.worker.script(
+        "iss-4",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more".into() }),
+    );
+
+    let mut trace = Vec::new();
+    h.sched.tick().unwrap();
+    trace.push(decision_trace(&h, &canonical_root));
+
+    // Every run finishes; verdicts land: done, retry scheduled, quarantined, continuation.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    trace.push(decision_trace(&h, &canonical_root));
+
+    // A human closes the finished one; cleanup fires.
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    trace.push(decision_trace(&h, &canonical_root));
+
+    // Far enough for both the continuation and the first backoff to come due.
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    trace.push(decision_trace(&h, &canonical_root));
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    trace.push(decision_trace(&h, &canonical_root));
+
+    trace
+}
+
+/// The projection is a view. Whether it writes real task files, fails on every call, or is
+/// switched off entirely, the scheduler must reach the same decisions on the same ticks —
+/// otherwise the dashboard has become load-bearing, which is the failure this invariant
+/// exists to make impossible. Proved by trace, not by inspection: the same scripted lifetime
+/// runs three times and the traces are required to be identical.
+#[test]
+fn the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off() {
+    let dir = tmp_dir("projector-bit-identical");
+
+    let off = run_scripted_lifetime(Arc::new(NoopProjector), dir.join("ws-off"));
+
+    let failing = run_scripted_lifetime(Arc::new(FailingProjector), dir.join("ws-failing"));
+    assert_eq!(off, failing, "a projector that fails on every call must not change one decision");
+
+    let tasks_root = dir.join("tasks");
+    let real = TasksProjector::new(&tasks_root, "sess").unwrap();
+    let written = run_scripted_lifetime(Arc::new(real), dir.join("ws-real"));
+    assert_eq!(off, written, "a projector that writes real files must not change one decision");
+
+    // Sanity: the real one did write — otherwise the third leg tested the same thing as the
+    // first. Four issues, none ever dropped from the store, so four files.
+    assert_eq!(
+        std::fs::read_dir(tasks_root.join("sess")).unwrap().count(),
+        4,
+        "the real projector must have projected, or this test proves nothing about it"
+    );
+
+    // Each tick must also have differed from the last, or the trace is too coarse to catch a
+    // divergence that happened to land on a quiet tick.
+    for w in off.windows(2) {
+        assert_ne!(w[0], w[1], "every scripted tick should move the scheduler somewhere new");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
