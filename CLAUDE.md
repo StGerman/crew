@@ -128,6 +128,22 @@ dispatches against its own backlog, with `~/.claude/tasks` as the operator-visib
 Until then `symphony.toml` stays on `kind = "fake"`. When you change scheduler behaviour, ask
 whether the change would still be correct when the agent running it is working on this repo.
 
+[.mcp.json](.mcp.json) hands the agent rust-analyzer over MCP, so navigation in this repo is
+LSP rather than grep — which is what makes the invariant table above checkable: whether
+`guard_within` is still reached from both `prepare` and `remove` is a find-references
+question. It needs `rustup component add rust-analyzer rust-src` plus
+`cargo install rust-analyzer-mcp` on the host. Being committed, it is inherited by every
+worktree under `.symphony/workspaces`, so each dispatched agent indexes its own copy of the
+tree. That is intended, but it is not free — budget roughly 1-2 GB resident and one
+`cargo check` per concurrent run when setting `agent.max_concurrent`.
+
+One trap, and it bites exactly the use above: `references`, `definition` and `hover` answer
+from whatever is indexed *so far* rather than waiting, so during the first load they come
+back empty — and empty is indistinguishable from *no callers*, which reads as an invariant
+that has already been broken. Only `rename` (which refuses outright) and `diagnostics`
+(which carries a `complete` flag) wait for a quiescent workspace. Ask again until an answer
+is non-empty before concluding anything from one.
+
 ## Constraints for the worker and broker slices
 
 Decisions already taken that are expensive to rediscover:
