@@ -24,6 +24,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::{mpsc, watch};
 
 use crate::sched::Snapshot;
+use crate::worker::TokenUsage;
 
 /// Requests the dashboard sends back to the scheduler loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,10 +157,26 @@ fn render_footer(f: &mut Frame, area: Rect, snap: &Snapshot) {
             Style::default().fg(if snap.quarantined > 0 { Color::Red } else { Color::DarkGray }),
         ),
         Span::styled("   tokens ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{} in / {} out", fmt_count(snap.in_tok), fmt_count(snap.out_tok))),
+        Span::raw(format!(
+            "{} in / {} out",
+            fmt_count(snap.tokens.input),
+            fmt_count(snap.tokens.output)
+        )),
         Span::styled("   ticks ", Style::default().fg(Color::DarkGray)),
         Span::raw(snap.ticks.to_string()),
     ];
+
+    // The sum covers only the runs that reported. Naming the ones that did not is what keeps it
+    // from reading as a total when it is a lower bound.
+    if snap.uncounted_runs > 0 {
+        spans.insert(
+            spans.len() - 2,
+            Span::styled(
+                format!(" (+{} uncounted)", snap.uncounted_runs),
+                Style::default().fg(Color::Yellow),
+            ),
+        );
+    }
 
     if let Some(err) = &snap.last_error {
         spans.push(Span::styled(
@@ -179,6 +196,16 @@ fn render_footer(f: &mut Frame, area: Rect, snap: &Snapshot) {
 }
 
 /// Compact counts so a wide token column does not push the layout around.
+/// `in/out` for a run that has reported, `-` for one that has not — the same mark the table
+/// uses for an attempt count or age that does not exist yet. Never `0/0`: on this screen a zero
+/// would say "free", and an unreported run is not free, it is unknown.
+pub fn fmt_tokens(t: Option<TokenUsage>) -> String {
+    match t {
+        Some(t) => format!("{}/{}", fmt_count(t.input), fmt_count(t.output)),
+        None => "-".to_string(),
+    }
+}
+
 pub fn fmt_count(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
@@ -212,8 +239,7 @@ mod tests {
             phase,
             attempt: 2,
             turns: 7,
-            in_tok: 1_200,
-            out_tok: 800,
+            tokens: Some(TokenUsage { input: 1_200, output: 800 }),
             age_ms: 92_000,
             quarantined,
             last_error: quarantined.then(|| "agent exited unexpectedly".to_string()),
@@ -254,16 +280,34 @@ mod tests {
             limit: 3,
             retrying: 1,
             quarantined: 1,
-            in_tok: 12_400,
-            out_tok: 3_100,
+            tokens: TokenUsage { input: 12_400, output: 3_100 },
+            uncounted_runs: 2,
             ticks: 9,
             ..Default::default()
         };
         let out = render_to_string(&snap, 0);
 
-        for expect in ["MT-601", "MT-602", "MT-603", "running", "1/3", "12.4k", "dispatch"] {
+        for expect in
+            ["MT-601", "MT-602", "MT-603", "running", "1/3", "12.4k", "+2 uncounted", "dispatch"]
+        {
             assert!(out.contains(expect), "missing {expect:?} in rendered output");
         }
+    }
+
+    #[test]
+    fn a_run_without_a_reported_total_shows_an_absence_not_a_zero() {
+        // The table cell and the detail pane are two renderings of the same fact, and both must
+        // say "unknown" rather than "free". The footer's own `running 0/0` counter is why this
+        // does not simply forbid `0/0` in the whole frame.
+        assert_eq!(fmt_tokens(None), "-");
+        assert_eq!(fmt_tokens(Some(TokenUsage { input: 1_200, output: 80 })), "1.2k/80");
+
+        let snap = Snapshot {
+            rows: vec![Row { tokens: None, ..row("MT-601", Phase::Running, false) }],
+            ..Default::default()
+        };
+        let out = render_to_string(&snap, 0);
+        assert!(out.contains("not yet reported"), "the detail pane names the absence");
     }
 
     #[test]

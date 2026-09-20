@@ -22,7 +22,7 @@ the published snapshot.
 ## Commands
 
 ```bash
-cargo test                                 # 124 unit + 37 integration
+cargo test                                 # 130 unit + 37 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -204,6 +204,19 @@ so the worker's prompt asks the agent to end its final message with `SYMPHONY_OU
 continue: <reason>` or `SYMPHONY_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
 and it is a soft convention by design — an agent that forgets it just reads as `Done`.
 
+Token totals come from the terminal `result` event and nowhere else (`Progress::tokens`, an
+`Option`). The first live dispatch (#7) summed the `usage` block of every streamed `assistant`
+event instead and recorded ten million input tokens and four hundred output tokens over 83
+turns: the CLI emits one `assistant` event per content block, each carrying the whole turn's
+usage, and the per-event `output_tokens` is a streaming placeholder. Two things follow. Stall
+detection no longer has token counters to watch, so `Progress::events` — a count of every
+parsed stream event, tool results included — is the liveness signal, and it is a better one: an
+agent an hour into a long tool call was previously indistinguishable from a silent one. And a
+run that ends without a `result` — killed, crashed, or cut off by the turn budget, which on a
+real install produces no `result` at all — reports `None`, stored as NULL, and lands in the
+dashboard's `(+N uncounted)` tally rather than as a zero or an estimate. Schema v3 dropped the
+totals recorded before this; they were unrelated to the real cost, not a rough version of it.
+
 `Tracker` stays a read kernel; the *write* half lives on a separate trait,
 `TrackerWrites` ([src/broker/writes.rs](src/broker/writes.rs)), whose only caller is the broker
 ([src/broker/](src/broker/)). `GithubTracker` implements both over one credential that never
@@ -275,8 +288,8 @@ agent onto its worktree.
 
 Each of these closes a defect found in the original spec — bar the last five: two from the
 first dogfooding review, two from putting an operator surface on top of the same state, and one
-that is issue #1's acceptance criterion made executable — and each has a test that fails
-without it. Several only fail in
+that is issue #1's acceptance criterion made executable, and one from the first live dispatch
+— and each has a test that fails without it. Several only fail in
 the exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
 
@@ -298,6 +311,7 @@ reading — check the named test is still meaningful, not just still green.
 | Clearing a quarantine cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL` and reports what it did | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim` |
 | A slow HTTP client cannot delay a tick | one task per connection, a `oneshot` reply the scheduler never waits on, and a bounded read timeout | `a_client_that_never_finishes_its_request_cannot_delay_a_tick` |
 | The projection cannot become load-bearing | `publish` logs a projector error and returns `Ok`; nothing written is ever read back | `the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off` |
+| A killed run cannot record a fabricated cost | totals are read only from the `result` event; a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the

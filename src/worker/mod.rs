@@ -36,12 +36,41 @@ impl ToolEndpoint {
 }
 
 /// Progress reported while a run is in flight. Drives stall detection and the dashboard.
+///
+/// Two of these fields answer different questions and must not be merged back into one.
+/// `events` is a liveness signal: it exists so that this struct compares unequal between two
+/// scheduler ticks whenever the child did anything at all, which is exactly what
+/// `detect_stalls` checks. `tokens` is a cost figure, and it is absent until the run's terminal
+/// `result` event supplies one. The first version of this type had per-event token counters
+/// serving both jobs, and they served the second badly (see [`TokenUsage`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Progress {
     pub turns: u32,
-    pub in_tok: u64,
-    pub out_tok: u64,
+    /// Stream events observed so far, of every type — a tool result counts as much as a turn.
+    /// A working agent inside a long tool call is not silent, and this is what says so.
+    pub events: u64,
+    /// The run's token totals, once it has reported them. `None` while the run is in flight and
+    /// `None` forever for a run that ended without a `result` event: killed, crashed, or cut off
+    /// by the session turn budget. An honest absence, not a zero.
+    pub tokens: Option<TokenUsage>,
     pub last_event: Option<String>,
+}
+
+/// Token totals for one run, as reported by the agent CLI itself in its terminal `result` event.
+///
+/// Taken from there and nowhere else. Summing the `usage` block of each streamed `assistant`
+/// event looked equivalent and was not, in both directions: the CLI emits one `assistant` event
+/// per content block, each carrying the whole turn's usage, so a thinking-then-text turn is
+/// counted twice; and the per-event `output_tokens` is a streaming placeholder that reads `1`
+/// for a full paragraph. The first live dispatch recorded ten million input tokens and four
+/// hundred output tokens over eighty-three turns that way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Prompt-side tokens billed for the run: fresh input plus cache creation plus cache reads.
+    /// One figure rather than three because the dashboard has one column; the split is in the
+    /// CLI's own transcript if a cost breakdown is ever needed.
+    pub input: u64,
+    pub output: u64,
 }
 
 /// Which conversation an attempt runs in.

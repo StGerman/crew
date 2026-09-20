@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[
+pub(super) const MIGRATIONS: &[&str] = &[
     // v1
     r#"
     CREATE TABLE IF NOT EXISTS issue_state (
@@ -53,6 +53,33 @@ const MIGRATIONS: &[&str] = &[
     -- dispatched has no session yet, and a run that proves its session unresumable clears the
     -- column rather than retrying into the same dead id.
     ALTER TABLE issue_state ADD COLUMN session_id TEXT;
+    "#,
+    // v3
+    r#"
+    -- Token totals become nullable, and every total recorded so far is dropped rather than
+    -- carried over. Until this version they were sums of per-event stream usage, which
+    -- double-counts input by the turn count and undercounts output by orders of magnitude
+    -- (issue #9). Those figures are not a rough version of the truth; they are unrelated to it,
+    -- and a NULL is the honest replacement. From here on NULL means "this run ended without the
+    -- CLI reporting a total" — killed, crashed, or cut off by the turn budget — and the sums the
+    -- dashboard shows cover only the runs that did report. SQLite cannot drop a NOT NULL, so the
+    -- table is rebuilt; nothing references `run`, so the rebuild has no cascade to worry about.
+    CREATE TABLE run_v3 (
+      run_id     TEXT PRIMARY KEY,
+      issue_id   TEXT NOT NULL REFERENCES issue_state(issue_id),
+      started_at INTEGER NOT NULL,
+      ended_at   INTEGER,
+      outcome    TEXT,
+      session_id TEXT,
+      turns      INTEGER NOT NULL DEFAULT 0,
+      in_tok     INTEGER,
+      out_tok    INTEGER
+    );
+    INSERT INTO run_v3 (run_id, issue_id, started_at, ended_at, outcome, session_id, turns)
+      SELECT run_id, issue_id, started_at, ended_at, outcome, session_id, turns FROM run;
+    DROP TABLE run;
+    ALTER TABLE run_v3 RENAME TO run;
+    CREATE INDEX IF NOT EXISTS run_by_issue ON run(issue_id, started_at DESC);
     "#,
 ];
 
