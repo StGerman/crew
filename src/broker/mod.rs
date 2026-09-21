@@ -52,7 +52,9 @@
 //!
 //! MCP over HTTP, on loopback, one listener for the process, with a per-run bearer token in
 //! the URL path. See [`server`] for the wire details and why this is hand-rolled rather than
-//! built on `rmcp`.
+//! built on `rmcp`. The same transport code also serves the operator's [ops
+//! tools](crate::api::mcp), but on a listener of their own: those tools are scoped to the whole
+//! daemon, and the address a worker is handed must never be one that answers them.
 
 pub mod fake;
 pub mod server;
@@ -69,6 +71,7 @@ use serde_json::{Value, json};
 use crate::clock::Clock;
 use crate::model::Issue;
 use crate::worker::ToolEndpoint;
+pub use server::McpService;
 pub use writes::TrackerWrites;
 
 /// The MCP server name. Tools reach the agent as `mcp__symphony__<tool>`.
@@ -223,7 +226,7 @@ impl Broker {
     /// a credential that still authorises writes.
     pub fn open(self: &Arc<Self>, issue: &Issue, run_id: &str) -> std::io::Result<BrokerSession> {
         let token = random_token()?;
-        let url = format!("http://{}/mcp/{token}", self.addr);
+        let url = format!("http://{}{PATH_PREFIX}{token}", self.addr);
 
         // Named by a hash of the token rather than the token, so the filename does not leak
         // the secret to anything that can list the directory.
@@ -540,6 +543,26 @@ impl Broker {
 
     pub fn open_sessions(&self) -> usize {
         self.inner.lock().unwrap().sessions.len()
+    }
+}
+
+/// Every session URL is `/mcp/<token>`, so the token is the request path with this prefix
+/// removed. Anything else — a bare `/mcp`, a different prefix — resolves to no session and is
+/// refused the same way a forged token is.
+const PATH_PREFIX: &str = "/mcp/";
+
+impl McpService for Broker {
+    fn name(&self) -> &str {
+        SERVER_NAME
+    }
+
+    fn tools(&self, _path: &str) -> Value {
+        self.tools_json()
+    }
+
+    fn call(&self, path: &str, tool: &str, args: &Value) -> Result<String, String> {
+        let token = path.strip_prefix(PATH_PREFIX).unwrap_or("");
+        Broker::call(self, token, tool, args).map_err(|e| e.to_string())
     }
 }
 

@@ -22,6 +22,21 @@
 //! [`Tracker`]: crate::tracker::Tracker
 //! [`TrackerWrites`]: super::TrackerWrites
 //!
+//! ## Two servers, one transport
+//!
+//! The same four methods later had to serve a second, unrelated set of tools: the operator's
+//! [ops tools](crate::api::mcp), which answer from the published snapshot rather than writing to
+//! a tracker. Rather than a second copy of this file or `rmcp` after all, the transport is
+//! generic over [`McpService`] — the part that differs between the two is which tools exist
+//! and what a call does, and that is the whole trait. What the decision cost: the transport
+//! knows nothing about authority, so each service does its own scoping from the request path
+//! (the broker reads a per-run token out of it; the ops service accepts one fixed path and
+//! nothing else), and the two **never share a listener**. They could have — one accept loop,
+//! routed by prefix — and it was not done, because the per-run token path and the operator path
+//! would then answer at the same address, which is exactly the address every dispatched worker
+//! is handed. Keeping them on separate ports is what makes "the ops tools are not reachable
+//! from a worker" a property of the wiring rather than of a prefix check.
+//!
 //! ## What the real client does
 //!
 //! Confirmed by pointing `claude 2.1.278` at a recording server rather than read off a spec,
@@ -46,19 +61,42 @@
 //!
 //! ## Exposure
 //!
-//! Bound to `127.0.0.1` on an ephemeral port — never a routable interface. Authority is the
-//! per-run token in the path, checked in [`Broker::call`](super::Broker::call). A tool failure
-//! is reported as an MCP tool *result* with `isError: true`, never as a JSON-RPC error: the
-//! former is something the agent can read and work around, the latter reads as a broken
-//! server and is the shape that would turn a refused write into a failed run.
+//! The broker's own listener is bound to `127.0.0.1` on an ephemeral port — never a routable
+//! interface. Authority there is the per-run token in the path, checked in
+//! [`Broker::call`](super::Broker::call). A tool failure is reported as an MCP tool *result*
+//! with `isError: true`, never as a JSON-RPC error: the former is something the agent can read
+//! and work around, the latter reads as a broken server and is the shape that would turn a
+//! refused write into a failed run.
+//!
+//! The *ops* listener is why [`Limits`] exists. This is a thread per connection, and that
+//! address is the operator's to choose: `api.allow_public` can put it on a routable interface,
+//! where a client that connects and then says nothing costs a thread for as long as it cares
+//! to hold one. The HTTP ops API bounds exactly that with its own `READ_TIMEOUT`; [`Limits`]
+//! is the same rule arriving at the other operator surface, and the broker gets it for free.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::Broker;
+/// What the transport needs from a set of tools, and nothing more.
+///
+/// A service sees the request path so it can do its own scoping — the transport does not know
+/// what a token is. `call` answers `Err` for anything the agent should read as a failed tool
+/// rather than a broken server; the transport turns it into a result with `isError: true`, so
+/// no implementation can accidentally produce the JSON-RPC error shape that fails a run.
+pub trait McpService: Send + Sync + 'static {
+    /// Reported in `initialize` as `serverInfo.name`. Tools reach the agent as
+    /// `mcp__<name>__<tool>`.
+    fn name(&self) -> &str;
+    /// The `tools/list` answer for a client that connected at `path`.
+    fn tools(&self, path: &str) -> Value;
+    /// Perform one call for a client that connected at `path`.
+    fn call(&self, path: &str, tool: &str, args: &Value) -> Result<String, String>;
+}
 
 /// The revision this server implements when the client does not name one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -68,37 +106,99 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// What one client may cost this server in threads and in time.
+///
+/// A thread-per-connection server has two ways to be exhausted and a read deadline alone
+/// closes one of them. The split between [`idle`](Self::idle) and [`request`](Self::request)
+/// is what lets a deadline exist here at all without breaking keep-alive, which the real
+/// client depends on: a connection sitting between two tool calls is ordinary and may wait a
+/// long time, but once a request has *started* arriving the rest of it must arrive promptly —
+/// the peer is a program, not a person. [`max_connections`](Self::max_connections) closes the
+/// other: a client that dribbles a byte inside every deadline, or simply opens sockets and
+/// never writes at all, pays nothing for a deadline and everything for a cap.
+///
+/// The count is per listener, not per process, so the broker's budget and the operator's are
+/// separate — a flood at the public one cannot starve a dispatched run of its own tools.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// How long a connection may sit between requests before it is closed. Generous: hanging
+    /// up on a live agent costs it a reconnect, and this exists to bound abandoned sockets,
+    /// not to ration a slow conversation.
+    pub idle: Duration,
+    /// How long the rest of a request may take once its first byte has arrived — and how long
+    /// a response may take to write, so a client that stops reading cannot wedge the thread
+    /// in `write_all` instead.
+    pub request: Duration,
+    /// How many connections may be in flight at once. Past it a new one is closed rather than
+    /// queued: refusal is something a client can retry, a thread it is holding is not.
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        // Room for every concurrent run's worker and an operator's session many times over.
+        // The number is here to bound a flood, not to ration ordinary use.
+        Self {
+            idle: Duration::from_secs(300),
+            request: Duration::from_secs(10),
+            max_connections: 64,
+        }
+    }
+}
+
 /// Bind the broker's listener on loopback, letting the OS pick the port.
 ///
 /// Separate from [`serve`] so the caller can learn the address *before* constructing the
-/// [`Broker`] that has to embed it in every session URL.
+/// [`Broker`](super::Broker) that has to embed it in every session URL.
 pub fn bind() -> std::io::Result<TcpListener> {
     TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
 }
 
-/// Start serving on a background thread. Returns immediately.
+/// Start serving on a background thread, under [`Limits::default`]. Returns immediately.
 ///
 /// There is no shutdown handle: the listener lives as long as the process, and every session
 /// it could serve is revoked independently when its [`BrokerSession`](super::BrokerSession) is
 /// dropped. Stopping the listener would add a second thing to get right for no property the
 /// token lifetime does not already provide.
-pub fn serve(broker: Arc<Broker>, listener: TcpListener) {
+pub fn serve<S: McpService>(service: Arc<S>, listener: TcpListener) {
+    serve_with(service, listener, Limits::default());
+}
+
+/// [`serve`], with the bounds named. Tests set deadlines they can wait out; nothing else needs
+/// to — the defaults are the policy and a caller that wanted looser ones would be removing the
+/// property, not configuring it.
+pub fn serve_with<S: McpService>(service: Arc<S>, listener: TcpListener, limits: Limits) {
+    let live = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
-                    let broker = Arc::clone(&broker);
+                    // Refused *before* the thread exists: accepting and then spawning is the
+                    // step that costs something, so the cap has to be checked on this side of
+                    // it. Dropping the stream closes it, which a client reads as a hangup.
+                    let Some(slot) = ConnSlot::take(&live, limits.max_connections) else {
+                        tracing::warn!(
+                            max = limits.max_connections,
+                            "refusing a connection: too many already in flight"
+                        );
+                        drop(s);
+                        continue;
+                    };
+                    let broker = Arc::clone(&service);
                     // `Builder::spawn` rather than `thread::spawn`: the latter panics when the
                     // process is out of threads, and a panic on this thread would take the
                     // whole orchestrator down over a connection it could simply have refused.
                     let spawned = std::thread::Builder::new()
                         .name("symphony-broker-conn".into())
                         .spawn(move || {
-                            if let Err(e) = handle_conn(&broker, s) {
+                            // Held for the life of the connection, released however it ends.
+                            let _slot = slot;
+                            if let Err(e) = handle_conn(broker.as_ref(), s, limits) {
                                 tracing::debug!(error = %e, "broker connection ended");
                             }
                         });
                     if let Err(e) = spawned {
+                        // The slot went into the closure and comes back with it.
                         tracing::warn!(error = %e, "broker could not serve a connection");
                     }
                 }
@@ -108,21 +208,48 @@ pub fn serve(broker: Arc<Broker>, listener: TcpListener) {
     });
 }
 
+/// One connection's place in [`Limits::max_connections`], returned by [`Drop`].
+///
+/// RAII rather than a decrement at the end of `handle_conn`, for the same reason
+/// [`BrokerSession`](super::BrokerSession) is: a path that ends the connection without
+/// releasing the slot — an early `?`, a panic in a tool — leaks a slot permanently, and a
+/// server that has leaked every slot refuses everyone while doing nothing.
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl ConnSlot {
+    fn take(live: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
+            .ok()?;
+        Some(Self(Arc::clone(live)))
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Request {
     method: String,
     path: String,
     body: Vec<u8>,
 }
 
-fn handle_conn(broker: &Broker, stream: TcpStream) -> std::io::Result<()> {
+fn handle_conn<S: McpService>(
+    service: &S,
+    stream: TcpStream,
+    limits: Limits,
+) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
+    // The write side of the same bound: a client that asks and then stops reading would
+    // otherwise hold this thread inside `write_all` for as long as it liked.
+    stream.set_write_timeout(Some(limits.request))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
     // Keep-alive: one accept serves the whole run's traffic.
-    while let Some(req) = read_request(&mut reader)? {
-        let token = req.path.strip_prefix("/mcp/").unwrap_or("").to_string();
-
+    while let Some(req) = read_request(&mut reader, limits)? {
         match req.method.as_str() {
             // The SSE stream. Nothing here ever pushes, so decline it.
             "GET" => respond(&mut writer, 405, "Method Not Allowed", None)?,
@@ -136,7 +263,7 @@ fn handle_conn(broker: &Broker, stream: TcpStream) -> std::io::Result<()> {
                     respond(&mut writer, 200, "OK", Some(&body))?;
                     continue;
                 };
-                match handle_rpc(broker, &token, &rpc) {
+                match handle_rpc(service, &req.path, &rpc) {
                     // A notification: acknowledged, never answered.
                     None => respond(&mut writer, 202, "Accepted", None)?,
                     Some(v) => {
@@ -152,7 +279,7 @@ fn handle_conn(broker: &Broker, stream: TcpStream) -> std::io::Result<()> {
 }
 
 /// `None` means the message was a notification and takes no reply.
-fn handle_rpc(broker: &Broker, token: &str, rpc: &Value) -> Option<Value> {
+fn handle_rpc<S: McpService>(service: &S, path: &str, rpc: &Value) -> Option<Value> {
     let method = rpc.get("method").and_then(Value::as_str).unwrap_or_default();
     let id = rpc.get("id").cloned();
 
@@ -169,11 +296,11 @@ fn handle_rpc(broker: &Broker, token: &str, rpc: &Value) -> Option<Value> {
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": super::SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
+                "serverInfo": { "name": service.name(), "version": env!("CARGO_PKG_VERSION") }
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": broker.tools_json() }),
+        "tools/list" => json!({ "tools": service.tools(path) }),
         "tools/call" => {
             let name = rpc.pointer("/params/name").and_then(Value::as_str).unwrap_or_default();
             let empty = json!({});
@@ -182,13 +309,13 @@ fn handle_rpc(broker: &Broker, token: &str, rpc: &Value) -> Option<Value> {
             // A refusal is a tool *result*, not a transport error: the agent is meant to read
             // it and pick something else, which is the "a tool failure is not a run failure"
             // rule from the issue.
-            match broker.call(token, name, args) {
+            match service.call(path, name, args) {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
                     "isError": false
                 }),
-                Err(e) => json!({
-                    "content": [{ "type": "text", "text": e.to_string() }],
+                Err(text) => json!({
+                    "content": [{ "type": "text", "text": text }],
                     "isError": true
                 }),
             }
@@ -208,7 +335,18 @@ fn error_body(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// `Ok(None)` on a clean EOF — the client closed, which is how every run ends.
-fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Request>> {
+///
+/// Two deadlines rather than one, and the split is the whole point: waiting for the *first*
+/// byte of the next request is an idle keep-alive connection, which is ordinary and may be
+/// long, while waiting for the *rest* of a request that has already begun is a client
+/// dribbling, which is not. A single deadline would have to be the generous one to keep
+/// keep-alive working, and a generous deadline on a half-sent request is no deadline at all.
+/// A timeout surfaces as an ordinary read error and ends the connection.
+fn read_request(
+    reader: &mut BufReader<TcpStream>,
+    limits: Limits,
+) -> std::io::Result<Option<Request>> {
+    reader.get_ref().set_read_timeout(Some(limits.idle))?;
     let mut start = String::new();
     if reader.read_line(&mut start)? == 0 {
         return Ok(None);
@@ -220,6 +358,8 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
             return Ok(None);
         }
     }
+
+    reader.get_ref().set_read_timeout(Some(limits.request))?;
 
     let mut parts = start.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
@@ -286,12 +426,12 @@ fn respond(
 /// sends, recorded from a live handshake.
 #[cfg(test)]
 mod tests {
-    use std::io::BufRead;
+    use std::io::{BufRead, ErrorKind};
     use std::sync::Arc;
 
     use super::*;
     use crate::broker::fake::FakeWrites;
-    use crate::broker::{BrokerLimits, BrokerSession, TrackerWrites};
+    use crate::broker::{Broker, BrokerLimits, BrokerSession, TrackerWrites};
     use crate::clock::FakeClock;
     use crate::model::Issue;
 
@@ -314,6 +454,15 @@ mod tests {
 
     /// A live broker, serving on a real loopback port, with one open session.
     fn serving(tag: &str) -> (Arc<Broker>, Arc<FakeWrites>, BrokerSession, SocketAddr) {
+        serving_with(tag, Limits::default())
+    }
+
+    /// [`serving`] under bounds a test can wait out. The defaults are minutes; a test that
+    /// proves a deadline fires has to be able to reach it.
+    fn serving_with(
+        tag: &str,
+        limits: Limits,
+    ) -> (Arc<Broker>, Arc<FakeWrites>, BrokerSession, SocketAddr) {
         let writes = Arc::new(FakeWrites::new());
         let w: Arc<dyn TrackerWrites> = writes.clone();
         let dir = std::env::temp_dir().join(format!(
@@ -336,7 +485,7 @@ mod tests {
             )
             .unwrap(),
         );
-        serve(Arc::clone(&broker), listener);
+        serve_with(Arc::clone(&broker), listener, limits);
         let session = broker.open(&issue("o/r#1"), "run-1").unwrap();
         (broker, writes, session, addr)
     }
@@ -492,5 +641,104 @@ mod tests {
         // cost the run every tool call after it.
         let list = c.rpc(&path, r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#);
         assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 3);
+    }
+
+    /// Blocks until the server hangs up, or reports that it did not. The client-side deadline
+    /// is the test's own safety net: without it the failure mode of every assertion below is a
+    /// hung test rather than a red one.
+    ///
+    /// A reset counts as a hangup. On macOS, closing a socket with bytes still unread sends an
+    /// RST rather than a FIN, so a probe that *writes* before reading cannot tell a refusal
+    /// from a failure — which is why the ones below write nothing.
+    fn hung_up_on(stream: &mut TcpStream) -> bool {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 64];
+        match stream.read(&mut buf) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::BrokenPipe),
+        }
+    }
+
+    #[test]
+    fn a_client_that_never_finishes_its_request_cannot_hold_a_connection_thread() {
+        // Slowloris, aimed at the operator's listener rather than the broker's: `api.allow_public`
+        // can put this transport on a routable interface, and a thread per connection means a
+        // client that connects and then goes quiet holds one for free. The deadline is what gives
+        // it a price. Note what is *not* asserted here — that a connection survives sitting idle
+        // between requests is `the_handshake_the_real_client_performs_is_answered_end_to_end`,
+        // and one deadline could not satisfy both tests.
+        let limits = Limits {
+            idle: Duration::from_millis(200),
+            request: Duration::from_millis(200),
+            max_connections: 4,
+        };
+        let (_b, _w, session, addr) = serving_with("slowloris", limits);
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // A request that begins and never ends: no blank line, so the header loop has nothing to
+        // finish on and the body is never reached. Every byte written is consumed by the server,
+        // so its hangup arrives as a clean EOF.
+        let head = format!("POST /mcp/{} HTTP/1.1\r\nHost: localhost\r\n", session.token);
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        assert!(
+            hung_up_on(&mut stream),
+            "the server must hang up on a half-sent request rather than wait out the client"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_connections_is_refused_rather_than_served_without_bound() {
+        // The deadline alone does not close this: a client that reconnects, or that opens
+        // sockets and writes nothing at all, spends a thread per socket for as long as the
+        // deadline allows it to.
+        let limits = Limits {
+            idle: Duration::from_secs(5),
+            request: Duration::from_secs(5),
+            max_connections: 2,
+        };
+        let (_b, _w, session, addr) = serving_with("flood", limits);
+        let path = format!("/mcp/{}", session.token);
+
+        // Two connections that have each *completed* a request are two the server is certainly
+        // holding. Merely connecting proves nothing — the accept loop is another thread.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let mut c = Conn::open(addr);
+            let pong = c.rpc(&path, r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+            assert!(pong["result"].is_object());
+            held.push(c);
+        }
+
+        let mut third = TcpStream::connect(addr).unwrap();
+        assert!(
+            hung_up_on(&mut third),
+            "over the cap, a connection is closed rather than queued or served"
+        );
+
+        // And the slot comes back when the connection holding it ends, so the cap bounds how
+        // many clients are in flight rather than how many the server will ever see. Polled
+        // because the slot is released on the connection's own thread, which the test does not
+        // synchronise with; without `ConnSlot` every probe below is refused and this never ends
+        // in anything but a failure.
+        drop(held.pop());
+        let mut served = false;
+        for _ in 0..100 {
+            let mut probe = TcpStream::connect(addr).unwrap();
+            probe.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            let mut buf = [0u8; 1];
+            // An immediate EOF is a refusal. Silence is the server waiting for a request on a
+            // connection it accepted, which is the whole assertion.
+            match probe.read(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(20)),
+                _ => {
+                    served = true;
+                    break;
+                }
+            }
+        }
+        assert!(served, "a finished connection must give its slot back");
     }
 }

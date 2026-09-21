@@ -12,9 +12,12 @@ use std::sync::Arc;
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use serde_json::Value;
+use serde_json::{Value, json};
 use symphony_cc::api::client::{Client, Endpoint, Source, StatusError};
+use symphony_cc::api::mcp::{self, OpsMcp};
 use symphony_cc::api::{Api, Command};
+use symphony_cc::broker::fake::FakeWrites;
+use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::FakeClock;
 use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
 use symphony_cc::model::{ErrorClass, Issue, Outcome};
@@ -30,6 +33,9 @@ use tokio::sync::{mpsc, watch};
 
 struct Harness {
     addr: SocketAddr,
+    /// The ops MCP server, on its own listener — as `main` wires it, never the HTTP API's port
+    /// and never the broker's.
+    mcp_addr: SocketAddr,
     sched: Scheduler,
     clock: Arc<FakeClock>,
     worker: Arc<FakeWorker>,
@@ -104,9 +110,37 @@ impl Harness {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(Api::new(snap_rx, cmd_tx).serve(listener));
+        tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
 
-        Harness { addr, sched, clock, worker, snap_tx, commands, root }
+        // The same `Api` (same watch receiver, same command sender) behind the MCP surface, so
+        // the two are provably one view rather than two that happen to agree today.
+        let mcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mcp_addr = mcp_listener.local_addr().unwrap();
+        broker::server::serve(Arc::new(OpsMcp::new(Api::new(snap_rx, cmd_tx))), mcp_listener);
+
+        Harness { addr, mcp_addr, sched, clock, worker, snap_tx, commands, root }
+    }
+
+    /// One MCP `tools/call` against the ops server, pumping commands the way `main`'s loop
+    /// does. Returns the tool result: `(isError, parsed text body)`.
+    async fn tool(&mut self, tool: &str, args: Value) -> (bool, Value) {
+        let addr = self.mcp_addr;
+        let tool = tool.to_string();
+        let client = tokio::task::spawn_blocking(move || {
+            let mut c = McpConn::open(addr, mcp::PATH);
+            c.tool_call(&tool, args)
+        });
+        self.pump(client).await
+    }
+
+    /// Drive a blocking client to completion while applying every command it sends.
+    async fn pump<T>(&mut self, mut client: tokio::task::JoinHandle<T>) -> T {
+        loop {
+            tokio::select! {
+                Some(cmd) = self.commands.recv() => self.apply(cmd),
+                done = &mut client => return done.unwrap(),
+            }
+        }
     }
 
     /// One scheduler tick, published the way the loop in `main` publishes it.
@@ -121,14 +155,8 @@ impl Harness {
         let addr = self.addr;
         let raw =
             format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
-        let mut client = tokio::spawn(async move { send(addr, &raw).await });
-
-        loop {
-            tokio::select! {
-                Some(cmd) = self.commands.recv() => self.apply(cmd),
-                done = &mut client => return done.unwrap(),
-            }
-        }
+        let client = tokio::spawn(async move { send(addr, &raw).await });
+        self.pump(client).await
     }
 
     fn apply(&mut self, cmd: Command) {
@@ -178,6 +206,82 @@ async fn send(addr: SocketAddr, request: &str) -> (u16, Value) {
     );
 
     (status, serde_json::from_str(body).expect("every response body is JSON"))
+}
+
+/// A blocking MCP client over a real socket, for the ops server — the same keep-alive request
+/// sequence the broker's transport tests drive, because the framing is the part a fake would
+/// hide. It speaks JSON-RPC and nothing more: `initialize`, `tools/list`, `tools/call`.
+struct McpConn {
+    stream: std::net::TcpStream,
+    reader: std::io::BufReader<std::net::TcpStream>,
+    path: String,
+    next_id: u64,
+}
+
+impl McpConn {
+    fn open(addr: SocketAddr, path: &str) -> Self {
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        Self { stream, reader, path: path.to_string(), next_id: 1 }
+    }
+
+    fn rpc(&mut self, method: &str, params: Value) -> Value {
+        use std::io::{BufRead, Read, Write};
+        let id = self.next_id;
+        self.next_id += 1;
+        let body =
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+        let req = format!(
+            "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            self.path,
+            body.len()
+        );
+        self.stream.write_all(req.as_bytes()).unwrap();
+        self.stream.flush().unwrap();
+
+        let mut status_line = String::new();
+        self.reader.read_line(&mut status_line).unwrap();
+        assert!(status_line.contains(" 200 "), "status was {status_line:?}");
+        let mut len = 0usize;
+        loop {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':')
+                && k.trim().eq_ignore_ascii_case("content-length")
+            {
+                len = v.trim().parse().unwrap();
+            }
+        }
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact(&mut buf).unwrap();
+        let v: Value = serde_json::from_slice(&buf).expect("a JSON-RPC response");
+        assert_eq!(v["id"], id);
+        v
+    }
+
+    fn tool_names(&mut self) -> Vec<String> {
+        let list = self.rpc("tools/list", json!({}));
+        list["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no tools array in {list}"))
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// `(isError, the text content parsed as JSON — or the raw text if it is not JSON)`.
+    fn tool_call(&mut self, name: &str, args: Value) -> (bool, Value) {
+        let call = self.rpc("tools/call", json!({ "name": name, "arguments": args }));
+        assert!(call.get("error").is_none(), "a tool failure must not be a JSON-RPC error: {call}");
+        let is_error = call["result"]["isError"].as_bool().unwrap();
+        let text = call["result"]["content"][0]["text"].as_str().unwrap();
+        (is_error, serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.into())))
+    }
 }
 
 fn rows(snapshot: &Value) -> &Vec<Value> {
@@ -557,4 +661,214 @@ async fn a_response_missing_the_marker_is_treated_as_a_different_service_not_the
     let addr = serve_once_unmarked("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found");
     let err = via_client(addr, |c| c.issue("MT-1")).await.expect_err("no marker, no daemon");
     assert!(matches!(err, StatusError::Unrecognised { .. }), "got {err:?}");
+}
+
+// ---- the ops MCP server -----------------------------------------------------
+//
+// The supervising agent's half of the harness (#34). These drive the real transport against the
+// same `Api` the HTTP tests drive, over a real socket, for the reason the rest of this file
+// gives: the tool result framing and the "publish, then answer" ordering are what a fake would
+// get right by construction.
+
+#[tokio::test]
+async fn the_ops_tools_answer_the_same_snapshot_the_http_api_serves() {
+    let mut h = Harness::new(vec![issue(1, "In Progress"), issue(2, "In Progress")]).await;
+    h.tick();
+
+    let (_, over_http) = h.request("GET", "/api/v1/snapshot").await;
+    let (is_error, over_mcp) = h.tool("snapshot", json!({})).await;
+    assert!(!is_error);
+    // Byte-for-byte the same JSON: the tool runs the route's method and frames its body, so an
+    // agent reading the one can be handed documentation written for the other.
+    assert_eq!(over_mcp, over_http);
+
+    let (_, http_row) = h.request("GET", "/api/v1/issues/MT-2").await;
+    let (is_error, mcp_row) = h.tool("issue", json!({ "key": "MT-2" })).await;
+    assert!(!is_error);
+    assert_eq!(mcp_row, http_row);
+    assert_eq!(mcp_row["issue_id"], "iss-2");
+
+    // And the list is exactly the four routes, no more.
+    let addr = h.mcp_addr;
+    let names = tokio::task::spawn_blocking(move || McpConn::open(addr, mcp::PATH).tool_names())
+        .await
+        .unwrap();
+    assert_eq!(names, mcp::TOOLS);
+}
+
+#[tokio::test]
+async fn an_ops_read_cannot_disturb_the_daemon_it_asks_about() {
+    // The property `run_status` holds by owning no `Store`, worktree or credential, shown from
+    // the daemon's side: the scheduler loop is *not pumped* while these reads are served, so
+    // if a read needed anything from it the call would hang past the deadline. And the tick
+    // count is unchanged afterwards — asking was not acting.
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+    let before = h.sched.snapshot().unwrap().ticks;
+
+    let addr = h.mcp_addr;
+    let deadline = std::time::Duration::from_secs(2);
+    let (snap, row) = tokio::time::timeout(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            let mut c = McpConn::open(addr, mcp::PATH);
+            (c.tool_call("snapshot", json!({})), c.tool_call("issue", json!({ "key": "MT-1" })))
+        }),
+    )
+    .await
+    .expect("a read must be answered without the scheduler's participation")
+    .unwrap();
+    assert!(!snap.0 && !row.0);
+    assert_eq!(snap.1["ticks"].as_u64().unwrap(), before);
+    assert_eq!(row.1["phase"], "running");
+
+    assert!(
+        matches!(h.commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "a read sent the scheduler a command"
+    );
+    assert_eq!(h.sched.snapshot().unwrap().ticks, before, "a read must not tick");
+}
+
+#[tokio::test]
+async fn an_ops_refresh_runs_exactly_one_tick_and_answers_with_it() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+    let (_, before) = h.request("GET", "/api/v1/snapshot").await;
+
+    let (is_error, after) = h.tool("refresh", json!({})).await;
+    assert!(!is_error);
+    assert_eq!(after["ticks"].as_u64().unwrap(), before["ticks"].as_u64().unwrap() + 1);
+
+    // Published before it was answered, so the HTTP surface agrees the instant the tool returns.
+    let (_, again) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(again["ticks"], after["ticks"]);
+}
+
+#[tokio::test]
+async fn clearing_a_quarantine_over_mcp_that_is_not_there_reports_a_no_op_not_a_tool_error() {
+    // The shape `Store::unquarantine` and the HTTP route already have, carried through to the
+    // tool: `cleared: false` in a plain result, so a supervising agent that clears
+    // speculatively is told what happened rather than handed a failure to work around.
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.worker.set_default(Script::succeeds_in(60_000));
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1);
+
+    let (is_error, body) = h.tool("unquarantine", json!({ "key": "MT-1" })).await;
+    assert!(!is_error, "a no-op is not an error: {body}");
+    assert_eq!(body["cleared"], false);
+    assert_eq!(body["detail"], "not quarantined; nothing to clear");
+
+    // And the live claim was not released under the running agent.
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1);
+
+    // An issue that does not exist, by contrast, is a tool error carrying the route's 404 body.
+    let (is_error, body) = h.tool("unquarantine", json!({ "key": "MT-404" })).await;
+    assert!(is_error);
+    assert!(body["error"].as_str().unwrap().contains("MT-404"), "{body}");
+}
+
+#[tokio::test]
+async fn clearing_a_quarantine_over_mcp_returns_the_issue_to_service() {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.worker.set_default(
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed { class: ErrorClass::AuthFailed, msg: "401".into() }),
+    );
+    h.tick();
+    h.clock.advance_ms(1_000);
+    h.tick();
+    let (_, row) = h.tool("issue", json!({ "key": "MT-1" })).await;
+    assert_eq!(row["quarantined"], true);
+
+    h.worker.set_default(Script::succeeds_in(1_000));
+    let (is_error, body) = h.tool("unquarantine", json!({ "key": "iss-1" })).await;
+    assert!(!is_error);
+    assert_eq!(body["cleared"], true);
+
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1, "cleared issues become dispatchable again");
+}
+
+#[tokio::test]
+async fn a_dispatched_worker_is_not_handed_the_ops_tools() {
+    // The constraint issue #34 says must survive review, tested on the wiring rather than on
+    // the tool. A worker learns of MCP servers from exactly one file the crate writes — the
+    // `--mcp-config` from `Broker::open` — so the test is: run both servers the way `main`
+    // does, open a real broker session, read the file a worker would be handed, and connect to
+    // whatever it names. A version of this that only asked the ops server to refuse an unknown
+    // caller would pass just as well if the server were reachable from the worker after all.
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+
+    let writes: Arc<dyn TrackerWrites> = Arc::new(FakeWrites::new());
+    let listener = broker::server::bind().unwrap();
+    let broker_addr = listener.local_addr().unwrap();
+    let dir = h.root.join("mcp-configs");
+    let broker = Arc::new(
+        Broker::new(
+            writes,
+            h.clock.clone(),
+            BrokerLimits::default(),
+            vec!["in progress".into(), "done".into()],
+            broker_addr,
+            &dir,
+        )
+        .unwrap(),
+    );
+    broker::server::serve(Arc::clone(&broker), listener);
+    assert_ne!(broker_addr, h.mcp_addr, "the two servers are two listeners");
+
+    let session = broker.open(&issue(1, "In Progress"), "run-1").unwrap();
+    let endpoint = session.endpoint().clone();
+
+    // 1. The prompt half: the tool names the worker is told about are the broker's only.
+    for ops_tool in mcp::TOOLS {
+        assert!(!endpoint.tools.iter().any(|t| t == ops_tool), "prompt names {ops_tool}");
+    }
+
+    // 2. The config half: the file names exactly one server, and that server is the broker.
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(&endpoint.config_path).unwrap()).unwrap();
+    let servers = config["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 1, "one server, and only one: {config}");
+    let url = servers.values().next().unwrap()["url"].as_str().unwrap().to_string();
+    let host_port: SocketAddr =
+        url.trim_start_matches("http://").split('/').next().unwrap().parse().unwrap();
+    assert_eq!(host_port, broker_addr, "the worker is pointed at the broker");
+    assert_ne!(host_port, h.mcp_addr, "and never at the ops server");
+    let path = format!("/{}", url.trim_start_matches("http://").split_once('/').unwrap().1);
+
+    // 3. The wire half: what the worker's URL actually serves. Connect as the worker would,
+    //    list the tools, and try the one call that would defeat the brakes.
+    let ops_addr = h.mcp_addr;
+    let (worker_sees, worker_call, misaimed_list, misaimed_call) =
+        tokio::task::spawn_blocking(move || {
+            let mut as_worker = McpConn::open(broker_addr, &path);
+            let names = as_worker.tool_names();
+            let call = as_worker.tool_call("unquarantine", json!({ "key": "MT-1" }));
+            // The worker's own path, aimed at the ops port by a misconfiguration.
+            let mut misaimed = McpConn::open(ops_addr, &path);
+            let list = misaimed.tool_names();
+            let call2 = misaimed.tool_call("unquarantine", json!({ "key": "MT-1" }));
+            (names, call, list, call2)
+        })
+        .await
+        .unwrap();
+
+    for ops_tool in mcp::TOOLS {
+        assert!(!worker_sees.iter().any(|t| t == ops_tool), "worker sees {ops_tool}");
+    }
+    assert!(worker_sees.contains(&"comment".to_string()), "it does see its own tools");
+    assert!(worker_call.0, "unquarantine at the worker's URL must be refused: {:?}", worker_call);
+    assert!(misaimed_list.is_empty(), "the ops port serves no tools at a worker path");
+    assert!(misaimed_call.0, "nor does it act on one: {:?}", misaimed_call);
+
+    // And nothing above touched the scheduler: the issue is still running, not re-dispatched.
+    assert!(
+        matches!(h.commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "a refused call must not become a command"
+    );
+    drop(session);
 }
