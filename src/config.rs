@@ -457,9 +457,21 @@ impl Config {
                         .into(),
                 ));
             }
-            if let Some(i) = self.gate.commands.iter().position(|c| c.is_empty()) {
+            // A blank program name is rejected here for the same reason an empty argv is, and it
+            // is the easier one to write by accident: `[[""]]` is a non-empty command whose
+            // program cannot be spawned, so it survives preflight and then fails every single
+            // run. Each failure is a `Continue` that sends the agent back to work on a
+            // configuration error it cannot see or fix, until `max_failures` blocks the issue.
+            // Startup is the only place this is cheap to say.
+            if let Some(i) = self
+                .gate
+                .commands
+                .iter()
+                .position(|c| c.first().is_none_or(|p| p.trim().is_empty()))
+            {
                 return Err(ConfigError::Invalid(format!(
-                    "gate.commands[{i}] is empty; each command is an argv like [\"cargo\", \"test\"]"
+                    "gate.commands[{i}] has no program to run; each command is an argv like \
+                     [\"cargo\", \"test\"]"
                 )));
             }
         }
@@ -542,7 +554,14 @@ mod tests {
         c.gate.max_failures = 3;
         c.gate.commands = vec![vec!["cargo".into(), "test".into()], vec![]];
         assert!(c.preflight().is_err(), "an empty argv cannot be exec'd");
-        c.gate.commands.pop();
+        // A command with a blank program is the same defect wearing a non-empty argv, and it is
+        // the one an operator writes by accident. Caught here it costs a startup error; missed,
+        // it costs every run of every issue until `max_failures` blocks each one.
+        c.gate.commands = vec![vec![String::new()]];
+        assert!(c.preflight().is_err(), "a blank program name cannot be exec'd either");
+        c.gate.commands = vec![vec!["   ".into(), "test".into()]];
+        assert!(c.preflight().is_err(), "nor can a program name that is only whitespace");
+        c.gate.commands = vec![vec!["cargo".into(), "test".into()]];
         assert!(c.preflight().is_ok());
         // Turning the gate off is the supported way to skip it.
         c.gate.enabled = false;

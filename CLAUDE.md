@@ -22,7 +22,7 @@ the published snapshot with a `status` client in front of it.
 ## Commands
 
 ```bash
-cargo test                                 # 178 unit + 63 integration
+cargo test                                 # 180 unit + 66 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -441,6 +441,12 @@ reading — check that the named test is still meaningful, not just still green.
 | A branch is not handed off ungated against the base it will merge into | a `Done` moves the run into `gating` with its claim held; `GitGate` rebases first and runs the commands on the rebased tree | `a_done_verdict_is_gated_in_its_own_worktree_before_the_claim_is_released`, `the_branch_is_rebased_onto_the_base_before_the_gate_runs_on_the_rebased_tree` |
 | A rebase conflict is a human's problem, not a silent failure | the rebase is aborted and the issue parks `Blocked` naming the paths, in `last_error` | `a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths`, `a_conflicting_rebase_is_aborted_and_names_the_conflicted_paths` |
 | The gate cannot become a runaway | a failing command is a `Continue` that carries its output, bounded by `gate.max_failures` consecutive failures → `Blocked`, and by `gate.timeout_ms` per gate | `a_failing_gate_continues_the_run_with_the_failing_output_in_hand`, `repeated_gate_failures_escalate_to_blocked_rather_than_looping`, `a_gate_that_hangs_is_killed_at_the_timeout_and_counts_as_a_failure` |
+| A gate cannot outrun the concurrency limit | `global_slots` and `state_slots` count `gating` as well as `running`, because a gate is a build on this host and the claim is held across it | `a_gating_run_still_holds_its_concurrency_slot_so_gates_cannot_accumulate` |
+| A gate cannot hide how far its run got | the turn count is checkpointed as the entry leaves `running`, since `observe_progress` walks only that map while the run row stays open for the whole gate | `a_run_entering_the_gate_checkpoints_its_turn_count_before_it_leaves_running` |
+| A gate command that can never start is refused at startup | `preflight` rejects a blank program name as well as an empty argv, so a typo costs one error instead of every run of the issue | `a_gate_that_could_never_escalate_or_never_start_is_rejected` |
+| The gate's own git subprocesses are killable | every `git` the gate runs goes through `spawn_tracked`, so `pgid` is set for the rebase and not only for a configured command | `killing_a_gate_during_the_rebase_step_stops_the_git_subprocess_instead_of_leaving_it_running` |
+| A gate that cannot start reports rather than panics | a supervising thread the OS refuses becomes `Verdict::Failed`, which is what `Gate::start` promises; a panic here would strand the claim until the next startup | `a_gate_whose_supervising_thread_cannot_be_spawned_reports_failed_instead_of_panicking` |
+| A brief describes the tree the agent will find | `Verdict::Failed` carries `on_base`, false for every step before the rebase and for a rebase that was aborted | `a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_rebased` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the

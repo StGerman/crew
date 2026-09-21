@@ -117,6 +117,7 @@ impl GateHandle for FakeGateRun {
             return Some(Verdict::Failed {
                 step: "fake".into(),
                 output: "stopped by the orchestrator".into(),
+                on_base: false,
             });
         }
         let elapsed = self.clock.mono().saturating_since(self.started);

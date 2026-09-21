@@ -411,6 +411,18 @@ impl Scheduler {
                 && let Some(gate) = &self.gate
             {
                 r._broker = None;
+
+                // Checkpoint the agent's final count before the entry leaves `running`.
+                // `observe_progress` only walks `running`, and the run row stays open for the
+                // whole gate, so without this the last durable figure is the previous tick's.
+                // A hard kill during a gate — which is the long part of the run, not the short
+                // one — would then have `recover()` close the row undercounting the attempt,
+                // and the per-issue turn budget would be charged less than the agent spent.
+                let final_turns = r.handle.progress().turns;
+                if let Err(e) = self.store.record_progress(&r.run_id, final_turns) {
+                    tracing::warn!(run_id = %r.run_id, error = %e, "progress checkpoint failed");
+                }
+
                 let handle = gate.start(&r.issue, &r.workspace);
                 let now = self.clock.mono();
                 tracing::info!(
@@ -622,6 +634,10 @@ impl Scheduler {
                         output: format!(
                             "the gate was still running after {timeout} ms and was stopped"
                         ),
+                        // A timeout can land on either side of the rebase and this path cannot
+                        // tell which. `false` is the cautious reading: it omits a claim about
+                        // the tree rather than making one that might be wrong.
+                        on_base: false,
                     },
                 ));
             }
@@ -684,7 +700,7 @@ impl Scheduler {
                     ),
                 }
             }
-            Verdict::Failed { step, output } => {
+            Verdict::Failed { step, output, on_base } => {
                 let n = {
                     let e = self.gate_failures.entry(issue_id.to_string()).or_insert(0);
                     *e += 1;
@@ -713,11 +729,20 @@ impl Scheduler {
                         max,
                         "gate failed; continuing"
                     );
+                    // Only say where the work sits when the gate actually got that far. A
+                    // base that would not resolve, or a rebase that was refused and aborted,
+                    // leaves the branch exactly where the agent left it — telling it to "fix
+                    // this on top of" a rebase that never happened describes a tree it will
+                    // not find, and the usual result is a `Done` repeated unchanged.
+                    let where_it_sits = if on_base {
+                        "the branch has been rebased onto the base, so fix this on top of it"
+                    } else {
+                        "the branch was not rebased and is where you left it, so fix this there"
+                    };
                     Outcome::Continue {
                         why: format!(
-                            "the handoff gate failed at `{step}` (failure {n} of {max}); the branch \
-                             has been rebased onto the base, so fix this on top of it and finish \
-                             again. Output:\n{output}"
+                            "the handoff gate failed at `{step}` (failure {n} of {max}); \
+                             {where_it_sits} and finish again. Output:\n{output}"
                         ),
                     }
                 }
@@ -974,12 +999,27 @@ impl Scheduler {
                 .all(|want| issue.labels.iter().any(|l| l == want))
     }
 
+    /// Capacity counts gating runs as well as running ones.
+    ///
+    /// A gate is work on this machine — a rebase and then whatever `gate.commands` names, which
+    /// for this repository is a `cargo test`. Counting only `running` frees the slot the moment
+    /// the agent exits, so a fast worker in front of a slow gate lets `dispatch_new` start
+    /// another agent while the last one's suite is still compiling. Nothing bounds that: the
+    /// gates accumulate, and `max_concurrent` stops describing how many builds the host is
+    /// running. The claim is held across the gate for the same reason, so counting it here is
+    /// what makes the two agree.
     fn global_slots(&self) -> usize {
-        self.cfg.agent.max_concurrent.saturating_sub(self.running.len())
+        let used = self.running.len() + self.gating.len();
+        self.cfg.agent.max_concurrent.saturating_sub(used)
     }
 
     fn state_slots(&self, state_key: &str) -> usize {
-        let used = self.running.values().filter(|r| r.issue.state_key() == state_key).count();
+        let used = self
+            .running
+            .values()
+            .chain(self.gating.values().map(|g| &g.run))
+            .filter(|r| r.issue.state_key() == state_key)
+            .count();
         self.cfg.state_limit(state_key).saturating_sub(used)
     }
 
