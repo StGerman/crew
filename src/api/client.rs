@@ -154,6 +154,13 @@ impl std::fmt::Display for StatusError {
 
 impl std::error::Error for StatusError {}
 
+/// The two read routes this client uses, spelled once.
+const SNAPSHOT: &str = "/api/v1/snapshot";
+
+fn issue_path(key: &str) -> String {
+    format!("/api/v1/issues/{}", encode_segment(key))
+}
+
 /// A daemon's published state, read over the API it publishes it on.
 pub struct Client {
     endpoint: Endpoint,
@@ -178,20 +185,28 @@ impl Client {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot, StatusError> {
-        self.get("/api/v1/snapshot")
+        self.get(SNAPSHOT)
     }
 
     /// One issue by dispatch id or identifier, resolved server-side — this client does not
     /// fetch the whole snapshot and filter, because a duplicated identifier is the API's
     /// `409` to answer and not this one's to guess at.
     pub fn issue(&self, key: &str) -> Result<Row, StatusError> {
-        self.get(&format!("/api/v1/issues/{}", encode_segment(key)))
+        self.get(&issue_path(key))
     }
 
-    /// The raw JSON for a path, for `--json`. Kept next to the typed calls so both go through
-    /// the same failure classification.
-    pub fn raw(&self, path: &str) -> Result<String, StatusError> {
-        self.fetch(path).map(|(_, body)| body)
+    /// The same two routes, unparsed, for `--json`.
+    ///
+    /// They are separate methods rather than one taking a path because the first version took a
+    /// path: `--json` built its own URL, skipped [`encode_segment`], and turned an identifier
+    /// containing `/` into a 404 that read as a missing issue on exactly the input the typed
+    /// call handles. Routes are constructed in one place now so the two cannot diverge again.
+    pub fn raw_snapshot(&self) -> Result<String, StatusError> {
+        self.fetch(SNAPSHOT).map(|(_, body)| body)
+    }
+
+    pub fn raw_issue(&self, key: &str) -> Result<String, StatusError> {
+        self.fetch(&issue_path(key)).map(|(_, body)| body)
     }
 
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, StatusError> {

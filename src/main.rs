@@ -339,8 +339,8 @@ fn run_status(args: &Args, status: &StatusArgs) -> i32 {
     let rendered = match (&status.issue, status.json) {
         (None, false) => client.snapshot().map(|s| render::snapshot(&s, &addr)),
         (Some(key), false) => client.issue(key).map(|r| render::issue(&r)),
-        (None, true) => client.raw("/api/v1/snapshot"),
-        (Some(key), true) => client.raw(&format!("/api/v1/issues/{key}")),
+        (None, true) => client.raw_snapshot(),
+        (Some(key), true) => client.raw_issue(key),
     };
 
     match rendered {

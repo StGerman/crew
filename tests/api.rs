@@ -454,4 +454,11 @@ async fn an_identifier_that_needs_encoding_still_reaches_its_route() {
 
     let row = via_client(h.addr, |c| c.issue("team/MT-1")).await.expect("the slash survives");
     assert_eq!(row.identifier, "team/MT-1");
+
+    // `--json` goes down a second path, and the first version of it built its own URL and
+    // skipped the encoding — a 404 that reads as a missing issue, on the one input the typed
+    // call gets right.
+    let raw = via_client(h.addr, |c| c.raw_issue("team/MT-1")).await.expect("so does --json");
+    let parsed: Value = serde_json::from_str(&raw).expect("the body is JSON");
+    assert_eq!(parsed["identifier"], "team/MT-1");
 }
