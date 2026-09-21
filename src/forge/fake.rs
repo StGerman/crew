@@ -5,7 +5,7 @@
 //! settled thread, no merge ever — and a fake that only remembered current state could not
 //! show an absence.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -44,6 +44,9 @@ struct Inner {
     /// Commit subjects the next `publish` reports. Empty models a run that committed nothing.
     commits: Vec<String>,
     publishes: u32,
+    /// Every branch `publish` has pushed. The fake stands in for the remote too, so this is
+    /// what "exists on the remote" means to `stacked_on`.
+    published: HashSet<String>,
     fail: Option<ForgeError>,
     ops: Vec<Op>,
     stacked_on: Option<String>,
@@ -201,6 +204,7 @@ impl Publisher for FakeForge {
         let mut g = self.inner.lock().unwrap();
         Self::gate(&g)?;
         g.ops.push(Op::Publish { branch: branch.into(), base: base.into() });
+        g.published.insert(branch.to_string());
         g.publishes += 1;
         let head_sha = Self::head_after_publish(g.publishes);
         // The pull request open for this branch moves with the push, as the real one does.
@@ -216,12 +220,15 @@ impl Publisher for FakeForge {
         &self,
         _worktree: &Path,
         _branch: &str,
+        _remote: &str,
         _base: &str,
         candidates: &[String],
     ) -> Result<Option<String>, ForgeError> {
         let g = self.inner.lock().unwrap();
         Self::gate(&g)?;
-        Ok(g.stacked_on.clone().filter(|b| candidates.contains(b)))
+        // The scripted answer holds only for a candidate the scheduler offered *and* a branch
+        // this fake has seen pushed — the same two conditions the real remote imposes.
+        Ok(g.stacked_on.clone().filter(|b| candidates.contains(b) && g.published.contains(b)))
     }
 }
 

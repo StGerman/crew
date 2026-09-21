@@ -178,12 +178,19 @@ pub trait Publisher: Send + Sync {
     ) -> Result<Published, ForgeError>;
 
     /// Which of `candidates` this branch is stacked on, if any: the candidate that is an
-    /// ancestor of `branch`, carries commits `base` does not, and is not itself an ancestor of
-    /// another such candidate. `None` when the work sits directly on `base`.
+    /// ancestor of `branch`, carries commits `base` does not, is not itself an ancestor of
+    /// another such candidate — **and exists on `remote`**. `None` when the work sits directly
+    /// on `base`.
+    ///
+    /// The remote is what the pull request is opened against, so a candidate the remote does
+    /// not have is not a base, whatever the local repository says: a lower branch that has not
+    /// finished, or finished and not yet been pushed, would be a `422` there — permanent, and
+    /// so a handoff — for a pull request that had nothing wrong with it but its timing.
     fn stacked_on(
         &self,
         worktree: &Path,
         branch: &str,
+        remote: &str,
         base: &str,
         candidates: &[String],
     ) -> Result<Option<String>, ForgeError>;

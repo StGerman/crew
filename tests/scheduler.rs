@@ -2295,10 +2295,14 @@ fn a_stacked_branch_opens_its_pull_request_against_the_branch_it_sits_on() {
         Store::open_in_memory().unwrap(),
         |_| {},
     );
+    // The lower branch finishes, and is pushed, before the one on top of it.
+    h.worker.script("iss-2", Script::succeeds_in(2_000));
     h.sched.tick().unwrap();
     let under = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
     // The publisher reports iss-2's work as sitting on iss-1's branch.
     forge.set_stacked_on(Some(under.clone()));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
 
@@ -2313,6 +2317,36 @@ fn a_stacked_branch_opens_its_pull_request_against_the_branch_it_sits_on() {
     assert_eq!(of("MT-2-"), under, "the branch on top targets the one it sits on");
     let top = forge.open_prs().iter().find(|p| p.base == under).unwrap().number;
     assert!(forge.spec_of(top).unwrap().body.contains("Stacked on"), "and the body says so");
+}
+
+/// Finding 2 on #47. Every issue's branch was a stack candidate, pushed or not; when the upper
+/// one finished first the pull request named a base the remote had never seen, and the
+/// provider's 422 read as permanent — a handoff for a branch with nothing wrong but its timing.
+#[test]
+fn a_base_that_is_not_published_is_not_selected_as_a_stack_base() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    // The branch on top finishes first; the one under it is still running.
+    h.worker.script("iss-1", Script::succeeds_in(5_000));
+    h.sched.tick().unwrap();
+    let under = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    forge.set_stacked_on(Some(under.clone()));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert!(
+        !forge.ops().iter().any(|o| matches!(o, Op::Publish { branch, .. } if *branch == under)),
+        "the lower branch has not been pushed: {:?}",
+        forge.ops()
+    );
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "the upper branch delivered: {:?}", forge.ops());
+    assert_eq!(prs[0].base, "master", "against the trunk, not a base the remote does not have");
+    assert_eq!(delivery_of(&h, "iss-2").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-2").base.as_deref(), Some("master"));
 }
 
 /// Merging is the operator's, and it closes the ticket; `sweep_parked` then reclaims the

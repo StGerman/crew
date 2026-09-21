@@ -282,7 +282,9 @@ impl Scheduler {
             }
             // Every other issue's branch is a candidate base: a pull request whose work sits
             // on another issue's branch is based on that branch, so the two stay reviewable
-            // apart.
+            // apart. The publisher keeps only the candidates the remote has — a lower branch
+            // still running, or done and not yet pushed, is not a base a pull request can be
+            // opened against, and this branch finishing first is not a reason to hand it off.
             let candidates: Vec<String> = self
                 .store
                 .all()?
@@ -291,11 +293,11 @@ impl Scheduler {
                 .filter_map(|o| o.branch)
                 .collect();
             let default_base = self.cfg.delivery.base.clone();
+            let remote = self.cfg.delivery.remote.clone();
             let base = publisher
-                .stacked_on(&worktree, &branch, &default_base, &candidates)?
+                .stacked_on(&worktree, &branch, &remote, &default_base, &candidates)?
                 .unwrap_or(default_base);
-            let published =
-                publisher.publish(&worktree, &branch, &self.cfg.delivery.remote, &base)?;
+            let published = publisher.publish(&worktree, &branch, &remote, &base)?;
             if published.commits.is_empty() {
                 tracing::info!(
                     issue_id,

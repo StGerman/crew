@@ -6,6 +6,7 @@
 //! well as before launch — deletion is the more dangerous of the two, and the spec only
 //! mandates the check for launch.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -478,14 +479,30 @@ impl Publisher for GitWorktreeWorkspace {
         &self,
         worktree: &Path,
         branch: &str,
+        remote: &str,
         base: &str,
         candidates: &[String],
     ) -> Result<Option<String>, ForgeError> {
-        // A candidate is "under" this branch when it is an ancestor of it and carries commits
-        // `base` does not — a branch already merged into `base` is not a stack, it is history.
+        // What the remote actually has, asked for directly rather than read off the
+        // remote-tracking refs: those say what this repository last fetched, and a lower branch
+        // pushed by another clone — or deleted after its merge — would be misread either way.
+        // One round trip for every candidate at once; a network failure here is the same
+        // transient the push after it would hit.
+        let heads = Self::git(worktree, &["ls-remote", "--heads", remote])
+            .map_err(|e| ForgeError::Transient(format!("listing {remote}'s branches: {e}")))?;
+        let on_remote: HashSet<&str> = heads
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter_map(|(_, r)| r.strip_prefix("refs/heads/"))
+            .collect();
+
+        // A candidate is "under" this branch when the remote has it, it is an ancestor of
+        // this branch, and it carries commits `base` does not — a branch already merged into
+        // `base` is not a stack, it is history.
         let under: Vec<&String> = candidates
             .iter()
             .filter(|c| *c != branch)
+            .filter(|c| on_remote.contains(c.as_str()))
             .filter(|c| {
                 Self::git(
                     worktree,
@@ -1125,36 +1142,41 @@ mod tests {
     #[test]
     fn stacked_on_names_the_nearest_branch_under_the_work_and_ignores_ones_already_in_the_base() {
         let root = tmp_root("wt-stack");
-        let repo = tmp_repo("wt-stack");
+        let (repo, bare) = repo_with_remote("wt-stack");
         let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
 
         // Lower carries a commit over main; upper is built on top of lower; sibling sits on
-        // main by itself; merged is a branch main already contains.
+        // main by itself; merged is a branch main already contains. All of them are on the
+        // remote, so this test is about ancestry alone.
         let lower = ws.prepare("id-1", "MT-1").unwrap();
         commit_in(&lower.path, "lower.txt", "lower");
         let lower_branch = lower.branch.clone().unwrap();
+        ws.publish(&lower.path, &lower_branch, "origin", "main").unwrap();
 
         let upper = ws.prepare("id-2", "MT-2").unwrap();
         git_out(&upper.path, &["merge", "-q", "--ff-only", &lower_branch]).unwrap();
         commit_in(&upper.path, "upper.txt", "upper");
         let upper_branch = upper.branch.clone().unwrap();
+        ws.publish(&upper.path, &upper_branch, "origin", "main").unwrap();
 
         let sibling = ws.prepare("id-3", "MT-3").unwrap();
         commit_in(&sibling.path, "sibling.txt", "sibling");
         let sibling_branch = sibling.branch.clone().unwrap();
+        ws.publish(&sibling.path, &sibling_branch, "origin", "main").unwrap();
 
         let merged = ws.prepare("id-4", "MT-4").unwrap();
         let merged_branch = merged.branch.clone().unwrap();
+        ws.publish(&merged.path, &merged_branch, "origin", "main").unwrap();
 
         let candidates = vec![lower_branch.clone(), sibling_branch.clone(), merged_branch];
 
         assert_eq!(
-            ws.stacked_on(&upper.path, &upper_branch, "main", &candidates).unwrap(),
+            ws.stacked_on(&upper.path, &upper_branch, "origin", "main", &candidates).unwrap(),
             Some(lower_branch.clone()),
             "upper's work sits on lower"
         );
         assert_eq!(
-            ws.stacked_on(&sibling.path, &sibling_branch, "main", &candidates).unwrap(),
+            ws.stacked_on(&sibling.path, &sibling_branch, "origin", "main", &candidates).unwrap(),
             None,
             "a branch straight off main is not stacked, even with merged-in candidates around"
         );
@@ -1165,11 +1187,51 @@ mod tests {
         commit_in(&top.path, "top.txt", "top");
         let all = vec![lower_branch, upper_branch.clone(), sibling_branch];
         assert_eq!(
-            ws.stacked_on(&top.path, top.branch.as_deref().unwrap(), "main", &all).unwrap(),
+            ws.stacked_on(&top.path, top.branch.as_deref().unwrap(), "origin", "main", &all)
+                .unwrap(),
             Some(upper_branch)
         );
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// Finding 2 on #47. The pull request is opened against the remote's branches, so a lower
+    /// branch that exists only locally — still running, or finished and not yet pushed — is
+    /// a `422` from the provider and a handoff for the upper one. Not a base, however plainly
+    /// the work sits on it; and a base once it has been pushed.
+    #[test]
+    fn a_stack_candidate_the_remote_does_not_have_is_not_selected_as_a_base() {
+        let root = tmp_root("wt-stack-unpushed");
+        let (repo, bare) = repo_with_remote("wt-stack-unpushed");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let lower = ws.prepare("id-1", "MT-1").unwrap();
+        commit_in(&lower.path, "lower.txt", "lower");
+        let lower_branch = lower.branch.clone().unwrap();
+
+        let upper = ws.prepare("id-2", "MT-2").unwrap();
+        git_out(&upper.path, &["merge", "-q", "--ff-only", &lower_branch]).unwrap();
+        commit_in(&upper.path, "upper.txt", "upper");
+        let upper_branch = upper.branch.clone().unwrap();
+
+        let candidates = vec![lower_branch.clone()];
+        assert_eq!(
+            ws.stacked_on(&upper.path, &upper_branch, "origin", "main", &candidates).unwrap(),
+            None,
+            "lower is under upper locally, but the remote has never seen it"
+        );
+
+        ws.publish(&lower.path, &lower_branch, "origin", "main").unwrap();
+        assert_eq!(
+            ws.stacked_on(&upper.path, &upper_branch, "origin", "main", &candidates).unwrap(),
+            Some(lower_branch),
+            "once pushed, the same branch is the base"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
     }
 }
