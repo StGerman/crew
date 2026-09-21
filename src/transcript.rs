@@ -1,10 +1,11 @@
 //! Per-run transcripts of the agent's raw event stream.
 //!
-//! The worker parses `stream-json` for a turn count and a verdict and drops everything else —
-//! `system`, `rate_limit_event`, every tool call. Those are precisely the lines a post-mortem
-//! wants and the parser does not, so once the terminal scrollback is gone a run that went wrong
-//! cannot be examined at all. This module is the other half of the reader: every line it sees
-//! goes to a file keyed by run id, whether or not the parser had a use for it.
+//! The worker parses `stream-json` for a turn count, a verdict and a rejected rate limit
+//! (#37), and drops everything else — `system`, every tool call. Those dropped lines are
+//! precisely what a post-mortem wants and the parser does not, so once the terminal scrollback
+//! is gone a run that went wrong cannot be examined at all. This module is the other half of
+//! the reader: every line it sees goes to a file keyed by run id, whether or not the parser had
+//! a use for it.
 //!
 //! Three properties, each closing something that went wrong in practice:
 //!
