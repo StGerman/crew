@@ -37,6 +37,10 @@
 //! pull request's outstanding requests and its posted reviews are. A request that verifiably
 //! attached nobody is a handoff with that reason, reported on the issue's row — never a quiet
 //! success that leaves a pull request nobody will look at.
+//!
+//! And it is per head. A fix round pushes a new head to the same pull request, and a reviewer
+//! verified against the old one has not seen it; so the push resets `review_requested`, and
+//! the request-then-read runs again before the pull request can read as ready (#47).
 
 use std::collections::HashMap;
 

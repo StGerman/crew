@@ -23,7 +23,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 220 unit + 85 integration
+cargo test                                 # 226 unit + 90 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -471,8 +471,12 @@ see the tick order above. The pull request body is derived
 from the run record (commits, runs, turns, tokens), never composed by the agent. Verdicts on
 review comments come back as `SYMPHONY_REVIEW: <id>: accepted: <commit>` or `rejected:
 <reason>` lines in the agent's final text, the same soft convention as `SYMPHONY_OUTCOME`; the
-orchestrator records each in `review_verdict` and replies on the thread, and a settled thread
-is never handed out again. A comment the agent gives no line for stays open.
+orchestrator replies on the thread and, once that reply has landed, records the verdict in
+`review_verdict`, and a settled thread is never handed out again. A comment the agent gives no
+line for stays open — and so does one whose acceptance names no commit, or a commit the branch
+does not carry: the worker drops an `accepted:` whose detail is not shaped like a commit, and
+the scheduler checks the rest against the branch (`Publisher::carries`) at the moment the run
+reports `Done`, before the gate's rebase rewrites the shas the agent named.
 
 Four things there are load-bearing. Every hand-back is a *round*, bounded per pull request
 (`max_rounds_per_pr`) and per issue (`max_rounds_per_issue`), and the per-issue count never
@@ -488,7 +492,23 @@ the operator's, and the trait's shape is what enforces it. And a delivery step o
 issue nothing else owns (phase `released`, no live run), so a push cannot land under a running
 agent and a hand-back cannot race a dispatch. A branch whose work sits on another issue's branch
 gets its pull request based on that branch (`Publisher::stacked_on`), so the two stay
-reviewable apart.
+reviewable apart — provided the remote has that branch. A lower branch still running, or done
+and not yet pushed, is not a base a pull request can be opened against, so the upper one opens
+against the trunk rather than handing off on the provider's 422; and when a later push computes
+a different base than the open pull request targets — the lower branch merged — `open_pull_request`
+retargets it, body included, so the store, the snapshot and the provider agree.
+
+The review on PR #42 found the handoff itself wrong in six places (#47), and two of them are
+worth knowing the shape of before touching `publish` or `apply_verdicts`. The push is
+`--force-with-lease`, because the gate rebases an already-published branch before every
+re-delivery and a plain push then fails non-fast-forward in exactly the round the base moved;
+forcing is sanctioned because the branch is the orchestrator's own, and the lease is what keeps
+that apart from forcing over someone else's — a lease failure is classified on its own,
+permanent, naming the remote branch that moved. And a verdict is settled by its reply landing
+and by nothing else: `apply_verdicts` replies first and records second, a failed reply leaves
+the verdict queued on the row and the step returns the error, so the threads are not read — or
+handed back to an agent — until it lands. Recording first, as it did, hid a verdict from its
+reviewer for good over one transient error while delivery went on to `Ready`.
 
 ## Invariants
 
@@ -498,8 +518,9 @@ built over the same state, issue #1's acceptance criterion made executable, the 
 dispatch and the review that followed it, the client put in front of that operator surface,
 making a finished run diagnosable, a closed ticket whose worktree outlived it, an
 orchestrator that ran inside its own worktree, the agent supervising the daemon getting
-the same surface as data, and two branches that were each green alone and broken
-together.
+the same surface as data, two branches that were each green alone and broken together, and
+the review of the handoff path that found it handing off, retrying or settling in six cases
+where it should not.
 
 Every row has a test that fails without its mechanism. Several of those tests only fail in the
 exact scenario they were written for, so a regression here can pass a casual `cargo test`
@@ -550,11 +571,22 @@ reading — check that the named test is still meaningful, not just still green.
 | The review-fix loop is bounded, and the bound survives a new run and a new pull request | `rounds_pr` resets only when the pull request number changes; `rounds_issue` never resets; both checked before charging | `fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_a_new_run_and_a_new_pull_request` |
 | Nothing merges without a human | `Forge` has no merge method; a ready pull request is polled, never advanced | `nothing_merges_without_a_human` |
 | Delivery never publishes an ungated branch | a `Done` enters `gating` first and only the gate's pass reaches the `Done` arm that queues delivery; a failing gate is a `Continue` the forge never hears about | `a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes_nothing` |
+| A reused pull request targets the base the scheduler recorded | `open_pull_request` compares the base it finds with `spec.base` and retargets — body included — when they differ, instead of returning the pull request as found | `a_reused_pull_request_whose_desired_base_has_changed_is_retargeted`, `a_pull_request_whose_desired_base_has_changed_is_retargeted_and_the_snapshot_agrees` |
+| A stack base the remote does not have is not a base | `Publisher::stacked_on` takes the remote and keeps only the candidates it has, asked directly with `ls-remote` rather than read off remote-tracking refs | `a_stack_candidate_the_remote_does_not_have_is_not_selected_as_a_base`, `a_base_that_is_not_published_is_not_selected_as_a_stack_base` |
+| A verdict is settled only by a reply that landed | `apply_verdicts` replies first and records second; a failed reply leaves the verdict in `pending_verdicts` — which the push no longer clears — and returns the error, so the threads are neither read nor handed back until it lands | `a_verdict_is_not_settled_by_a_reply_that_did_not_land` |
+| A new head is not left unreviewed | `set_delivery_pr` resets `review_requested` when the head changes, not only when the pull request number does, so the request-then-verify runs again for every push | `a_new_head_on_the_same_pull_request_needs_its_review_requested_again`, `a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed` |
+| An acceptance names a commit the branch carries, never a bare acknowledgement | `extract_verdicts` drops an `accepted:` whose detail is not commit-shaped; `verified_verdicts` checks the rest with `Publisher::carries` as the run reports `Done`, before the gate's rebase rewrites the shas | `an_acceptance_that_names_no_commit_leaves_its_comment_outstanding`, `an_acceptance_is_believed_only_for_a_commit_the_delivered_branch_carries`, `an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_outstanding` |
+| A rebased branch updates its pull request, and never overwrites someone else's work | `publish` pushes `--force-with-lease`; a lease failure is classified on its own as permanent, naming the remote branch that moved, so it stays distinct from a stale-base rejection | `a_rebased_branch_is_pushed_over_its_own_history_but_never_over_someone_elses` |
 
 The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
 way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop
 the per-issue bound or reset it with the pull request, stop consulting the verdict table — and
-the named test fails.
+the named test fails. The six rows from #47 were checked the same way — a plain push, then a
+bare `--force`; the pull request returned as found; the remote filter dropped from both
+`stacked_on`s; the verdict recorded before its reply; `review_requested` keyed on the number
+alone; the commit check removed from the worker, from `carries` and from the scheduler in turn —
+and each named test failed, with the file restored by `cp` rather than `mv`, because a preserved
+mtime leaves cargo running the stale binary.
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the
