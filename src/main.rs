@@ -22,6 +22,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use symphony_cc::api::client::{Client, endpoint};
+use symphony_cc::api::mcp::OpsMcp;
 use symphony_cc::api::{Api, Command, render};
 use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
@@ -62,6 +63,12 @@ struct Args {
     /// query instead of the one to serve.
     #[arg(long, value_name = "ADDR", global = true)]
     api: Option<String>,
+
+    /// Serve the ops API as MCP tools on this address, for the agent supervising this daemon,
+    /// overriding `[api] mcp_bind`. Loopback unless `api.allow_public`. Never hand this
+    /// address to a dispatched worker — see `api::mcp`.
+    #[arg(long, value_name = "ADDR")]
+    mcp: Option<String>,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -234,6 +241,10 @@ async fn main() -> anyhow::Result<()> {
         api_cfg.enabled = true;
         api_cfg.bind = addr;
     }
+    if let Some(addr) = args.mcp.clone() {
+        api_cfg.mcp_enabled = true;
+        api_cfg.mcp_bind = addr;
+    }
 
     let mut sched =
         Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
@@ -257,6 +268,25 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
             }
             Err(e) => tracing::error!(error = %e, "ops API not started; scheduling continues"),
+        }
+    }
+
+    // The same surface as tools, on its own listener. Same contract as the HTTP API above: a
+    // bind failure costs this server, never a dispatch. It is served by the broker's transport
+    // but is deliberately *not* the broker — nothing here passes it to `Broker`, and the
+    // `--mcp-config` a worker receives is written by `Broker::open` alone, so no dispatched
+    // agent learns this address. `a_dispatched_worker_is_not_handed_the_ops_tools` holds that.
+    if api_cfg.mcp_enabled {
+        match symphony_cc::api::mcp::bind(&api_cfg) {
+            Ok(listener) => {
+                let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+                let ops = Arc::new(OpsMcp::new(Api::new(snap_rx.clone(), cmd_tx.clone())));
+                broker::server::serve(ops, listener);
+                tracing::info!(%addr, path = symphony_cc::api::mcp::PATH, "ops MCP server listening");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ops MCP server not started; scheduling continues")
+            }
         }
     }
 

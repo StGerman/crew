@@ -49,6 +49,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub mod client;
+pub mod mcp;
 pub mod render;
 
 use crate::config::ApiConfig;
@@ -95,17 +96,32 @@ pub enum Command {
 /// address that does not parse — and then carry on scheduling. The API failing to start must
 /// not be the reason agents stop being dispatched.
 pub async fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
-    let addr: SocketAddr = normalize_bind(&cfg.bind)
-        .parse()
-        .with_context(|| format!("api.bind = {:?} is not a host:port address", cfg.bind))?;
+    let addr = resolve_bind("api.bind", &cfg.bind, cfg.allow_public)?;
+    TcpListener::bind(addr).await.with_context(|| format!("binding the ops API to {addr}"))
+}
 
-    if !addr.ip().is_loopback() && !cfg.allow_public {
+/// Parse a configured bind address and apply the exposure rule.
+///
+/// Shared with [`mcp::bind`], so the two operator surfaces cannot drift on what "loopback" or
+/// "public" means: both carry the same two write actions, so one `allow_public` governs both.
+/// `field` names the config key in the error, because an operator fixing a typo needs to know
+/// which of the two addresses to look at.
+pub(crate) fn resolve_bind(
+    field: &str,
+    raw: &str,
+    allow_public: bool,
+) -> anyhow::Result<SocketAddr> {
+    let addr: SocketAddr = normalize_bind(raw)
+        .parse()
+        .with_context(|| format!("{field} = {raw:?} is not a host:port address"))?;
+
+    if !addr.ip().is_loopback() && !allow_public {
         anyhow::bail!(
-            "api.bind = {addr} is not loopback and api.allow_public is not set; the write \
+            "{field} = {addr} is not loopback and api.allow_public is not set; the write \
              endpoints control agent execution, so this is refused rather than exposed"
         );
     }
-    TcpListener::bind(addr).await.with_context(|| format!("binding the ops API to {addr}"))
+    Ok(addr)
 }
 
 /// The one normalization `api.bind` gets before it is treated as an address. Shared with
@@ -199,11 +215,11 @@ impl Api {
 
     /// The latest published snapshot. Cloned rather than borrowed: a `watch` read guard held
     /// across an await would block the scheduler's next publish on whatever this client does.
-    fn latest(&self) -> Snapshot {
+    pub(crate) fn latest(&self) -> Snapshot {
         self.snapshots.borrow().clone()
     }
 
-    fn issue(&self, key: &str) -> Response {
+    pub(crate) fn issue(&self, key: &str) -> Response {
         let snap = self.latest();
         match resolve(&snap, key) {
             Resolved::One(row) => json_of(200, row),
@@ -213,25 +229,54 @@ impl Api {
     }
 
     async fn refresh(&self) -> Response {
-        let (tx, rx) = oneshot::channel();
-        if self.commands.send(Command::Tick(tx)).is_err() {
-            return Response::error(503, "the scheduler is no longer accepting commands");
-        }
-        match rx.await {
-            Ok(Ok(snap)) => json_of(200, &snap),
-            Ok(Err(e)) => Response::error(500, &format!("the tick failed: {e}")),
-            Err(_) => Response::error(503, "the scheduler stopped before the tick completed"),
+        match self.request_tick() {
+            Ok(rx) => tick_reply(rx.await),
+            Err(refused) => refused,
         }
     }
 
+    /// [`Api::refresh`] for a caller on a plain thread — the MCP transport, which is not async.
+    ///
+    /// The wait is the same one-shot the async path awaits, so the property that matters — the
+    /// scheduler answers into a channel and never waits on this side — holds identically.
+    pub(crate) fn refresh_blocking(&self) -> Response {
+        match self.request_tick() {
+            Ok(rx) => tick_reply(rx.blocking_recv()),
+            Err(refused) => refused,
+        }
+    }
+
+    fn request_tick(&self) -> Result<oneshot::Receiver<anyhow::Result<Snapshot>>, Response> {
+        let (tx, rx) = oneshot::channel();
+        if self.commands.send(Command::Tick(tx)).is_err() {
+            return Err(Response::error(503, "the scheduler is no longer accepting commands"));
+        }
+        Ok(rx)
+    }
+
     async fn unquarantine(&self, key: &str) -> Response {
+        match self.request_unquarantine(key) {
+            Ok((target, rx)) => target.reply(rx.await),
+            Err(refused) => refused,
+        }
+    }
+
+    /// [`Api::unquarantine`] for a caller on a plain thread; see [`Api::refresh_blocking`].
+    pub(crate) fn unquarantine_blocking(&self, key: &str) -> Response {
+        match self.request_unquarantine(key) {
+            Ok((target, rx)) => target.reply(rx.blocking_recv()),
+            Err(refused) => refused,
+        }
+    }
+
+    fn request_unquarantine(&self, key: &str) -> Result<(Target, UnquarantineReply), Response> {
         let snap = self.latest();
         let (issue_id, identifier) = match resolve(&snap, key) {
             Resolved::One(row) => (row.issue_id.clone(), row.identifier.clone()),
             Resolved::Unknown => {
-                return Response::error(404, &format!("no issue matching {key:?}"));
+                return Err(Response::error(404, &format!("no issue matching {key:?}")));
             }
-            Resolved::Ambiguous(ids) => return ambiguous(key, &ids),
+            Resolved::Ambiguous(ids) => return Err(ambiguous(key, &ids)),
         };
 
         // Sent even when this snapshot says the issue is not quarantined: the snapshot is as
@@ -240,15 +285,36 @@ impl Api {
         let (tx, rx) = oneshot::channel();
         let cmd = Command::Unquarantine { issue_id: issue_id.clone(), reply: tx };
         if self.commands.send(cmd).is_err() {
-            return Response::error(503, "the scheduler is no longer accepting commands");
+            return Err(Response::error(503, "the scheduler is no longer accepting commands"));
         }
+        Ok((Target { issue_id, identifier }, rx))
+    }
+}
 
-        match rx.await {
+fn tick_reply(answer: Result<anyhow::Result<Snapshot>, oneshot::error::RecvError>) -> Response {
+    match answer {
+        Ok(Ok(snap)) => json_of(200, &snap),
+        Ok(Err(e)) => Response::error(500, &format!("the tick failed: {e}")),
+        Err(_) => Response::error(503, "the scheduler stopped before the tick completed"),
+    }
+}
+
+type UnquarantineReply = oneshot::Receiver<anyhow::Result<bool>>;
+
+/// The issue an unquarantine was sent for, kept so the answer can name it.
+struct Target {
+    issue_id: String,
+    identifier: String,
+}
+
+impl Target {
+    fn reply(self, answer: Result<anyhow::Result<bool>, oneshot::error::RecvError>) -> Response {
+        match answer {
             Ok(Ok(cleared)) => Response::json(
                 200,
                 json!({
-                    "issue_id": issue_id,
-                    "identifier": identifier,
+                    "issue_id": self.issue_id,
+                    "identifier": self.identifier,
                     "cleared": cleared,
                     "detail": if cleared {
                         "quarantine cleared; the issue is dispatchable again"
@@ -298,7 +364,7 @@ fn ambiguous(key: &str, ids: &[String]) -> Response {
     )
 }
 
-fn json_of<T: Serialize>(status: u16, value: &T) -> Response {
+pub(crate) fn json_of<T: Serialize>(status: u16, value: &T) -> Response {
     match serde_json::to_value(value) {
         Ok(v) => Response::json(status, v),
         // Unreachable for the types served here, and cheaper to answer than to panic in a task
@@ -315,10 +381,15 @@ struct Request {
     path: String,
 }
 
-struct Response {
-    status: u16,
+/// One answer from the ops surface, before it is put on a wire.
+///
+/// Built by the routes and written by either transport: the HTTP server below frames it as a
+/// response, and [`mcp`] frames the same status and body as a tool result. That is what keeps
+/// the two surfaces from answering the same question differently.
+pub(crate) struct Response {
+    pub(crate) status: u16,
     headers: Vec<(&'static str, String)>,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Response {
@@ -522,14 +593,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_loopback_bind_is_refused_unless_it_was_asked_for() {
-        let cfg = ApiConfig { enabled: true, bind: "0.0.0.0:0".into(), allow_public: false };
+        let cfg = ApiConfig { enabled: true, bind: "0.0.0.0:0".into(), ..Default::default() };
         let err = bind(&cfg).await.expect_err("0.0.0.0 must not bind by default").to_string();
         assert!(err.contains("allow_public"), "the refusal must name the way out: {err}");
 
-        let bad = ApiConfig { enabled: true, bind: "not-an-address".into(), allow_public: false };
+        let bad = ApiConfig { enabled: true, bind: "not-an-address".into(), ..Default::default() };
         assert!(bind(&bad).await.is_err());
 
-        let ok = ApiConfig { enabled: true, bind: "127.0.0.1:0".into(), allow_public: false };
+        let ok = ApiConfig { enabled: true, bind: "127.0.0.1:0".into(), ..Default::default() };
         assert!(bind(&ok).await.is_ok(), "loopback needs no ceremony");
     }
 
