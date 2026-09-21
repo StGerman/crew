@@ -22,7 +22,7 @@ the published snapshot with a `status` client in front of it.
 ## Commands
 
 ```bash
-cargo test                                 # 166 unit + 53 integration
+cargo test                                 # 199 unit + 64 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -363,6 +363,40 @@ and so the likelier reading) versus a daemon that answered and refused. Collapsi
 what has somebody restart a daemon that was never down, so each message names the address
 tried, where that address came from, and the way out.
 
+
+**Delivery** ([src/sched/delivery.rs](src/sched/delivery.rs), behind the `Forge` and
+`Publisher` traits in [src/forge/](src/forge/)) is what happens after a run reports `Done`,
+when `[delivery] enabled` is on. `Done` still releases the claim and parks the issue exactly as
+before; delivery is then a row in the store advanced on the tick — after reconciliation,
+before the dispatch gate, at `delivery.poll_interval_ms` — through: push the branch
+(`Publisher`, implemented by `GitWorktreeWorkspace`, from the worktree), open or find the pull
+request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the configured
+reviewers *and read back whether they attached*, read CI, read the review threads. A red CI or
+an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
+due now, the session resumed, and the failure in the prompt as `Feedback` — which is the
+literal form of "a red gate is a `Continue`, never a `Done`". The pull request body is derived
+from the run record (commits, runs, turns, tokens), never composed by the agent. Verdicts on
+review comments come back as `SYMPHONY_REVIEW: <id>: accepted: <commit>` or `rejected:
+<reason>` lines in the agent's final text, the same soft convention as `SYMPHONY_OUTCOME`; the
+orchestrator records each in `review_verdict` and replies on the thread, and a settled thread
+is never handed out again. A comment the agent gives no line for stays open.
+
+Four things there are load-bearing. Every hand-back is a *round*, bounded per pull request
+(`max_rounds_per_pr`) and per issue (`max_rounds_per_issue`), and the per-issue count never
+resets — not for a new run and not for a new pull request — because a reviewer that comments
+on every push, answered by an agent that pushes, is a loop with no bound of its own, and one
+that reset with the pull request would bound nothing (the same gap `max_calls_per_issue`
+closes for the broker). At either bound the pull request is handed to the operator with the
+outstanding items named. A review request is followed by a read of the pull request and its
+reviews, because GitHub answers a request for a bot reviewer with `200` and attaches nobody
+(GETT-174120); a request that verifiably attached nobody is a handoff with that reason on the
+issue's row, not a success. `Forge` has no `merge` method, and must not grow one — merging is
+the operator's, and the trait's shape is what enforces it. And a delivery step only runs for an
+issue nothing else owns (phase `released`, no live run), so a push cannot land under a running
+agent and a hand-back cannot race a dispatch. A branch whose work sits on another issue's branch
+gets its pull request based on that branch (`Publisher::stacked_on`), so the two stay
+reviewable apart.
+
 ## Invariants
 
 Each of these closes a defect found in the original spec. The later rows came instead from
@@ -403,6 +437,16 @@ reading — check that the named test is still meaningful, not just still green.
 | Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
 | A parked run's worktree is reclaimed once its ticket closes | `sweep_parked` re-reads parked ids on a bounded cadence, unparks what it cleans, and clears the published branch when cleanup deleted the ref | `a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart`, `sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks`, `a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes` |
 | One orchestrator cannot nest its worktrees inside another's | `GitWorktreeWorkspace::new` refuses a `repo` or `root` inside a linked worktree of the repository; `remove` prunes registrations beneath the path it deletes, then `branch -d`s their branches with the merged check intact | `an_orchestrator_cannot_be_started_inside_another_runs_worktree`, `removing_a_worktree_reclaims_the_worktrees_nested_inside_it_from_shared_metadata` |
+| A red gate cannot rest on `Done` | delivery reads CI after every push and hands a failure back through the retry path with the failure in the prompt | `a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_run_does_not_rest_on_done` |
+| A review request that attached nobody is not a success | the request is followed by a read of `requested_reviewers` and `reviews`; a missing login hands off with the reason | `a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reported_as_a_failure` |
+| A settled review comment is not re-argued | verdicts are recorded by comment id, first one stands, and open threads are computed against that table | `each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and_is_not_re_argued` |
+| The review-fix loop is bounded, and the bound survives a new run and a new pull request | `rounds_pr` resets only when the pull request number changes; `rounds_issue` never resets; both checked before charging | `fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_a_new_run_and_a_new_pull_request` |
+| Nothing merges without a human | `Forge` has no merge method; a ready pull request is polled, never advanced | `nothing_merges_without_a_human` |
+
+The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
+way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop
+the per-issue bound or reset it with the pull request, stop consulting the verdict table — and
+the named test fails.
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the
