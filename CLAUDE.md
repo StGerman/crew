@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**MUST follow: [docs/coding-guidelines.md](docs/coding-guidelines.md).** Read it before the
+first edit. It is the authoritative statement of how code is written here, with a check named
+for every rule. This file covers what the system is and why; that file covers how to change it.
+
 ## What this is
 
 `symphony-cc` is a tracker-driven orchestrator for Claude Code agents: a daemon that polls an
@@ -459,10 +463,7 @@ hold. They cover different paths; keep all three.
 
 ## Conventions
 
-The coding rules live in [docs/coding-guidelines.md](docs/coding-guidelines.md), and that file
-is authoritative. Each rule there states what, why, and where the tree shows it done right, and
-the rules the code does not yet meet are tagged with the issue that tracks the fix. Read it
-before the first edit, and check a PR against it before asking for review.
+See [docs/coding-guidelines.md](docs/coding-guidelines.md), linked at the top of this file.
 
 ## Dogfooding
 
