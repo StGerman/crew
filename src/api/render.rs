@@ -40,6 +40,17 @@ pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
     }
     out.push('\n');
 
+    // Named so an idle daemon reads as "waiting on a limit" rather than as broken — the whole
+    // point of publishing this at all (#37). Its own line, ahead of the tick line: an operator
+    // deciding whether to restart the daemon needs this before anything else here.
+    if let Some(p) = &snap.rate_limit_pause {
+        out.push_str(&format!(
+            "waiting on a {} limit until {}\n",
+            p.kind.replace('_', "-"),
+            timestamp(p.resets_at)
+        ));
+    }
+
     out.push_str(&format!("tick {}", snap.ticks));
     if let Some(at) = snap.last_tick_at {
         out.push_str(&format!(", last at {}", timestamp(at)));
@@ -346,6 +357,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sched::RateLimitPause;
     use crate::worker::TokenUsage;
 
     /// The whole point of a transcript is that it is readable after the run is over, so the
@@ -403,6 +415,7 @@ mod tests {
             uncounted_runs: 2,
             rows: vec![row("MT-601", Phase::Running)],
             last_error: None,
+            rate_limit_pause: None,
         };
 
         let out = snapshot(&snap, "127.0.0.1:8787");
@@ -415,6 +428,22 @@ mod tests {
         assert!(out.contains("at least 1.2M in / 48.3k out"), "{out}");
         assert!(out.contains("2 finished runs reported none"), "a floor, not a total: {out}");
         assert!(out.contains("MT-601"), "{out}");
+    }
+
+    /// #37: an idle daemon and a daemon waiting out an account-wide rate limit must not read
+    /// the same to an operator deciding whether to restart it.
+    #[test]
+    fn a_rate_limit_pause_says_why_nothing_is_dispatching_and_when_that_ends() {
+        let snap = Snapshot {
+            rate_limit_pause: Some(RateLimitPause {
+                kind: "five_hour".into(),
+                resets_at: 1_789_981_200_000,
+            }),
+            ..Default::default()
+        };
+        let out = snapshot(&snap, "x");
+        assert!(out.contains("waiting on a five-hour limit until"), "{out}");
+        assert!(out.contains(&timestamp(1_789_981_200_000)), "{out}");
     }
 
     #[test]

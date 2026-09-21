@@ -163,6 +163,22 @@ pub struct Snapshot {
     pub ticks: u64,
     pub last_tick_at: Option<i64>,
     pub last_error: Option<String>,
+    /// Set while dispatch is paused for an account-wide rate limit the agent CLI itself
+    /// reported (#37). `None` when dispatch is not paused for this reason — which is not the
+    /// same as "nothing is wrong"; see `last_error` for an ordinary failure.
+    pub rate_limit_pause: Option<RateLimitPause>,
+}
+
+/// An account-wide dispatch pause, published so an operator sees *why* nothing is running
+/// rather than an idle daemon with no explanation (#37).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitPause {
+    /// Whatever the CLI named the exhausted window — `"five_hour"`, `"seven_day"`, or a name
+    /// this crate has never seen.
+    pub kind: String,
+    /// Wall-clock milliseconds — the same units as [`Snapshot::generated_at`] — at which
+    /// dispatch resumes.
+    pub resets_at: i64,
 }
 
 pub struct Scheduler {
@@ -209,6 +225,12 @@ pub struct Scheduler {
     /// a restart reclaims what closed while the process was down without waiting a full
     /// interval. See [`Scheduler::sweep_parked`].
     last_parked_sweep: Option<Mono>,
+    /// Set when the agent CLI itself reported a rejected, account-wide rate limit; cleared once
+    /// `resets_at` has passed. Not persisted — a restart mid-pause simply re-learns it from the
+    /// next dispatch that hits the same limit, which costs one wasted dispatch and nothing more:
+    /// that run still charges no attempt, the same as the one that set the pause in the first
+    /// place (#37).
+    rate_limit_pause: Option<RateLimitPause>,
     ticks: u64,
     last_error: Option<String>,
 }
@@ -245,6 +267,7 @@ impl Scheduler {
             no_progress: HashMap::new(),
             recovered: false,
             last_parked_sweep: None,
+            rate_limit_pause: None,
             ticks: 0,
             last_error: None,
         }
@@ -320,10 +343,32 @@ impl Scheduler {
         }
 
         self.sweep_parked()?;
+
+        // Checked after the housekeeping above and before the two dispatch steps it guards:
+        // reclaiming a closed parked issue's workspace has nothing to do with the account being
+        // throttled, but starting a new agent does. Clears itself the moment `resets_at` has
+        // passed, so a tick that finds the window already reset needs no separate step
+        // remembering to un-pause (#37).
+        if self.rate_limited() {
+            self.publish()?;
+            return Ok(());
+        }
+
         self.dispatch_due_retries()?;
         self.dispatch_new()?;
         self.publish()?;
         Ok(())
+    }
+
+    /// True while dispatch is paused for an account-wide rate limit that has not yet lifted.
+    fn rate_limited(&mut self) -> bool {
+        let Some(p) = &self.rate_limit_pause else { return false };
+        if self.clock.wall().0 >= p.resets_at {
+            tracing::info!(kind = %p.kind, "rate limit window reset; resuming dispatch");
+            self.rate_limit_pause = None;
+            return false;
+        }
+        true
     }
 
     // ---- startup recovery ----------------------------------------------------
@@ -429,6 +474,30 @@ impl Scheduler {
         for (issue_id, outcome) in done {
             let mut r = self.running.remove(&issue_id).expect("just listed");
 
+            // Checked before the outcome is looked at all: the CLI's own verdict for a run cut
+            // short this way is ordinarily `Failed`, but that failure is the account's, not this
+            // issue's, so it must never reach `apply_outcome` — no attempt charged, no
+            // quarantine streak, and no `ErrorClass` (#37). A `resets_at` that is missing or
+            // already past cannot be trusted to pause anything, so that case falls through to
+            // the ordinary outcome below rather than risking a pause nothing ever lifts.
+            if let Some(sig) = r.handle.rate_limit() {
+                let now = self.clock.wall().0;
+                let resets_at_ms = sig.resets_at.map(|secs| secs.saturating_mul(1_000));
+                match resets_at_ms {
+                    Some(at) if at > now => {
+                        self.pause_for_rate_limit(&issue_id, &r, sig.kind, at)?;
+                        continue;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            issue_id, kind = %sig.kind, resets_at = ?sig.resets_at,
+                            "rate limit event carried no usable resets_at; \
+                             falling back to ordinary backoff"
+                        );
+                    }
+                }
+            }
+
             if outcome == Outcome::Done {
                 // Now, and not when delivery applies them: the gate below rebases the branch,
                 // and a rebase rewrites the very shas these verdicts name. Checked against the
@@ -479,6 +548,34 @@ impl Scheduler {
             self.store.add_turns(&issue_id, p.turns)?;
             self.apply_outcome(&issue_id, &r, outcome)?;
         }
+        Ok(())
+    }
+
+    /// An account-wide rate limit interrupted this run rather than the run failing on its own
+    /// account, so the claim is released exactly as it was found
+    /// (`Store::release_for_rate_limit`, not `release`) — the issue resumes at the attempt and
+    /// session it was already on once the pause lifts. `resets_at_ms` widens rather than
+    /// replaces an existing pause, in case two runs interrupted by the same account-wide limit
+    /// report it with a few seconds' drift between them (#37).
+    fn pause_for_rate_limit(
+        &mut self,
+        issue_id: &str,
+        r: &Running,
+        kind: String,
+        resets_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let p = r.handle.progress();
+        self.store.finish_run(self.clock.as_ref(), &r.run_id, "rate_limited", p.turns, p.tokens)?;
+        self.store.add_turns(issue_id, p.turns)?;
+        self.store.release_for_rate_limit(self.clock.as_ref(), issue_id)?;
+
+        let resets_at =
+            self.rate_limit_pause.as_ref().map_or(resets_at_ms, |p| p.resets_at.max(resets_at_ms));
+        tracing::warn!(
+            issue_id, identifier = %r.issue.identifier, kind, resets_at,
+            "account-wide rate limit; pausing dispatch until it resets"
+        );
+        self.rate_limit_pause = Some(RateLimitPause { kind, resets_at });
         Ok(())
     }
 
@@ -1467,6 +1564,7 @@ impl Scheduler {
             ticks: self.ticks,
             last_tick_at: Some(now_wall),
             last_error: self.last_error.clone(),
+            rate_limit_pause: self.rate_limit_pause.clone(),
             rows,
         })
     }

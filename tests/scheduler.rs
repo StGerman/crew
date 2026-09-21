@@ -20,8 +20,8 @@ use symphony_cc::store::Store;
 use symphony_cc::tracker::TrackerError;
 use symphony_cc::tracker::fake::FakeTracker;
 use symphony_cc::transcript::Transcripts;
-use symphony_cc::worker::Session;
 use symphony_cc::worker::fake::{FakeWorker, Script};
+use symphony_cc::worker::{RateLimitSignal, Session};
 use symphony_cc::workspace::{DirWorkspace, GitWorktreeWorkspace, Workspace};
 
 struct Harness {
@@ -639,6 +639,145 @@ fn the_per_issue_turn_budget_stops_an_endless_continuation() {
         "budget should have been reached, saw {}",
         st.cumulative_turns
     );
+}
+
+// ---- account-wide rate limit (#37) -------------------------------------------
+
+/// The CLI's own account-wide rate limit is not any one issue's failure. Every issue it
+/// interrupts must resume at the attempt it was already on rather than being quarantined, and
+/// it is dispatch itself — not any one issue's retry timer — that pauses until the window
+/// resets.
+#[test]
+fn a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupted() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    let resets_at_secs = h.clock.wall().0 / 1_000 + 60;
+    h.worker.set_default(
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed {
+                class: ErrorClass::AgentCrash,
+                msg: "session limit".into(),
+            })
+            .with_rate_limit(RateLimitSignal {
+                kind: "five_hour".into(),
+                resets_at: Some(resets_at_secs),
+            }),
+    );
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 2);
+    let first_sessions: Vec<_> =
+        ["iss-1", "iss-2"].iter().map(|id| h.worker.sessions_for(id)[0].clone()).collect();
+
+    // The interruption itself: both runs end on the rejected limit.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0);
+
+    for id in ["iss-1", "iss-2"] {
+        let st = h.sched.store().get(id).unwrap().unwrap();
+        assert_eq!(st.attempt, 0, "{id} must not be charged an attempt");
+        assert_eq!(st.consecutive_fail, 0, "{id} must not accrue the identical-failure streak");
+        assert!(!st.is_quarantined(), "{id} must not be quarantined");
+        assert_eq!(st.phase, Phase::Released, "{id} must be dispatchable again, not parked");
+    }
+    assert!(
+        h.sched.store().all_retries().unwrap().is_empty(),
+        "no per-issue retry timer owns this — dispatch itself is what pauses"
+    );
+
+    let pause = h.sched.snapshot().unwrap().rate_limit_pause.expect("the pause must be published");
+    assert_eq!(pause.kind, "five_hour");
+
+    // Before the reset: dispatch stays paused, account-wide.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "still paused before the reset");
+
+    // Past the reset: both issues are dispatchable again, resuming their sessions.
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 2, "dispatch resumes once the window resets");
+    assert!(h.sched.snapshot().unwrap().rate_limit_pause.is_none());
+
+    for (id, first) in [("iss-1", &first_sessions[0]), ("iss-2", &first_sessions[1])] {
+        let seen = h.worker.sessions_for(id);
+        assert_eq!(seen.len(), 2, "{id}: {seen:?}");
+        assert_eq!(
+            seen[1],
+            Session::Resume(first.id().to_string()),
+            "{id} resumes the conversation the interrupted attempt started"
+        );
+    }
+}
+
+/// What is throttled is the agent's own CLI, not this orchestrator's other work: killing a run
+/// that is mid-edit to react to a limit one *other* issue hit would cost work for nothing.
+#[test]
+fn a_rate_limit_pause_does_not_disturb_runs_already_in_flight() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |_| {});
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed {
+                class: ErrorClass::AgentCrash,
+                msg: "session limit".into(),
+            })
+            .with_rate_limit(RateLimitSignal {
+                kind: "five_hour".into(),
+                resets_at: Some(h.clock.wall().0 / 1_000 + 60),
+            }),
+    );
+    // Still running when iss-1 is interrupted, and past the pause's own duration.
+    h.worker.script("iss-2", Script::succeeds_in(10_000));
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 2);
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // iss-1 is interrupted and pauses dispatch
+    assert_eq!(h.sched.running_count(), 1, "the run already in flight must survive the pause");
+    assert_eq!(h.sched.store().get("iss-2").unwrap().unwrap().phase, Phase::Running);
+
+    // iss-2 finishes on its own power while dispatch is still paused — reconciliation is not
+    // what the pause gates, only new dispatch is.
+    h.clock.advance_ms(9_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0);
+    assert_eq!(h.sched.store().get("iss-2").unwrap().unwrap().phase, Phase::Released);
+    assert!(h.sched.snapshot().unwrap().rate_limit_pause.is_some(), "the pause itself outlives it");
+}
+
+/// A `resets_at` the scheduler cannot trust — missing, or already behind the clock — must not
+/// be able to stop dispatch permanently. A clock the host disagrees with is exactly the case
+/// this has to survive, so both degrade to the ordinary failure path instead of pausing on a
+/// value that would never lift.
+#[test]
+fn a_rate_limit_with_no_usable_resets_at_degrades_to_ordinary_backoff() {
+    for resets_at in [None, Some(1)] {
+        let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+        h.worker.set_default(
+            Script::succeeds_in(1_000)
+                .with_outcome(Outcome::Failed {
+                    class: ErrorClass::AgentCrash,
+                    msg: "session limit".into(),
+                })
+                .with_rate_limit(RateLimitSignal { kind: "five_hour".into(), resets_at }),
+        );
+
+        h.sched.tick().unwrap();
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+
+        assert!(
+            h.sched.snapshot().unwrap().rate_limit_pause.is_none(),
+            "resets_at {resets_at:?} must not pause anything"
+        );
+        let st = h.sched.store().get("iss-1").unwrap().unwrap();
+        assert_eq!(st.attempt, 1, "resets_at {resets_at:?} falls back to charging the attempt");
+        assert!(!h.sched.store().all_retries().unwrap().is_empty(), "an ordinary retry is queued");
+    }
 }
 
 // ---- handoff gate -----------------------------------------------------------
