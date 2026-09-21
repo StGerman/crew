@@ -62,8 +62,10 @@ enabled = true
 max_calls_per_run = 10
 max_calls_per_issue = 40
 
-# Inspect a headless run without attaching a terminal:
-#   curl -s localhost:8787/api/v1/snapshot | jq '.rows[] | {identifier, phase, turns}'
+# Inspect a headless run without attaching a terminal. `status` reads `bind` out of this file,
+# so neither command needs the port repeated to it:
+#   symphony-cc --config symphony.github.toml status
+#   symphony-cc --config symphony.github.toml status 24
 [api]
 enabled = true
 bind = "127.0.0.1:8787"

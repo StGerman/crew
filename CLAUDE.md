@@ -17,12 +17,12 @@ Slices 1–6 are complete and green: a deterministic core with a fake behind eve
 seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
 Issues tracker, then a real `claude -p` worker, then a host-side MCP tool broker that lets the
 agent write to its own ticket without ever holding the credential, and an HTTP ops API over
-the published snapshot.
+the published snapshot with a `status` client in front of it.
 
 ## Commands
 
 ```bash
-cargo test                                 # 132 unit + 37 integration
+cargo test                                 # 152 unit + 41 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -34,6 +34,8 @@ cargo fmt --check
 cargo run -- --tui                         # dashboard against the fake tracker
 cargo run -- --max-ticks 20                # headless smoke run, then exit
 cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
+cargo run -- status                        # what a running daemon is doing, read over that API
+cargo run -- status MT-649                 # one issue in full: phase, attempt, turns, cost, branch
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
@@ -127,11 +129,12 @@ have it.
    order, in `launch()`. Spawning first leaves a window where a fast-exiting worker reports
    against state that was never written.
 3. No observer reads the store. The scheduler publishes an immutable `Snapshot` over a
-   `tokio::sync::watch` channel, and the TUI and the HTTP API render that and nothing else.
-   Headless is the default and `--tui` opts in, which is what keeps the dashboard from becoming
-   load-bearing. The rule cuts both ways: an observer that needs something the snapshot does
-   not carry does not get a `Store`, it gets a new field on `Snapshot` — which is why run
-   history lives on `Row`.
+   `tokio::sync::watch` channel, and the TUI, the HTTP API and `symphony-cc status` render that
+   and nothing else. Headless is the default and `--tui` opts in, which is what keeps the
+   dashboard from becoming load-bearing. The rule cuts both ways: an observer that needs
+   something the snapshot does not carry does not get a `Store`, it gets a new field on
+   `Snapshot` — which is why run history lives on `Row`, and why `Row.branch` was added when
+   the status client needed it rather than having the client ask git.
 4. The projection is one-way ([src/project.rs](src/project.rs)). The orchestrator writes to
    `~/.claude/tasks` and never reads it back for a scheduling decision — it is Claude Code's
    internal store with no published schema, so a change there must cost a dashboard, not the
@@ -163,7 +166,13 @@ behind: `remove` deletes the worktree but only deletes the branch when git's own
 says it carries nothing `repo`'s HEAD does not already have, and `prepare` attaches to an
 existing branch that does carry commits rather than `-B`-resetting it. Cleanup is triggered by
 a ticket reaching a terminal state, and closing a ticket is not a decision to throw away the
-work done under it. `Prepared.branch` reports that name upwards so it reaches the dispatch log.
+work done under it. `Prepared.branch` reports that name upwards so it reaches the dispatch log, and
+`Workspace::branch_for` — pure naming, like `path_for` — answers the same question for the
+snapshot. Naming rather than probing is what lets a *finished* run still report its branch,
+which is when a reviewer wants it; asking git per row per tick would put a subprocess on the
+snapshot path. `Row.branch` is `None` until an issue has been dispatched at least once, because
+before that the name is a prediction and pointing an operator at a ref nobody wrote is worse
+than saying nothing.
 
 `Tracker` gets its third implementation in [src/tracker/github.rs](src/tracker/github.rs):
 `GithubTracker<H: Http>`, generic over a small `Http` seam (`FakeHttp` in tests, `UreqHttp` —
@@ -284,12 +293,35 @@ the guard lives in `Store::unquarantine`'s `WHERE` clause, because an unconditio
 would reset a *running* issue's phase to `released` and let the next tick dispatch a second
 agent onto its worktree.
 
+`symphony-cc status` ([src/api/client.rs](src/api/client.rs), rendered by
+[src/api/render.rs](src/api/render.rs)) is the other end, and it exists because the API on its
+own was not enough: it had been able to answer for hours at the moment diagnosis instead went
+to a block-buffered log file and got the wrong answer (#24). Nothing was missing server-side —
+what was missing was something to type. So it is a client and nothing else. `run_status`
+returns before any of `main`'s setup, holding no `Store`, no worktree and no tracker
+credential: an operator asking what is running must not be able to disturb it, and a second
+process on `symphony.db` while the daemon holds it would be exactly that. It shares `Snapshot`
+and `Row` with the server instead of re-describing them, so a renamed field fails the build
+rather than rendering a blank column, and it reuses the dashboard's `fmt_count`/`fmt_ms`/
+`Phase::label` so a duration means the same thing on all three surfaces.
+
+Two behaviours there are load-bearing and easy to "simplify" away. It finds the daemon itself —
+`--api`, then `[api] bind`, then `DEFAULT_API_BIND` — and reads the config *leniently* rather
+than through `Config::load`, because that runs `preflight`, and preflight gates dispatch: an
+unset `tracker.owner` is a real problem for the daemon and none at all for a client asking what
+the daemon is doing. And `StatusError` keeps apart the two failures that a stack trace makes
+look identical: nothing listening (no daemon — or one with its API off, which is the default
+and so the likelier reading) versus a daemon that answered and refused. Collapsing those is
+what has somebody restart a daemon that was never down, so each message names the address
+tried, where that address came from, and the way out.
+
 ## Invariants
 
-Each of these closes a defect found in the original spec — bar the last seven, which came from
+Each of these closes a defect found in the original spec — bar the last nine, which came from
 dogfooding this orchestrator against its own backlog: two from the first review, two from putting
 an operator surface on top of the same state, one from issue #1's acceptance criterion made
-executable, one from the first live dispatch, and one from the review of that one — and each has
+executable, one from the first live dispatch, one from the review of that one, and two from
+putting a client in front of that operator surface — and each has
 a test that fails without it. Several only fail in
 the exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
@@ -314,6 +346,8 @@ reading — check the named test is still meaningful, not just still green.
 | The projection cannot become load-bearing | `publish` logs a projector error and returns `Ok`; nothing written is ever read back | `the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off` |
 | A killed run cannot record a fabricated cost | totals are read only from the `result` event; a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total` |
 | A half-applied migration cannot stop the store opening | each migration and the `user_version` bump that records it commit in one transaction | `a_migration_that_fails_partway_leaves_no_trace_and_does_not_advance_the_version` |
+| "No daemon" is never confused with "daemon said no" | `StatusError` splits a refused connection from a refused request, and names the address and its source in both | `a_closed_port_reads_as_no_daemon_rather_than_a_refused_request` |
+| The branch an operator is sent to is the one git checked out | `Workspace::branch_for` is the same naming function `prepare` uses, not a second spelling of it | `the_branch_the_snapshot_publishes_is_the_one_prepare_checks_out` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the

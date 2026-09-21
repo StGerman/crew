@@ -39,6 +39,10 @@ max_calls_per_issue = 100
 # The ops HTTP surface, off unless asked for — `--api 127.0.0.1:8787` flips it for one run
 # without editing this file. `POST /refresh` and `POST /unquarantine` control agent execution,
 # so a non-loopback `bind` additionally needs `allow_public = true`.
+#
+# `bind` is also where `symphony-cc status` looks, so a client run from this directory needs no
+# address of its own. Turning `enabled` on is what makes that work: with it off there is nothing
+# listening, and `status` says so rather than guessing the daemon is down.
 [api]
 enabled = false
 bind = "127.0.0.1:8787"
