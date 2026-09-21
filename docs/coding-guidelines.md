@@ -108,6 +108,15 @@ this file.
   `EXP_CAP` in [src/sched/retry.rs](../src/sched/retry.rs), which names the overflow it
   prevents, is the model. Check: review. The reviewing agent deletes any comment that fails the
   test and does not ask first.
+- **MUST** re-read every comment attached to code you change, and delete any that fails the
+  rule above. The check is not optional and not deferred: a comment above, beside or inside the
+  function you edit is part of the edit. If the comment still holds, leave it; if the code
+  moved and the comment now describes the old code, rewrite it or delete it; if it only
+  restates the code, delete it. Do not ask, do not leave a `TODO`, do not keep it "for
+  context". Why: a comment is never checked by the compiler, so an edit is the only moment
+  anyone looks at it, and a stale comment left behind is the next agent's wrong assumption.
+  Check: review. The reviewing agent treats a stale or restating comment inside the diff's
+  context lines as a defect of the PR, not of the original author.
 - **MUST** state the failure mode a comment guards against, in the first sentence. Why: the
   next agent to touch the line needs to know what breaks if it is removed, not how it works.
   Example: the module doc of [src/transcript.rs](../src/transcript.rs) opens each load-bearing
