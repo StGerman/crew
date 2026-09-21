@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**MUST follow: [docs/coding-guidelines.md](docs/coding-guidelines.md).** Read it before the
+first edit. It is the authoritative statement of how code is written here, with a check named
+for every rule. This file covers what the system is and why; that file covers how to change it.
+
 ## What this is
 
 `symphony-cc` is a tracker-driven orchestrator for Claude Code agents: a daemon that polls an
@@ -601,15 +605,7 @@ all of it rediscovering that.
 
 ## Conventions
 
-- **Test names are sentences asserting the invariant**, not `test_foo`. If you cannot name
-  what a test defends, it probably is not defending anything.
-- **Comments carry the why**, usually which failure mode is being avoided. The what is in the
-  code. Match the surrounding density — this codebase comments decisions, not lines.
-- `max_width = 100`, `use_small_heuristics = "Max"` ([rustfmt.toml](rustfmt.toml)). Run
-  `cargo fmt` rather than hand-wrapping; it makes different choices than you will.
-- New external effects get a trait and a fake in the same commit, or the scheduler tests stop
-  being able to reach the new code path.
-- Rust edition 2024 — let-chains (`if x && let Some(y) = z`) are available and used.
+See [docs/coding-guidelines.md](docs/coding-guidelines.md), linked at the top of this file.
 
 ## Dogfooding
 
