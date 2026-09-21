@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::forge::{ForgeError, Published, Publisher};
-use crate::model::worktree_key;
+use crate::model::{looks_like_commit, worktree_key};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -521,6 +521,23 @@ impl Publisher for GitWorktreeWorkspace {
             })
         });
         Ok(nearest.map(|s| s.to_string()))
+    }
+
+    fn carries(&self, worktree: &Path, branch: &str, sha: &str) -> Result<bool, ForgeError> {
+        // Shape first, so a bare acknowledgement never reaches git as a revision expression —
+        // `fixed` is not a ref, but `HEAD` or `@{-1}` would be, and an agent's text is input.
+        if !looks_like_commit(sha) {
+            return Ok(false);
+        }
+        self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        // Existence before ancestry: `merge-base --is-ancestor` fails the same way for a commit
+        // that is not an ancestor and for a name that resolves to nothing, and only the first
+        // of those is a fact about the branch.
+        let object = format!("{sha}^{{commit}}");
+        if Self::git(worktree, &["rev-parse", "--verify", "--quiet", &object]).is_err() {
+            return Ok(false);
+        }
+        Ok(Self::git(worktree, &["merge-base", "--is-ancestor", sha, branch]).is_ok())
     }
 }
 
@@ -1233,5 +1250,36 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// Finding 5 on #47. An acceptance names the commit that resolved the comment, and the
+    /// delivered branch is what that claim is checked against: a commit on the base only, a
+    /// sha that resolves to nothing, or a word that is no sha at all is not an acceptance.
+    #[test]
+    fn an_acceptance_is_believed_only_for_a_commit_the_delivered_branch_carries() {
+        let root = tmp_root("wt-carries");
+        let repo = tmp_repo("wt-carries");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the fix");
+        let on_branch = head_of(&p.path);
+        let abbreviated = on_branch[..7].to_string();
+        // A real commit that is not on the branch: main moves on without it.
+        std::fs::write(repo.join("main.txt"), b"elsewhere").unwrap();
+        git_out(&repo, &["add", "main.txt"]).unwrap();
+        git_out(&repo, &["commit", "-q", "-m", "on main only"]).unwrap();
+        let on_main = git_out(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        assert!(ws.carries(&p.path, &branch, &on_branch).unwrap());
+        assert!(ws.carries(&p.path, &branch, &abbreviated).unwrap(), "abbreviated is still it");
+        assert!(!ws.carries(&p.path, &branch, &on_main).unwrap(), "a commit the branch lacks");
+        assert!(!ws.carries(&p.path, &branch, "deadbeefdeadbeef").unwrap(), "resolves to nothing");
+        assert!(!ws.carries(&p.path, &branch, "fixed").unwrap(), "not a commit at all");
+        assert!(!ws.carries(&p.path, &branch, "HEAD").unwrap(), "a ref is not a commit named");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }

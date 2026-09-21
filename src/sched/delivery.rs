@@ -575,6 +575,61 @@ impl Scheduler {
         }
     }
 
+    /// The run's verdicts as delivery will apply them: every acceptance that names a commit the
+    /// branch does not carry is dropped, and its comment stays outstanding.
+    ///
+    /// An acceptance's detail is the commit that resolved the comment — that is what the reply
+    /// on the thread will say — so a detail that is no commit of this branch's is a bare
+    /// acknowledgement in the accepted form, and recording it would tell the reviewer a fix
+    /// exists where none does. Called from `harvest_finished` at the moment the run ends,
+    /// before the gate's rebase rewrites the shas; a repository that cannot be asked leaves
+    /// the comment outstanding too, because "could not check" is not "on the branch".
+    pub(super) fn verified_verdicts(
+        &self,
+        issue_id: &str,
+        worktree: &std::path::Path,
+        verdicts: Vec<ReviewVerdict>,
+    ) -> Vec<ReviewVerdict> {
+        if !self.delivery_on() || !verdicts.iter().any(|v| v.verdict == Verdict::Accepted) {
+            return verdicts;
+        }
+        let branch = match self.store.get(issue_id) {
+            Ok(st) => st.and_then(|s| s.branch),
+            Err(e) => {
+                tracing::warn!(issue_id, error = %e, "could not read the branch to check verdicts against");
+                None
+            }
+        };
+        // No branch means nothing will be delivered, so nothing here will be applied either.
+        let Some(branch) = branch else { return verdicts };
+        let publisher = self.publisher.clone().expect("checked by delivery_on");
+        verdicts
+            .into_iter()
+            .filter(|v| {
+                if v.verdict != Verdict::Accepted {
+                    return true;
+                }
+                match publisher.carries(worktree, &branch, &v.detail) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        tracing::warn!(
+                            issue_id, comment = %v.comment_id, detail = %v.detail, branch,
+                            "acceptance names a commit the branch does not carry; the comment stays outstanding"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            issue_id, comment = %v.comment_id, detail = %v.detail, error = %e,
+                            "could not check the commit an acceptance names; the comment stays outstanding"
+                        );
+                        false
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// The pull request's title and body, derived from the run record — never composed by the
     /// agent. What a reviewer needs first is what the issue asked for and what the branch
     /// actually contains; both are facts the orchestrator holds and the agent could only

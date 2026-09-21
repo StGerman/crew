@@ -68,6 +68,10 @@ struct Inner {
     /// Every branch `publish` has pushed. The fake stands in for the remote too, so this is
     /// what "exists on the remote" means to `stacked_on`.
     published: HashSet<String>,
+    /// The commits the delivered branch carries, for `carries`. `None` — the default — answers
+    /// yes to every sha, so a test that is not about acceptance can name any commit it likes;
+    /// a test that is about it scripts the set.
+    on_branch: Option<HashSet<String>>,
     fail: Option<ForgeError>,
     /// Makes `reply` alone fail: the network dropping exactly the write that carries a verdict
     /// to its reviewer, while every read still answers.
@@ -159,6 +163,11 @@ impl FakeForge {
     /// Make every call fail until cleared.
     pub fn fail_with(&self, e: Option<ForgeError>) {
         self.inner.lock().unwrap().fail = e;
+    }
+
+    /// Script which commits the delivered branch carries; `None` restores "all of them".
+    pub fn set_commits_on_branch(&self, shas: Option<Vec<String>>) {
+        self.inner.lock().unwrap().on_branch = shas.map(|v| v.into_iter().collect());
     }
 
     /// Make only `reply` fail until cleared.
@@ -258,6 +267,12 @@ impl Publisher for FakeForge {
         // The scripted answer holds only for a candidate the scheduler offered *and* a branch
         // this fake has seen pushed — the same two conditions the real remote imposes.
         Ok(g.stacked_on.clone().filter(|b| candidates.contains(b) && g.published.contains(b)))
+    }
+
+    fn carries(&self, _worktree: &Path, _branch: &str, sha: &str) -> Result<bool, ForgeError> {
+        let g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        Ok(g.on_branch.as_ref().is_none_or(|set| set.contains(sha)))
     }
 }
 

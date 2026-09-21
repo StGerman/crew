@@ -196,4 +196,12 @@ pub trait Publisher: Send + Sync {
         base: &str,
         candidates: &[String],
     ) -> Result<Option<String>, ForgeError>;
+
+    /// Whether `sha` names a commit that `branch` carries. What an accepted review verdict is
+    /// checked against before it is believed: an acceptance names the commit that resolved the
+    /// comment, and one naming a commit the branch does not have — invented, or from somewhere
+    /// else — is a bare acknowledgement dressed up, so its comment stays outstanding. `false`
+    /// for anything that is not a commit at all; an error only for a repository that could not
+    /// be asked.
+    fn carries(&self, worktree: &Path, branch: &str, sha: &str) -> Result<bool, ForgeError>;
 }

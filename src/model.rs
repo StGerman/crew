@@ -228,6 +228,14 @@ impl Feedback {
     }
 }
 
+/// Whether `s` is shaped like a git commit: an abbreviated or full hex object name, and nothing
+/// else. The test an acceptance's detail has to pass before anything treats it as the commit it
+/// claims to be — `fixed`, `see above` and `commit abc1234` all fail it. Shape only; whether
+/// the commit exists, and is on the branch delivered, is git's to answer.
+pub fn looks_like_commit(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// The agent's settlement of one review comment. Either a fix, named by the commit that
 /// carries it, or a refusal, named by its reason — never a bare acknowledgement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

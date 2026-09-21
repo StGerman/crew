@@ -2195,6 +2195,58 @@ fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
     assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready);
 }
 
+/// Finding 5 on #47, the half the parser cannot do: `deadbee` is shaped like a commit, and only
+/// the branch can say it is not one of its. An acceptance naming it is not recorded and not
+/// posted; the comment stays open and goes round again, named as one the agent left unanswered.
+#[test]
+fn an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_outstanding() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let real = forge.add_comment(pr, "Copilot", "src/a.rs", "handle the empty case");
+    let bogus = forge.add_comment(pr, "Copilot", "src/b.rs", "this leaks the handle");
+    forge.set_commits_on_branch(Some(vec!["abc1234".into()]));
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![
+        ReviewVerdict {
+            comment_id: real.clone(),
+            verdict: Verdict::Accepted,
+            detail: "abc1234".into(),
+        },
+        ReviewVerdict {
+            comment_id: bogus.clone(),
+            verdict: Verdict::Accepted,
+            detail: "deadbee".into(),
+        },
+    ]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let verdicts = h.sched.store().verdicts_for("iss-1").unwrap();
+    assert_eq!(verdicts[&real].0, Verdict::Accepted, "a commit the branch carries is believed");
+    assert!(!verdicts.contains_key(&bogus), "one it does not is not: {verdicts:?}");
+    assert_eq!(forge.replies_to(pr, &real).len(), 1);
+    assert!(forge.replies_to(pr, &bogus).is_empty(), "and nobody is told it was resolved");
+
+    // The comment is still open, so it goes back to an agent — as one it already left hanging.
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Redispatched, "{d:?}");
+    assert_eq!(d.rounds_pr, 2);
+    match &h.worker.feedback_for("iss-1")[2] {
+        Some(Feedback::Review { comments, unanswered_before, .. }) => {
+            let ids: Vec<&str> = comments.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(ids, vec![bogus.as_str()], "only the unsettled comment is handed back");
+            assert_eq!(unanswered_before, &vec![bogus.clone()], "named as left unanswered");
+        }
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+}
+
 /// The new runaway, bounded. A reviewer that comments on every push, answered by an agent
 /// that pushes, would loop forever; every hand-back is a round and the two bounds hold across
 /// a restart and across a fresh pull request.

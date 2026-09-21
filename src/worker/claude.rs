@@ -92,7 +92,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
-use crate::model::{ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict};
+use crate::model::{
+    ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict, looks_like_commit,
+};
 use crate::transcript::TranscriptWriter;
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
@@ -520,6 +522,11 @@ fn extract_marker(text: &str, kind: &str) -> Option<String> {
 /// Every well-formed `SYMPHONY_REVIEW: <id>: <accepted|rejected>: <detail>` line in the final
 /// text. Malformed lines are skipped rather than failing the run: the run's own outcome does not
 /// depend on this, and a comment left unsettled stays outstanding, which is the safe reading.
+///
+/// An acceptance is well-formed only when its detail is shaped like a commit. `accepted: fixed`
+/// is a bare acknowledgement wearing the accepted form, and recording it would post "resolved
+/// in fixed" to a reviewer; whether the commit named is actually on the branch is the
+/// scheduler's to check, with the worktree in hand, when the run ends.
 fn extract_verdicts(text: &str) -> Vec<ReviewVerdict> {
     text.lines()
         .filter_map(|l| {
@@ -530,6 +537,9 @@ fn extract_verdicts(text: &str) -> Vec<ReviewVerdict> {
             let id = id.trim();
             let detail = detail.trim();
             if id.is_empty() || detail.is_empty() {
+                return None;
+            }
+            if verdict == Verdict::Accepted && !looks_like_commit(detail) {
                 return None;
             }
             Some(ReviewVerdict { comment_id: id.to_string(), verdict, detail: detail.to_string() })
@@ -862,7 +872,7 @@ mod tests {
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let v = h.verdicts();
-        assert_eq!(v.len(), 2, "two well-formed lines, one malformed: {v:?}");
+        assert_eq!(v.len(), 2, "two well-formed lines, one malformed, one bare acceptance: {v:?}");
         assert_eq!(v[0].comment_id, "4059939692");
         assert_eq!(v[0].verdict, Verdict::Accepted);
         assert_eq!(v[0].detail, "a1b2c3d", "an accepted verdict names the resolving commit");
@@ -872,8 +882,31 @@ mod tests {
             !v.iter().any(|x| x.comment_id == "4059939694"),
             "a line with no verdict must leave its comment outstanding, not invent one"
         );
+        assert!(
+            !v.iter().any(|x| x.comment_id == "4059939695"),
+            "an acceptance that names no commit is not an acceptance"
+        );
 
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// Finding 5 on #47. An acceptance needed only a non-empty detail, so `accepted: fixed`
+    /// was stored and posted as though it named the commit carrying the fix. The module's own
+    /// invariant is that acceptance records a commit and never a bare acknowledgement.
+    #[test]
+    fn an_acceptance_that_names_no_commit_leaves_its_comment_outstanding() {
+        let v = extract_verdicts(
+            "SYMPHONY_REVIEW: 1: accepted: fixed\n\
+             SYMPHONY_REVIEW: 2: accepted: a1b2c3d\n\
+             SYMPHONY_REVIEW: 3: accepted: see commit a1b2c3d\n\
+             SYMPHONY_REVIEW: 4: accepted: 0123456789abcdef0123456789abcdef01234567\n\
+             SYMPHONY_REVIEW: 5: rejected: fixed\n",
+        );
+        let ids: Vec<&str> = v.iter().map(|x| x.comment_id.as_str()).collect();
+        assert_eq!(ids, vec!["2", "4", "5"], "{v:?}");
+        assert!(v.iter().all(|x| x.verdict != Verdict::Accepted || looks_like_commit(&x.detail)));
+        // A rejection's detail is a reason, and "fixed" is a poor one but not a forged commit.
+        assert_eq!(v[2].verdict, Verdict::Rejected);
     }
 
     #[test]
