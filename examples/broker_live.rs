@@ -81,12 +81,26 @@ fn main() -> anyhow::Result<()> {
         DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
         10,
     );
+    // A real transcript for a real run: this is the one place in the crate where the stream
+    // comes from the actual CLI, so it is also the best place to see what a transcript of one
+    // looks like.
+    let transcripts = symphony_cc::transcript::Transcripts::new(
+        &std::env::temp_dir().join("symphony-live-transcripts"),
+        8 << 20,
+        10,
+    )?;
+    let transcript = transcripts.open("broker-live");
+    if let Some(t) = &transcript {
+        println!("transcript: {}", t.path().display());
+    }
+
     let handle = worker.spawn(
         &issue,
         &workspace,
         0,
         &Session::New(symphony_cc::model::session_id("live", 1)),
         Some(session.endpoint()),
+        transcript,
     );
 
     let deadline = Instant::now() + Duration::from_secs(180);

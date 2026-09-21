@@ -69,3 +69,12 @@ max_calls_per_issue = 40
 [api]
 enabled = true
 bind = "127.0.0.1:8787"
+# Per-run transcripts (src/transcript.rs). Worth more here than against the demo tracker: this
+# is the config that dispatches real agents, and the run you need to explain afterwards is the
+# one whose scrollback is already gone. `stall_timeout_ms` above means a wedged run can sit in
+# `keep_runs` for a long time — retention never deletes a live run's own file, so a low bound
+# costs finished runs, not the one being diagnosed.
+[transcripts]
+enabled = true
+max_bytes_per_run = 8388608
+keep_runs = 50

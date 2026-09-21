@@ -69,6 +69,9 @@ pub struct RunRecord {
     /// crashed, or cut off by the session turn budget. Not zero: unknown.
     pub in_tok: Option<u64>,
     pub out_tok: Option<u64>,
+    /// Path to this run's raw event stream, when one was written. How an operator gets from
+    /// "run X went wrong" to the bytes it produced, without knowing where transcripts are kept.
+    pub transcript: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,17 +489,28 @@ impl Store {
         Ok(())
     }
 
+    /// `transcript` is recorded here, before the worker exists, for the same reason the claim
+    /// and the session name are: a run that dies in its first second is exactly the one someone
+    /// will want the bytes from, and the child cannot be what records where they went.
     pub fn start_run(
         &self,
         clock: &dyn Clock,
         run_id: &str,
         issue_id: &str,
         session_id: &str,
+        transcript: Option<&Path>,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO run (run_id, issue_id, started_at, session_id) VALUES (?1, ?2, ?3, ?4)",
-            params![run_id, issue_id, clock.wall().0, session_id],
+            "INSERT INTO run (run_id, issue_id, started_at, session_id, transcript)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                issue_id,
+                clock.wall().0,
+                session_id,
+                transcript.map(|p| p.display().to_string())
+            ],
         )?;
         Ok(())
     }
@@ -504,6 +518,48 @@ impl Store {
     /// `tokens` is `None` for a run that ended without reporting a total — killed, crashed, or
     /// cut off by the turn budget. It is stored as NULL, never as zero: a zero would read as a
     /// free run in every sum, and a run that was killed mid-stream is not free, it is uncounted.
+    /// One run by id — the "show me what run X did" lookup.
+    pub fn run(&self, run_id: &str) -> rusqlite::Result<Option<RunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id, turns, in_tok,
+                    out_tok, transcript
+             FROM run WHERE run_id = ?1",
+            params![run_id],
+            run_record,
+        )
+        .optional()
+    }
+
+    /// An issue's runs, newest first.
+    pub fn runs_for(&self, issue_id: &str) -> rusqlite::Result<Vec<RunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id, turns, in_tok,
+                    out_tok, transcript
+             FROM run WHERE issue_id = ?1 ORDER BY started_at DESC",
+        )?;
+        let rows = stmt.query_map(params![issue_id], run_record)?;
+        rows.collect()
+    }
+
+    /// The most recent transcript path per issue, for the dashboard.
+    ///
+    /// Ordered oldest-first so the newest run for each issue is the last write into the map —
+    /// one scan rather than a correlated subquery, which at this scale is the cheaper of the
+    /// two to read.
+    pub fn latest_transcripts(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT issue_id, transcript FROM run
+             WHERE transcript IS NOT NULL ORDER BY started_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
     pub fn finish_run(
         &self,
         clock: &dyn Clock,
@@ -537,7 +593,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, issue_id, started_at, ended_at, outcome, session_id,
-                    turns, in_tok, out_tok
+                    turns, in_tok, out_tok, transcript
              FROM (SELECT *, ROW_NUMBER() OVER (
                        PARTITION BY issue_id ORDER BY started_at DESC, run_id DESC) AS rn
                    FROM run)
@@ -555,6 +611,7 @@ impl Store {
                 turns: r.get::<_, i64>(6)? as u32,
                 in_tok: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
                 out_tok: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                transcript: r.get(9)?,
             })
         })?;
         rows.collect()
@@ -591,6 +648,21 @@ pub struct TokenTotals {
     pub counted: TokenUsage,
     /// Finished runs that reported none. Each is real spend the sum does not include.
     pub uncounted_runs: u64,
+}
+
+fn run_record(r: &rusqlite::Row) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        run_id: r.get(0)?,
+        issue_id: r.get(1)?,
+        started_at: r.get(2)?,
+        ended_at: r.get(3)?,
+        outcome: r.get(4)?,
+        session_id: r.get(5)?,
+        turns: r.get::<_, i64>(6)? as u32,
+        in_tok: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+        out_tok: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        transcript: r.get(9)?,
+    })
 }
 
 #[cfg(test)]
@@ -674,11 +746,11 @@ mod tests {
         s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
         for n in 1..=4 {
             c.advance_ms(1_000);
-            s.start_run(&c, &format!("run-1-{n}"), "id-1", "sess-1").unwrap();
+            s.start_run(&c, &format!("run-1-{n}"), "id-1", "sess-1", None).unwrap();
             let tok = TokenUsage { input: 10 * n as u64, output: n as u64 };
             s.finish_run(&c, &format!("run-1-{n}"), "done", n, Some(tok)).unwrap();
         }
-        s.start_run(&c, "run-2-1", "id-2", "sess-2").unwrap();
+        s.start_run(&c, "run-2-1", "id-2", "sess-2", None).unwrap();
 
         let runs = s.recent_runs(2).unwrap();
         let for_1: Vec<_> = runs.iter().filter(|r| r.issue_id == "id-1").collect();
@@ -702,7 +774,7 @@ mod tests {
     #[test]
     fn a_run_that_reported_no_total_still_appears_in_history() {
         let (s, c) = setup();
-        s.start_run(&c, "run-a", "id-1", "sess-1").unwrap();
+        s.start_run(&c, "run-a", "id-1", "sess-1", None).unwrap();
         s.finish_run(&c, "run-a", "killed", 2, None).unwrap();
 
         let runs = s.recent_runs(5).unwrap();
@@ -751,9 +823,9 @@ mod tests {
     #[test]
     fn closing_open_runs_touches_only_the_ones_still_in_flight() {
         let (s, c) = setup();
-        s.start_run(&c, "run-a", "id-1", "sess-a").unwrap();
+        s.start_run(&c, "run-a", "id-1", "sess-a", None).unwrap();
         s.finish_run(&c, "run-a", "done", 3, Some(TokenUsage { input: 10, output: 20 })).unwrap();
-        s.start_run(&c, "run-b", "id-1", "sess-b").unwrap();
+        s.start_run(&c, "run-b", "id-1", "sess-b", None).unwrap();
 
         // Only the run the kill interrupted; the one that reported for itself keeps its verdict.
         assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 1);
@@ -771,11 +843,11 @@ mod tests {
         // sum must cover exactly the first, and the uncounted tally exactly the second — an
         // in-flight run is not yet anything.
         let (s, c) = setup();
-        s.start_run(&c, "run-a", "id-1", "sess-a").unwrap();
+        s.start_run(&c, "run-a", "id-1", "sess-a", None).unwrap();
         s.finish_run(&c, "run-a", "done", 4, Some(TokenUsage { input: 300, output: 40 })).unwrap();
-        s.start_run(&c, "run-b", "id-1", "sess-b").unwrap();
+        s.start_run(&c, "run-b", "id-1", "sess-b", None).unwrap();
         s.finish_run(&c, "run-b", "killed", 2, None).unwrap();
-        s.start_run(&c, "run-c", "id-1", "sess-c").unwrap();
+        s.start_run(&c, "run-c", "id-1", "sess-c", None).unwrap();
 
         assert_eq!(
             s.token_totals().unwrap(),
@@ -813,6 +885,36 @@ mod tests {
         );
         let c = FakeClock::new();
         assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 1, "run rows survived");
+    }
+
+    #[test]
+    fn a_runs_transcript_path_is_reachable_from_its_run_record() {
+        let (s, c) = setup();
+        s.ensure(&c, "id-1", "MT-1", "MT-1-abc").unwrap();
+        let log = Path::new("/tmp/transcripts/id-1-1700-abc.jsonl");
+
+        s.start_run(&c, "run-a", "id-1", "sess-a", Some(log)).unwrap();
+        s.finish_run(&c, "run-a", "done", 3, Some(TokenUsage { input: 10, output: 20 })).unwrap();
+        c.advance_ms(1_000);
+        // A run dispatched with transcripts off still gets a row, with nothing to point at.
+        s.start_run(&c, "run-b", "id-1", "sess-b", None).unwrap();
+
+        let rec = s.run("run-a").unwrap().expect("the run was recorded");
+        assert_eq!(rec.transcript.as_deref(), Some("/tmp/transcripts/id-1-1700-abc.jsonl"));
+        assert_eq!(rec.outcome.as_deref(), Some("done"));
+        assert_eq!(rec.turns, 3);
+        assert_eq!(s.run("run-b").unwrap().unwrap().transcript, None);
+        assert_eq!(s.run("no-such-run").unwrap(), None);
+
+        let runs = s.runs_for("id-1").unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, "run-b", "newest first");
+
+        // The dashboard wants the latest per issue, not every run ever.
+        assert_eq!(
+            s.latest_transcripts().unwrap().get("id-1").map(String::as_str),
+            Some(log.to_str().unwrap())
+        );
     }
 
     #[test]

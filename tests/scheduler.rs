@@ -17,6 +17,7 @@ use symphony_cc::sched::Scheduler;
 use symphony_cc::store::Store;
 use symphony_cc::tracker::TrackerError;
 use symphony_cc::tracker::fake::FakeTracker;
+use symphony_cc::transcript::Transcripts;
 use symphony_cc::worker::Session;
 use symphony_cc::worker::fake::{FakeWorker, Script};
 use symphony_cc::workspace::{DirWorkspace, GitWorktreeWorkspace, Workspace};
@@ -99,6 +100,7 @@ fn harness_full(
         worker: Default::default(),
         broker: Default::default(),
         api: Default::default(),
+        transcripts: Default::default(),
     };
     tune(&mut cfg);
     cfg.preflight().expect("test config must be valid");
@@ -1072,4 +1074,105 @@ fn the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- transcripts ------------------------------------------------------------
+
+/// A transcript root under the harness's own directory, so it is cleaned up with it.
+fn transcript_root(h: &Harness) -> PathBuf {
+    h.root.join(".transcripts")
+}
+
+#[test]
+fn a_completed_run_leaves_a_readable_transcript_reachable_from_its_run_record() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let root = transcript_root(&h);
+    h.sched.set_transcripts(Some(Transcripts::new(&root, 1 << 20, 10).unwrap()));
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Released);
+
+    // The run record is the entry point — nobody should have to know the layout on disk.
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].outcome.as_deref(), Some("done"));
+    let path = PathBuf::from(runs[0].transcript.clone().expect("the run recorded a transcript"));
+
+    let text = std::fs::read_to_string(&path).expect("and the transcript is readable");
+    assert!(text.contains("symphony_run_start"), "got: {text}");
+    assert!(text.contains("iss-1"));
+    assert!(text.lines().count() > 1, "a transcript with only a header records nothing");
+}
+
+#[test]
+fn a_transcript_root_that_cannot_be_written_costs_the_record_and_not_the_dispatch() {
+    let h0 = harness(vec![], |_| {});
+    // A *file* where the root should be: `create_dir_all` fails, and so would every open under
+    // it. The degrade has to be silent enough that dispatch never notices.
+    std::fs::create_dir_all(&h0.root).unwrap();
+    let blocked = h0.root.join("not-a-directory");
+    std::fs::write(&blocked, b"").unwrap();
+    assert!(Transcripts::new(&blocked, 1 << 20, 10).is_err());
+    drop(h0);
+
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.sched.set_transcripts(None);
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "a missing transcript must never cost a dispatch");
+
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs[0].outcome.as_deref(), Some("done"));
+    assert_eq!(runs[0].transcript, None, "and the row says plainly that there is none");
+}
+
+/// Retention has to bound the directory without ever unlinking a file a live run is writing
+/// to — and a stalled run is both live and, by definition, the oldest file there.
+#[test]
+fn retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file() {
+    const KEEP: usize = 2;
+
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |c| {
+            c.agent.stall_timeout_ms = 3_600_000
+        });
+    let root = transcript_root(&h);
+    // Deliberately far below the number of runs this test produces, so pruning has to fire.
+    h.sched.set_transcripts(Some(Transcripts::new(&root, 1 << 20, KEEP).unwrap()));
+
+    // iss-1 goes quiet at once and never finishes — live throughout, and its file never gets a
+    // second write, so it ages to the back of the directory while the process behind it runs.
+    h.worker.script("iss-1", Script::stalls_after(0));
+    // iss-2 keeps asking for another turn, so every retry opens a fresh run and a fresh file.
+    h.worker.script(
+        "iss-2",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    let stalled =
+        PathBuf::from(h.sched.store().runs_for("iss-1").unwrap()[0].transcript.clone().unwrap());
+    assert!(stalled.exists());
+
+    // Past the escalating continuation backoff each time, so each pass really re-dispatches.
+    for _ in 0..6 {
+        h.clock.advance_ms(600_000);
+        h.sched.tick().unwrap();
+    }
+
+    let created = h.sched.store().runs_for("iss-2").unwrap().len();
+    assert!(created > KEEP + 1, "the test needs more runs than the bound: {created}");
+
+    let kept = std::fs::read_dir(&root).unwrap().count();
+    assert!(kept < created, "retention never fired: {kept} files for {created} runs");
+    // The bound, plus the one file retention is not allowed to touch.
+    assert!(kept <= KEEP + 1, "retention is not bounding the directory: {kept} files");
+    assert!(
+        stalled.exists(),
+        "a live run's transcript must survive retention, however old the file looks"
+    );
 }

@@ -14,6 +14,7 @@ pub mod project;
 pub mod sched;
 pub mod store;
 pub mod tracker;
+pub mod transcript;
 pub mod tui;
 pub mod worker;
 pub mod workspace;

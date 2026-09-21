@@ -49,6 +49,15 @@ fn d_calls_per_run() -> u32 {
 fn d_calls_per_issue() -> u32 {
     100
 }
+fn d_transcripts_enabled() -> bool {
+    true
+}
+fn d_max_bytes_per_run() -> u64 {
+    8 * 1024 * 1024
+}
+fn d_keep_runs() -> usize {
+    100
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -66,6 +75,7 @@ pub struct Config {
     pub broker: BrokerConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    pub transcripts: TranscriptsConfig,
 }
 
 /// The ops HTTP surface ([`crate::api`]).
@@ -96,6 +106,51 @@ pub struct ApiConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self { enabled: false, bind: d_api_bind(), allow_public: false }
+    }
+}
+
+/// Per-run transcripts of the agent's raw event stream (see [`crate::transcript`]).
+///
+/// On by default, like the broker and for a related reason: what it adds is a record of what
+/// already happened, so switching it off removes the evidence rather than the behaviour. The
+/// bounds are the reason it can be a default at all — without them a long-lived daemon would
+/// trade a disk for a debugging story.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptsConfig {
+    #[serde(default = "d_transcripts_enabled")]
+    pub enabled: bool,
+    /// Defaults to `.transcripts` under the workspace root — see [`TranscriptsConfig::root_in`].
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// Backstop against one pathological run, not a limit a normal session approaches.
+    #[serde(default = "d_max_bytes_per_run")]
+    pub max_bytes_per_run: u64,
+    /// How many runs' transcripts to keep. Must exceed `agent.max_concurrent` to be useful,
+    /// though a live run is never the one pruned even when it does not.
+    #[serde(default = "d_keep_runs")]
+    pub keep_runs: usize,
+}
+
+impl Default for TranscriptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: d_transcripts_enabled(),
+            root: None,
+            max_bytes_per_run: d_max_bytes_per_run(),
+            keep_runs: d_keep_runs(),
+        }
+    }
+}
+
+impl TranscriptsConfig {
+    /// Where transcripts go, given the resolved workspace root.
+    ///
+    /// The default is a dot-directory *beside* the worktrees rather than inside one: a
+    /// worktree is a git checkout the agent commits from, and it is deleted when the ticket
+    /// goes terminal, which is the exact moment the transcript becomes worth reading. A leading
+    /// dot cannot collide with a `worktree_key`, which always ends in `-<hash>`.
+    pub fn root_in(&self, workspace_root: &Path) -> PathBuf {
+        self.root.clone().unwrap_or_else(|| workspace_root.join(".transcripts"))
     }
 }
 
@@ -313,6 +368,16 @@ impl Config {
                     .into(),
             ));
         }
+        // Zero on either bound would not mean "unlimited", it would mean "write nothing" by a
+        // route that looks like a bug at the call site rather than a decision here.
+        if self.transcripts.enabled
+            && (self.transcripts.max_bytes_per_run == 0 || self.transcripts.keep_runs == 0)
+        {
+            return Err(ConfigError::Invalid(
+                "transcript bounds must be > 0; use transcripts.enabled = false to record none"
+                    .into(),
+            ));
+        }
         // Overlap makes startup cleanup delete a workspace for an issue about to be dispatched.
         let overlap: Vec<_> = self
             .tracker
@@ -377,6 +442,7 @@ mod tests {
             worker: Default::default(),
             broker: Default::default(),
             api: Default::default(),
+            transcripts: Default::default(),
         };
         c.normalize();
         c
@@ -413,6 +479,29 @@ mod tests {
         assert!(c.preflight().is_err(), "repo is still missing");
         c.tracker.repo = "r".into();
         assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn zero_transcript_bounds_are_rejected_rather_than_silently_recording_nothing() {
+        let mut c = base();
+        c.transcripts.keep_runs = 0;
+        assert!(c.preflight().is_err());
+        c.transcripts.keep_runs = 10;
+        c.transcripts.max_bytes_per_run = 0;
+        assert!(c.preflight().is_err());
+        // Turning the feature off is the supported way to record nothing.
+        c.transcripts.enabled = false;
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn transcripts_default_beside_the_worktrees_never_inside_one() {
+        let c = base();
+        let root = c.transcripts.root_in(Path::new("/tmp/ws"));
+        assert_eq!(root, Path::new("/tmp/ws/.transcripts"));
+        // A worktree_key can never start with a dot followed by letters — it is a sanitised
+        // identifier plus `-<hash>` — so the default cannot shadow one.
+        assert!(root.file_name().unwrap().to_str().unwrap().starts_with('.'));
     }
 
     #[test]

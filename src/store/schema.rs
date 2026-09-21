@@ -92,6 +92,14 @@ pub(super) const MIGRATIONS: &[&str] = &[
     -- because the issue has never been dispatched or because cleanup deleted the ref.
     ALTER TABLE issue_state ADD COLUMN branch TEXT;
     "#,
+    // v5
+    r#"
+    -- Where this run's raw event stream was written. Nullable because a transcript is
+    -- best-effort: a run dispatched with transcripts off, or whose file could not be opened,
+    -- still gets a row. Recording the path rather than deriving it is what makes "show me what
+    -- run X did" answerable from the run record alone, without knowing the layout on disk.
+    ALTER TABLE run ADD COLUMN transcript TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
