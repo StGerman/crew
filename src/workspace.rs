@@ -30,13 +30,27 @@ pub struct Prepared {
     pub created_now: bool,
     /// The branch this run's commits land on, for impls that have one. It is the only durable
     /// artifact a dispatched run leaves behind — the worktree directory is scratch space — so
-    /// it is reported upwards rather than kept private to the impl.
+    /// it is reported upwards rather than kept private to the impl, and the caller persists it
+    /// rather than recomputing it later: `identifier` can be renamed after this call returns,
+    /// and a name derived from the *current* identifier would silently stop matching the ref
+    /// this call actually checked out.
     pub branch: Option<String>,
+}
+
+/// What `remove` did to the branch, as distinct from the worktree directory it always removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Removed {
+    /// True only when this call deleted the branch along with the directory. `false` covers
+    /// every case a caller must treat alike: the branch outlived cleanup because it holds
+    /// commits `repo`'s HEAD does not, there was never a branch for this issue, or this impl
+    /// has no branches at all. A caller that persisted the branch at `prepare` time clears that
+    /// record exactly when this is `true`, and leaves it alone otherwise.
+    pub branch_deleted: bool,
 }
 
 pub trait Workspace: Send + Sync {
     fn prepare(&self, issue_id: &str, identifier: &str) -> Result<Prepared, WorkspaceError>;
-    fn remove(&self, issue_id: &str, identifier: &str) -> Result<(), WorkspaceError>;
+    fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError>;
     fn path_for(&self, issue_id: &str, identifier: &str) -> PathBuf;
 
     /// The branch this issue's runs commit on, for impls that have one.
@@ -112,14 +126,14 @@ impl Workspace for DirWorkspace {
         Ok(Prepared { path, created_now, branch: None })
     }
 
-    fn remove(&self, issue_id: &str, identifier: &str) -> Result<(), WorkspaceError> {
+    fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
         let path = self.path_for(issue_id, identifier);
         self.guard(&path)?;
         if path.exists() {
             std::fs::remove_dir_all(&path)
                 .map_err(|source| WorkspaceError::Io { path: path.clone(), source })?;
         }
-        Ok(())
+        Ok(Removed::default())
     }
 }
 
@@ -267,12 +281,12 @@ impl Workspace for GitWorktreeWorkspace {
         Ok(Prepared { path, created_now: true, branch: Some(branch) })
     }
 
-    fn remove(&self, issue_id: &str, identifier: &str) -> Result<(), WorkspaceError> {
+    fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
         let path = self.path_for(issue_id, identifier);
         self.guard(&path)?;
 
         if !path.exists() {
-            return Ok(());
+            return Ok(Removed::default());
         }
 
         let path_str = path.to_string_lossy().into_owned();
@@ -285,10 +299,10 @@ impl Workspace for GitWorktreeWorkspace {
         //
         // Best-effort either way: a branch that was already deleted, or never created because
         // `prepare` failed before reaching it, must not turn a successful worktree removal into
-        // an error.
+        // an error — it just means `branch_deleted` reads `false`, same as "kept".
         let branch = Self::branch_name(issue_id, identifier);
-        let _ = Self::git(&self.repo, &["branch", "-d", &branch]);
-        Ok(())
+        let branch_deleted = Self::git(&self.repo, &["branch", "-d", &branch]).is_ok();
+        Ok(Removed { branch_deleted })
     }
 }
 
@@ -486,11 +500,12 @@ mod tests {
         let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
         assert!(branch_exists(&repo, &branch));
 
-        ws.remove("id-1", "MT-1").unwrap();
+        let removed = ws.remove("id-1", "MT-1").unwrap();
 
         assert!(!p.exists());
         assert!(!is_registered_worktree(&repo, &p));
         assert!(!branch_exists(&repo, &branch), "remove must prune the branch too");
+        assert!(removed.branch_deleted, "and report having done so");
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -556,10 +571,11 @@ mod tests {
         commit_in(&p, "work.txt", "the agent output");
         let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
 
-        ws.remove("id-1", "MT-1").unwrap();
+        let removed = ws.remove("id-1", "MT-1").unwrap();
 
         assert!(!p.exists(), "the directory is scratch space and still goes");
         assert!(branch_exists(&repo, &branch), "the run's commits must survive cleanup");
+        assert!(!removed.branch_deleted, "and remove must say so, not just leave it alone");
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();

@@ -388,6 +388,24 @@ where
     tokio::task::spawn_blocking(move || call(Client::new(endpoint))).await.unwrap()
 }
 
+/// Accepts one connection, writes a fixed raw HTTP/1.1 response with none of this API's own
+/// headers, and closes — standing in for "some other service happens to be on this port," the
+/// same raw-`TcpListener` pattern `tracker::github`'s `ureq_http_tests` uses so the test proves
+/// something about the real `Client` rather than about a fake that was told what to answer.
+fn serve_once_unmarked(response: &'static str) -> SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf); // drain the request so the client isn't left hanging
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    addr
+}
+
 #[tokio::test]
 async fn the_status_client_renders_the_same_snapshot_the_api_publishes() {
     let mut h = Harness::new(vec![issue(1, "In Progress"), issue(2, "In Progress")]).await;
@@ -461,4 +479,80 @@ async fn an_identifier_that_needs_encoding_still_reaches_its_route() {
     let raw = via_client(h.addr, |c| c.raw_issue("team/MT-1")).await.expect("so does --json");
     let parsed: Value = serde_json::from_str(&raw).expect("the body is JSON");
     assert_eq!(parsed["identifier"], "team/MT-1");
+}
+
+#[tokio::test]
+async fn a_padded_bind_address_in_the_config_reaches_the_daemon_the_way_a_trimmed_one_does() {
+    // `api::bind` (mod.rs) trims `cfg.bind` before parsing it, so a config written with
+    // incidental surrounding whitespace binds the daemon successfully. The client has to trim
+    // the same string the same way, or the exact address the daemon is listening on turns into
+    // an invalid URL only on this side of the connection.
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+
+    let cfg_path = std::env::temp_dir()
+        .join(format!("symphony-api-test-padded-bind-{}.toml", std::process::id()));
+    std::fs::write(&cfg_path, format!("[api]\nbind = \"  {}  \"\n", h.addr)).unwrap();
+
+    let ep = symphony_cc::api::client::endpoint(None, &cfg_path);
+    assert_eq!(ep.addr, h.addr.to_string(), "the padding must not survive into the address used");
+
+    let snap = tokio::task::spawn_blocking(move || Client::new(ep).snapshot())
+        .await
+        .unwrap()
+        .expect("a client built from the padded config must still reach the daemon");
+    assert_eq!(snap.rows.len(), 1);
+
+    std::fs::remove_file(&cfg_path).ok();
+}
+
+#[tokio::test]
+async fn every_response_the_ops_api_writes_carries_its_marker_header() {
+    // Both a 200 and this API's own 404 have to carry it: the client trusts the header before
+    // it trusts anything else in the response, including a status code this router produced
+    // itself, so an error path that forgot the header would make itself indistinguishable from
+    // a different service refusing the request.
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.tick();
+
+    for path in ["/api/v1/snapshot", "/api/v1/issues/MT-404"] {
+        let mut stream = TcpStream::connect(h.addr).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        assert!(
+            text.contains("X-Symphony-Ops-Api"),
+            "missing the marker header for {path}:\n{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_response_missing_the_marker_is_treated_as_a_different_service_not_the_daemon() {
+    // The exact case issue #31's review flagged: a reachable port that answers is not
+    // necessarily this daemon. Without the check, the 200 below would have satisfied
+    // `snapshot()` outright, and the same body would have been handed back verbatim by the
+    // `--json` path — and a 404 would have read as "the daemon said no" rather than as nothing
+    // to do with the daemon at all.
+    let addr = serve_once_unmarked(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    let err = via_client(addr, |c| c.snapshot()).await.expect_err("no marker, no daemon");
+    assert!(matches!(err, StatusError::Unrecognised { .. }), "got {err:?}");
+
+    // `--json` is not exempt: a raw body from a service that is not this API must not reach an
+    // operator's `jq` looking like a snapshot.
+    let addr = serve_once_unmarked(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    let err = via_client(addr, |c| c.raw_snapshot()).await.expect_err("--json is not exempt");
+    assert!(matches!(err, StatusError::Unrecognised { .. }), "got {err:?}");
+
+    let addr = serve_once_unmarked("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found");
+    let err = via_client(addr, |c| c.issue("MT-1")).await.expect_err("no marker, no daemon");
+    assert!(matches!(err, StatusError::Unrecognised { .. }), "got {err:?}");
 }

@@ -85,13 +85,15 @@ pub struct Row {
     pub last_error: Option<String>,
     pub last_event: Option<String>,
     pub workspace: Option<String>,
-    /// The branch this issue's runs commit on, once it has been dispatched at least once.
+    /// The branch this issue's most recent dispatch actually checked out, recorded at that
+    /// call rather than recomputed from `identifier` — see `Store::set_branch`.
     ///
     /// Outlives `workspace`, and deliberately: the worktree directory is scratch that cleanup
     /// deletes, while the branch is what a finished run leaves behind for a reviewer to find.
     /// `None` for an issue never dispatched — naming a branch that was never written would
-    /// send that reviewer after nothing — and for a [`crate::workspace::DirWorkspace`]
-    /// deployment, which has no branches at all.
+    /// send that reviewer after nothing — for a [`crate::workspace::DirWorkspace`] deployment,
+    /// which has no branches at all, and once cleanup deletes a branch that turned out to carry
+    /// nothing new: `None` here is always either of those, never a ref that is already gone.
     pub branch: Option<String>,
     /// This issue's most recent runs, newest first, at most [`RUNS_PER_ISSUE`].
     pub runs: Vec<RunRecord>,
@@ -279,7 +281,14 @@ impl Scheduler {
             // check says it carries nothing HEAD already has, so a killed run's work survives
             // this and the next `prepare` attaches straight back to it.
             let workspace_removed = match self.workspace.remove(&st.issue_id, &st.identifier) {
-                Ok(()) => true,
+                Ok(removed) => {
+                    // The stored branch is only ever wrong in the direction of pointing at a
+                    // ref that is gone; cleared here so it does not outlive the ref it named.
+                    if removed.branch_deleted {
+                        self.store.set_branch(self.clock.as_ref(), &st.issue_id, None)?;
+                    }
+                    true
+                }
                 Err(e) => {
                     // Not fatal, deliberately. A worktree that cannot be removed must not be
                     // what keeps the claim held, or this would reproduce the bug it fixes.
@@ -564,8 +573,14 @@ impl Scheduler {
         self.store.finish_run(self.clock.as_ref(), &r.run_id, "killed", p.turns, p.tokens)?;
         self.store.add_turns(issue_id, p.turns)?;
 
-        if cleanup && let Err(e) = self.workspace.remove(issue_id, &r.issue.identifier) {
-            tracing::warn!(issue_id, error = %e, "workspace cleanup failed");
+        if cleanup {
+            match self.workspace.remove(issue_id, &r.issue.identifier) {
+                Ok(removed) if removed.branch_deleted => {
+                    self.store.set_branch(self.clock.as_ref(), issue_id, None)?;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(issue_id, error = %e, "workspace cleanup failed"),
+            }
         }
         Ok(())
     }
@@ -622,8 +637,14 @@ impl Scheduler {
 
             if self.cfg.is_terminal(&key) {
                 self.store.clear_retry(&issue.id)?;
-                if let Err(e) = self.workspace.remove(&issue.id, &issue.identifier) {
-                    tracing::warn!(issue_id = %issue.id, error = %e, "cleanup failed");
+                match self.workspace.remove(&issue.id, &issue.identifier) {
+                    Ok(removed) if removed.branch_deleted => {
+                        self.store.set_branch(self.clock.as_ref(), &issue.id, None)?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(issue_id = %issue.id, error = %e, "cleanup failed");
+                    }
                 }
                 self.store.release(self.clock.as_ref(), &issue.id)?;
                 continue;
@@ -773,6 +794,15 @@ impl Scheduler {
             }
         };
 
+        // Persisted here, before the worker exists, for the same reason the claim above is:
+        // this is the one moment the real name is known. Deriving it later from `identifier`
+        // is what the finding on PR #31 flagged — `Store::ensure` can rename `identifier` after
+        // this point, and `Workspace::remove` sometimes deletes the ref cleanup decided the run
+        // did not need — so a recomputed name can point at a branch that was never this run's,
+        // or at one that no longer exists. Written unconditionally, including on a resumed
+        // attempt, so a stale value from a since-renamed identifier does not survive a retry.
+        self.store.set_branch(self.clock.as_ref(), &issue.id, prepared.branch.as_deref())?;
+
         let run_id = format!("{}-{}", issue.id, self.clock.wall().0);
 
         // The conversation is named here, before the process exists, for the same reason the
@@ -870,9 +900,6 @@ impl Scheduler {
             let progress = run.map(|r| r.handle.progress()).unwrap_or_default();
 
             let runs = history.remove(&st.issue_id).unwrap_or_default();
-            // A branch is worth naming only once something has run on it; before that the
-            // name is a prediction, not a place to look.
-            let dispatched = run.is_some() || !runs.is_empty();
 
             rows.push(Row {
                 issue_id: st.issue_id.clone(),
@@ -890,9 +917,12 @@ impl Scheduler {
                 last_error: st.last_error.clone(),
                 last_event: progress.last_event,
                 workspace: run.map(|r| r.workspace.display().to_string()),
-                branch: dispatched
-                    .then(|| self.workspace.branch_for(&st.issue_id, &st.identifier))
-                    .flatten(),
+                // Read back rather than derived: `st.branch` is exactly what `prepare` returned
+                // at the most recent dispatch, kept in step with reality by `set_branch` calls
+                // at launch and at cleanup — not recomputed from `identifier`, which can have
+                // been renamed since, or from run history, which says nothing about whether the
+                // ref cleanup later deleted still exists.
+                branch: st.branch.clone(),
                 runs,
             });
         }

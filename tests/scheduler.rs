@@ -874,6 +874,76 @@ fn recovery_leaves_the_claims_of_runs_this_process_is_still_executing_alone() {
     assert!(ws.exists(), "nor its workspace removed out from under it");
 }
 
+// ---- published branch ---------------------------------------------------------
+
+/// Review finding on PR #31 (`src/sched/mod.rs:895`): the published branch used to be
+/// recomputed on every snapshot from `st.identifier` and "has this issue ever produced a run",
+/// neither of which proves the recomputed name is the branch `prepare` actually checked out.
+/// Two things break it independently: `Store::ensure` can rename `identifier` after dispatch,
+/// changing what a recompute produces, and `Workspace::remove` deletes a branch that turns out
+/// to carry no commits while the run history that gated the old derivation never clears. This
+/// drives both: one issue's branch survives cleanup because it holds a commit, the other's does
+/// not, and the surviving one's identifier is renamed after dispatch. The recorded value must
+/// track what `prepare` returned and what cleanup actually did, not what a recompute would say.
+#[test]
+fn the_published_branch_is_the_one_prepare_recorded_not_one_recomputed_from_the_current_identifier()
+{
+    let dir = tmp_dir("branch-recorded-not-derived");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(1))],
+        root.clone(),
+        Store::open_in_memory().unwrap(),
+        Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+        |c| c.agent.max_concurrent = 2,
+    );
+    h.worker.set_default(Script::succeeds_in(600_000));
+
+    h.sched.tick().unwrap();
+    let snap = h.sched.snapshot().unwrap();
+    let row_1 = snap.rows.iter().find(|r| r.issue_id == "iss-1").unwrap();
+    let row_2 = snap.rows.iter().find(|r| r.issue_id == "iss-2").unwrap();
+    assert!(row_1.branch.is_some(), "a dispatched run reports the branch it checked out");
+    let branch_2 = row_2.branch.clone().expect("same for the second issue");
+    let ws_2 = PathBuf::from(row_2.workspace.clone().unwrap());
+
+    // iss-2's run leaves a commit, so cleanup keeps its branch; iss-1's leaves none, so cleanup
+    // deletes it (git's own merged check, exercised by `GitWorktreeWorkspace::remove`).
+    commit_in(&ws_2, "work.txt", "the agent's output");
+
+    // A tracker-side rename after dispatch — the failure mode a recomputed name cannot survive.
+    // `worktree_key` is fixed at the first `ensure` and ignored on conflict, so this only
+    // changes what `identifier` displays as, never which worktree or branch this issue owns.
+    h.sched.store().ensure(h.clock.as_ref(), "iss-2", "MT-2-renamed", "irrelevant").unwrap();
+
+    h.tracker.set_state("iss-1", "Done");
+    h.tracker.set_state("iss-2", "Done");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let snap = h.sched.snapshot().unwrap();
+    let row_1 = snap.rows.iter().find(|r| r.issue_id == "iss-1").unwrap();
+    let row_2 = snap.rows.iter().find(|r| r.issue_id == "iss-2").unwrap();
+
+    assert_eq!(row_2.identifier, "MT-2-renamed", "the rename really did take hold in the store");
+    assert_eq!(
+        row_1.branch, None,
+        "cleanup deleted the ref this run actually used; the stored value must follow, not \
+         keep reporting a name that no longer exists just because the issue has run history"
+    );
+    assert_eq!(
+        row_2.branch,
+        Some(branch_2),
+        "cleanup kept this branch because it holds commits, so the recorded name must survive \
+         unchanged — not get recomputed from the identifier that was renamed underneath it"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- projection -------------------------------------------------------------
 
 /// The projector every real deployment is one disk error away from.

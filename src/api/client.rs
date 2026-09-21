@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::{API_MARKER_HEADER, API_MARKER_VERSION};
 use crate::config::{ApiConfig, DEFAULT_API_BIND};
 use crate::sched::{Row, Snapshot};
 
@@ -70,9 +71,12 @@ pub struct Endpoint {
 ///
 /// `--api`, then the config's `[api] bind`, then [`DEFAULT_API_BIND`] — the same order of
 /// precedence `main` uses when it decides where to *serve*, so the client looks where the
-/// daemon was told to listen.
+/// daemon was told to listen. Both of the first two are run through [`super::normalize_bind`],
+/// the same trim [`super::bind`] applies before parsing — a `--api` flag or a `[api] bind` with
+/// incidental surrounding whitespace must not bind successfully on the server side and build an
+/// unreachable URL on this one.
 pub fn endpoint(explicit: Option<&str>, config_path: &Path) -> Endpoint {
-    if let Some(addr) = explicit.map(str::trim).filter(|a| !a.is_empty()) {
+    if let Some(addr) = explicit.map(super::normalize_bind).filter(|a| !a.is_empty()) {
         return Endpoint { addr: addr.to_string(), source: Source::Flag };
     }
     match bind_in(config_path) {
@@ -88,6 +92,10 @@ pub fn endpoint(explicit: Option<&str>, config_path: &Path) -> Endpoint {
 /// a client asking what the daemon is doing — refusing to print status over it would be the
 /// same class of mistake as validating `api.bind` in preflight. Anything unreadable falls
 /// through to the default, where a wrong guess costs one clearly-labelled connection refusal.
+///
+/// The value is normalised with [`super::normalize_bind`] before it is handed back — the same
+/// trim [`super::bind`] applies server-side — so `bind = " 127.0.0.1:8787 "` binds the daemon
+/// and reaches it from here, rather than binding the daemon while this builds an invalid URL.
 fn bind_in(config_path: &Path) -> Option<String> {
     #[derive(Deserialize)]
     struct JustApi {
@@ -95,7 +103,7 @@ fn bind_in(config_path: &Path) -> Option<String> {
     }
     let text = std::fs::read_to_string(config_path).ok()?;
     let parsed: JustApi = toml::from_str(&text).ok()?;
-    Some(parsed.api.bind)
+    Some(super::normalize_bind(&parsed.api.bind).to_string())
 }
 
 /// Why a status query did not produce a snapshot.
@@ -222,6 +230,22 @@ impl Client {
         let response = self.agent.get(&url).call().map_err(|e| self.classify(e))?;
 
         let status = response.status().as_u16();
+
+        // Settled before either the status or the body is trusted, and before the body is even
+        // read: a status code and a JSON body are exactly what an unrelated service on this
+        // port could also produce (a 404 from nginx reads just like this API's own 404, and a
+        // 200 would previously have been handed straight through by the `--json` paths).
+        let marked = response.headers().get(API_MARKER_HEADER).and_then(|v| v.to_str().ok())
+            == Some(API_MARKER_VERSION);
+        if !marked {
+            return Err(StatusError::Unrecognised {
+                endpoint: self.endpoint.clone(),
+                why: "it answered without this API's marker header — probably a different \
+                      service on that port"
+                    .into(),
+            });
+        }
+
         let body = response.into_body().read_to_string().map_err(|e| StatusError::Unreachable {
             endpoint: self.endpoint.clone(),
             why: format!("the response head arrived but its body did not ({e})"),

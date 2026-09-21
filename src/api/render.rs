@@ -18,6 +18,7 @@ use crate::model::Phase;
 use crate::sched::{Row, Snapshot};
 use crate::store::RunRecord;
 use crate::tui::{fmt_count, fmt_ms};
+use crate::worker::TokenUsage;
 
 /// What a missing value prints as, everywhere. The same mark the dashboard's table uses, and
 /// never `0` — an unreported cost is unknown, not free.
@@ -172,7 +173,7 @@ pub fn issue(r: &Row) -> String {
     field("turns", r.turns.to_string());
     field(
         "tokens",
-        match r.tokens {
+        match effective_tokens(r) {
             Some(t) => format!("{} in / {} out", fmt_count(t.input), fmt_count(t.output)),
             // The dashboard's distinction, kept: a run still going has not reported yet, which
             // is not the same as one that ended without reporting at all.
@@ -244,10 +245,32 @@ fn age_of(r: &Row) -> String {
 }
 
 fn tokens_of(r: &Row) -> String {
-    match r.tokens {
+    match effective_tokens(r) {
         Some(t) => format!("{}/{}", fmt_count(t.input), fmt_count(t.output)),
         None => NONE.into(),
     }
+}
+
+/// The totals to show for a row. `Row.tokens` is live progress and is only ever populated for
+/// the run currently in flight, so it is `None` for every row that is not `Running` even when
+/// that issue's last run finished with a known cost sitting right there in `r.runs`. For any
+/// other phase, fall back to the newest run that actually reported a `result` event.
+///
+/// Deliberately the newest reporting run, not a sum over all of them: `Row.tokens` has always
+/// meant one run's cost, not a lifetime total for the issue (that lifetime figure is the
+/// snapshot-level `tokens`/`uncounted_runs` pair, which already sums across finished runs on
+/// purpose). Keeping this to one run preserves that meaning instead of quietly turning a
+/// per-run figure into a different, larger number. A run that ended without a total (killed,
+/// crashed, cut off by the turn budget) is skipped rather than treated as zero — `find_map`
+/// only stops at a run that reported both halves of its usage.
+fn effective_tokens(r: &Row) -> Option<TokenUsage> {
+    if r.phase == Phase::Running {
+        return r.tokens;
+    }
+    r.runs.iter().find_map(|run| match (run.in_tok, run.out_tok) {
+        (Some(input), Some(output)) => Some(TokenUsage { input, output }),
+        _ => None,
+    })
 }
 
 fn or_none(s: &str) -> String {
@@ -425,6 +448,52 @@ mod tests {
         let ended = Row { tokens: None, ..row("MT-2", Phase::Released) };
         let out = issue(&ended);
         assert!(out.contains("not reported") && !out.contains("not yet"), "{out}");
+    }
+
+    #[test]
+    fn a_finished_rows_cost_falls_back_to_its_newest_run_that_reported_one() {
+        // Row.tokens is live progress and goes back to None once the run stops — the cost did
+        // not disappear, it is sitting in `runs`. The review finding: the header used to say
+        // "not reported" here even though the run history right below it carried a real total.
+        let r = Row {
+            tokens: None,
+            runs: vec![
+                // Newest run first, and it reported nothing (killed/crashed/cut off) — it must
+                // be skipped rather than read as a free run, so the older run's total is what
+                // should surface.
+                RunRecord {
+                    run_id: "run-2".into(),
+                    issue_id: "iss-MT-7".into(),
+                    started_at: 1_789_205_400_000,
+                    ended_at: Some(1_789_205_500_000),
+                    outcome: Some("blocked".into()),
+                    session_id: None,
+                    turns: 3,
+                    in_tok: None,
+                    out_tok: None,
+                },
+                RunRecord {
+                    run_id: "run-1".into(),
+                    issue_id: "iss-MT-7".into(),
+                    started_at: 1_789_200_000_000,
+                    ended_at: Some(1_789_200_100_000),
+                    outcome: Some("continue".into()),
+                    session_id: None,
+                    turns: 6,
+                    in_tok: Some(9_000),
+                    out_tok: Some(1_500),
+                },
+            ],
+            ..row("MT-7", Phase::Released)
+        };
+
+        let out = issue(&r);
+        assert!(out.contains("9.0k in / 1.5k out"), "{out}");
+        assert!(!out.contains("not reported"), "{out}");
+
+        // The table's TOKENS column is the same fallback, not a second, inconsistent answer.
+        let table_out = snapshot(&Snapshot { rows: vec![r], ..Default::default() }, "x");
+        assert!(table_out.contains("9.0k/1.5k"), "{table_out}");
     }
 
     #[test]
