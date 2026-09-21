@@ -459,15 +459,10 @@ hold. They cover different paths; keep all three.
 
 ## Conventions
 
-- **Test names are sentences asserting the invariant**, not `test_foo`. If you cannot name
-  what a test defends, it probably is not defending anything.
-- **Comments carry the why**, usually which failure mode is being avoided. The what is in the
-  code. Match the surrounding density — this codebase comments decisions, not lines.
-- `max_width = 100`, `use_small_heuristics = "Max"` ([rustfmt.toml](rustfmt.toml)). Run
-  `cargo fmt` rather than hand-wrapping; it makes different choices than you will.
-- New external effects get a trait and a fake in the same commit, or the scheduler tests stop
-  being able to reach the new code path.
-- Rust edition 2024 — let-chains (`if x && let Some(y) = z`) are available and used.
+The coding rules live in [docs/coding-guidelines.md](docs/coding-guidelines.md), and that file
+is authoritative. Each rule there states what, why, and where the tree shows it done right, and
+the rules the code does not yet meet are tagged with the issue that tracks the fix. Read it
+before the first edit, and check a PR against it before asking for review.
 
 ## Dogfooding
 
