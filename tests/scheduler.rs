@@ -1919,3 +1919,32 @@ fn a_stacked_branch_opens_its_pull_request_against_the_branch_it_sits_on() {
     let top = forge.open_prs().iter().find(|p| p.base == under).unwrap().number;
     assert!(forge.spec_of(top).unwrap().body.contains("Stacked on"), "and the body says so");
 }
+
+/// Merging is the operator's, and it closes the ticket; `sweep_parked` then reclaims the
+/// worktree and may delete the branch. The delivery row polled after that must read the merged
+/// pull request as the end of the story, not the missing branch as a failure.
+#[test]
+fn a_merged_pull_request_whose_branch_cleanup_deleted_closes_delivery_rather_than_failing_it() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+
+    // The human merges; the ticket closes; cleanup deletes the now-merged branch.
+    forge.set_state(pr, PrState::Merged);
+    h.sched.store().set_branch(h.clock.as_ref(), "iss-1", None).unwrap();
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Closed, "{d:?}");
+    assert_eq!(d.handoff_reason.as_deref(), Some("merged"));
+    assert!(
+        h.sched.store().get("iss-1").unwrap().unwrap().last_error.is_none(),
+        "a merged pull request is not an error to report"
+    );
+}

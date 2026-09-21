@@ -230,14 +230,56 @@ impl Scheduler {
         let forge = self.forge.clone().expect("checked by delivery_on");
         let publisher = self.publisher.clone().expect("checked by delivery_on");
         let clock = self.clock.clone();
-        let branch = st
-            .branch
-            .clone()
-            .ok_or_else(|| ForgeError::Permanent("the issue has no branch".into()))?;
-
         let mut d = d.clone();
+
+        // The pull request's own state comes first, before anything touches the branch. Once
+        // the operator merges, the ticket closes and `sweep_parked` reclaims the worktree and
+        // may delete the branch — so a delivery row polled after that has no branch to speak
+        // of, and reading that as "the issue has no branch" would hand a finished, merged
+        // piece of work to the operator as a failure.
+        //
+        // Only for a row that is *waiting* on that pull request. A row a fresh run just set
+        // back to pending is about to push again, and a previous pull request the operator
+        // closed without merging is then exactly why a new one gets opened, not a reason to
+        // stop.
+        let mut pr = match d.pr_number {
+            Some(number) if d.stage != DeliveryStage::Pending => Some(forge.pull_request(number)?),
+            _ => None,
+        };
+        if let Some(p) = &pr
+            && p.state != PrState::Open
+        {
+            let how = if p.state == PrState::Merged { "merged" } else { "closed" };
+            tracing::info!(
+                issue_id,
+                pr = p.number,
+                how,
+                "pull request is no longer open; delivery over"
+            );
+            self.store.set_delivery_stage(
+                clock.as_ref(),
+                issue_id,
+                DeliveryStage::Closed,
+                Some(how),
+            )?;
+            return Ok(());
+        }
+
         if d.stage == DeliveryStage::Pending {
+            let branch = st
+                .branch
+                .clone()
+                .ok_or_else(|| ForgeError::Permanent("the issue has no branch".into()))?;
             let worktree = self.workspace.path_for(issue_id, &st.identifier);
+            if !worktree.exists() {
+                // Retrying a push from a directory that is gone would fail identically on
+                // every poll; the branch, if it still exists, is on the row for the operator.
+                return Err(ForgeError::Permanent(format!(
+                    "worktree {} is gone before the branch was pushed",
+                    worktree.display()
+                ))
+                .into());
+            }
             // Every other issue's branch is a candidate base: a pull request whose work sits
             // on another issue's branch is based on that branch, so the two stay reviewable
             // apart.
@@ -270,7 +312,7 @@ impl Scheduler {
             }
 
             let spec = self.pr_spec(issue_id, st, &branch, &base, &published.commits)?;
-            let pr = match forge.open_pull_request(&spec) {
+            let opened = match forge.open_pull_request(&spec) {
                 Err(ForgeError::NothingToDeliver(why)) => {
                     tracing::info!(issue_id, why, "nothing to deliver");
                     self.store.set_delivery_stage(
@@ -283,47 +325,34 @@ impl Scheduler {
                 }
                 other => other?,
             };
-            let fresh = d.pr_number != Some(pr.number);
+            let fresh = d.pr_number != Some(opened.number);
             self.store.set_delivery_pr(
                 clock.as_ref(),
                 issue_id,
-                pr.number,
-                &pr.url,
+                opened.number,
+                &opened.url,
                 &base,
                 &published.head_sha,
             )?;
             tracing::info!(
-                issue_id, identifier = %st.identifier, pr = pr.number, url = %pr.url, base, head = %published.head_sha,
+                issue_id, identifier = %st.identifier, pr = opened.number, url = %opened.url, base, head = %published.head_sha,
                 fresh, "pull request {}", if fresh { "opened" } else { "updated" }
             );
 
             if let Some(json) = &d.pending_verdicts {
                 let verdicts: Vec<ReviewVerdict> = serde_json::from_str(json)?;
-                self.apply_verdicts(issue_id, &pr, &verdicts)?;
+                self.apply_verdicts(issue_id, &opened, &verdicts)?;
             }
             d = self.store.delivery(issue_id)?.ok_or_else(|| {
                 StepError::Other(anyhow::anyhow!("delivery row vanished mid-step"))
             })?;
+            // Re-read rather than trusting `opened`: the head the push just moved is what CI
+            // and review are judged against from here on.
+            pr = Some(forge.pull_request(opened.number)?);
         }
 
-        let number = d.pr_number.ok_or_else(|| ForgeError::Permanent("no pull request".into()))?;
-        let pr = forge.pull_request(number)?;
-        if pr.state != PrState::Open {
-            let how = if pr.state == PrState::Merged { "merged" } else { "closed" };
-            tracing::info!(
-                issue_id,
-                pr = number,
-                how,
-                "pull request is no longer open; delivery over"
-            );
-            self.store.set_delivery_stage(
-                clock.as_ref(),
-                issue_id,
-                DeliveryStage::Closed,
-                Some(how),
-            )?;
-            return Ok(());
-        }
+        let pr = pr.ok_or_else(|| ForgeError::Permanent("no pull request".into()))?;
+        let number = pr.number;
 
         if !d.review_requested && !self.cfg.delivery.reviewers.is_empty() {
             for r in &self.cfg.delivery.reviewers {

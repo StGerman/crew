@@ -22,7 +22,7 @@ the published snapshot with a `status` client in front of it.
 ## Commands
 
 ```bash
-cargo test                                 # 199 unit + 64 integration
+cargo test                                 # 199 unit + 65 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
