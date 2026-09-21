@@ -98,10 +98,20 @@ this file.
 
 ## Comments and docs
 
-- **MUST** write comments that carry the why, usually which failure mode is avoided. The what
-  is in the code. Why: a comment that restates the code goes stale on the next edit, and a
-  comment that names the failure mode tells the next reader what not to remove. Example: the
-  comment on `EXP_CAP` in [src/sched/retry.rs](../src/sched/retry.rs). Check: review.
+- **MUST NOT** write a comment that says what the code already says. Before you write one,
+  delete the code in your head and read the comment alone: if a reader could regenerate the
+  comment from the code, the comment is noise and does not go in. A comment exists only for
+  what the code cannot carry: the failure mode it avoids, the alternative that was rejected, the
+  external fact it relies on, the invariant that another file depends on. Why: a comment that
+  mirrors the code is wrong the moment the code changes and teaches an agent to keep writing
+  more of them. Example: `// increment the counter` above `n += 1` is banned; the comment on
+  `EXP_CAP` in [src/sched/retry.rs](../src/sched/retry.rs), which names the overflow it
+  prevents, is the model. Check: review. The reviewing agent deletes any comment that fails the
+  test and does not ask first.
+- **MUST** state the failure mode a comment guards against, in the first sentence. Why: the
+  next agent to touch the line needs to know what breaks if it is removed, not how it works.
+  Example: the module doc of [src/transcript.rs](../src/transcript.rs) opens each load-bearing
+  choice with the defect it prevents. Check: review.
 - **MUST** open every module with a `//!` doc that states what the module is for and which
   decision it records. Why: the module doc is the one place a reader looks before the code.
   Example: [src/broker/server.rs](../src/broker/server.rs), which records why the transport is
