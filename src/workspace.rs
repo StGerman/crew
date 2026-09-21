@@ -21,6 +21,18 @@ pub enum WorkspaceError {
     NotAGitRepo { path: PathBuf },
     #[error("git {args} failed: {stderr}")]
     Git { args: String, stderr: String },
+    /// `workspace.repo` or `workspace.root` resolves inside a linked worktree of the
+    /// repository — one orchestrator about to run inside another's checkout. Refused rather
+    /// than redirected, because the worktrees such a run would create register in the shared
+    /// `.git` of `main`, where the orchestrator that owns that checkout never recorded them and
+    /// will never revisit them.
+    #[error(
+        "refusing to nest: {path} is inside the linked worktree {worktree} of {main}; \
+         a run there would register worktrees and branches the orchestrator owning that checkout \
+         never recorded. Point workspace.repo at a checkout that is not itself a worktree \
+         (e.g. a throwaway clone) and workspace.root outside every worktree of it"
+    )]
+    Nested { path: PathBuf, worktree: PathBuf, main: PathBuf },
 }
 
 #[derive(Debug)]
@@ -182,6 +194,34 @@ impl GitWorktreeWorkspace {
         // is the case after an ordinary kill-and-restart.
         let _ = Self::git(&repo, &["worktree", "prune"]);
 
+        // Refuse to run inside another run's checkout. The first dispatched agent to exercise
+        // the daemon did so from its own worktree with the default config, and `repo = "."`
+        // plus a cwd-relative `root` put six demo worktrees one level down inside it. Nothing
+        // under `.gitignore` was involved: a worktree registers in the *shared* `.git` of the
+        // main checkout, so the top-level orchestrator — which never recorded those keys —
+        // was left holding registrations and branches it will never revisit, and the merged
+        // check that protects an agent's commits is exactly what keeps them alive.
+        //
+        // Refused rather than redirected to the top-level root: redirecting would move the
+        // directories but still create registrations and branches the owning orchestrator does
+        // not know about, which is the same litter made harder to see. Both paths are checked
+        // because either alone reproduces it — `repo` inside a worktree nests the metadata,
+        // `root` inside one nests the directories under something `remove` will later delete.
+        // After the prune above, so a stale entry for a directory that is gone cannot refuse a
+        // legitimate start.
+        let linked = Self::registered_worktrees(&repo)?;
+        let main = linked.first().map(|(p, _)| p.clone()).unwrap_or_else(|| repo.clone());
+        for path in [&repo, &root] {
+            if let Some((worktree, _)) = linked.iter().skip(1).find(|(wt, _)| path.starts_with(wt))
+            {
+                return Err(WorkspaceError::Nested {
+                    path: path.clone(),
+                    worktree: worktree.clone(),
+                    main,
+                });
+            }
+        }
+
         Ok(Self { root, repo })
     }
 
@@ -239,6 +279,27 @@ impl GitWorktreeWorkspace {
     fn is_worktree_checkout(path: &Path) -> bool {
         path.join(".git").is_file()
     }
+
+    /// Every worktree `repo`'s shared metadata knows about, main checkout first, each with the
+    /// branch it has checked out when it has one. Paths are canonicalised where they still
+    /// exist so they compare equal to the canonical `root` and `repo` this type holds; an
+    /// entry whose directory is already gone keeps git's own spelling, which is enough to
+    /// name it in a log line.
+    fn registered_worktrees(repo: &Path) -> Result<Vec<(PathBuf, Option<String>)>, WorkspaceError> {
+        let porcelain = Self::git(repo, &["worktree", "list", "--porcelain"])?;
+        let mut out: Vec<(PathBuf, Option<String>)> = Vec::new();
+        for line in porcelain.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                let path = PathBuf::from(p);
+                out.push((path.canonicalize().unwrap_or(path), None));
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/")
+                && let Some(last) = out.last_mut()
+            {
+                last.1 = Some(b.to_string());
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl Workspace for GitWorktreeWorkspace {
@@ -289,6 +350,17 @@ impl Workspace for GitWorktreeWorkspace {
             return Ok(Removed::default());
         }
 
+        // Worktrees registered *beneath* this one — an orchestrator that ran inside this
+        // checkout before `new` refused that, or anything else that nested a worktree here by
+        // hand. Collected before removal because `worktree remove --force` deletes their
+        // directories along with the parent's without knowing they were worktrees, and once
+        // the directories are gone their branches can no longer be told from any other.
+        let nested: Vec<(PathBuf, Option<String>)> = Self::registered_worktrees(&self.repo)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(wt, _)| wt != &path && wt.starts_with(&path))
+            .collect();
+
         let path_str = path.to_string_lossy().into_owned();
         Self::git(&self.repo, &["worktree", "remove", "--force", &path_str])?;
 
@@ -302,6 +374,38 @@ impl Workspace for GitWorktreeWorkspace {
         // an error — it just means `branch_deleted` reads `false`, same as "kept".
         let branch = Self::branch_name(issue_id, identifier);
         let branch_deleted = Self::git(&self.repo, &["branch", "-d", &branch]).is_ok();
+
+        // Reconcile what the removal just orphaned in the shared metadata. The registrations
+        // now point at directories that no longer exist, which is precisely what `prune`
+        // reclaims — and it has to run first, because `branch -d` refuses a branch a
+        // registered worktree still has checked out, stale or not. The branches then get the
+        // same `-d` as this run's own: one sitting on a commit HEAD already has goes, one
+        // carrying anything else stays and is named here, because the rule that protects an
+        // agent's commits is not weakened for litter. That is the case for a nested run
+        // branched off a parent that had committed: its branches are kept until the parent
+        // branch is merged, at which point `git branch -d` on them succeeds by hand.
+        if !nested.is_empty() {
+            let _ = Self::git(&self.repo, &["worktree", "prune"]);
+            for (wt, nested_branch) in &nested {
+                match nested_branch {
+                    Some(b) if Self::git(&self.repo, &["branch", "-d", b]).is_ok() => {
+                        tracing::info!(
+                            worktree = %wt.display(), branch = %b,
+                            "pruned a worktree nested inside the removed one, and its branch"
+                        );
+                    }
+                    Some(b) => tracing::warn!(
+                        worktree = %wt.display(), branch = %b,
+                        "pruned a worktree nested inside the removed one; its branch carries \
+                         commits HEAD does not and is kept — `git branch -d` it once they are merged"
+                    ),
+                    None => tracing::info!(
+                        worktree = %wt.display(),
+                        "pruned a detached worktree nested inside the removed one"
+                    ),
+                }
+            }
+        }
         Ok(Removed { branch_deleted })
     }
 }
@@ -676,6 +780,117 @@ mod tests {
             let branch = GitWorktreeWorkspace::branch_name(&id, bad);
             assert!(branch_exists(&repo, &branch), "git refused the branch name {branch}");
         }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Run git inside an existing worktree, standing in for a second orchestrator started
+    /// there with `repo = "."` — the shape a dispatched agent produces when it runs the daemon
+    /// from its own checkout with the default config.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn registered_count(repo: &Path) -> usize {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.starts_with("worktree ")).count()
+    }
+
+    #[test]
+    fn an_orchestrator_cannot_be_started_inside_another_runs_worktree() {
+        // Reproduces #29: the agent for #24 ran `cargo run` from its own worktree, so
+        // `workspace.repo = "."` was a linked worktree and `workspace.root` resolved inside it.
+        // Both spellings of that mistake must be refused, and the ordinary shape — root beside
+        // or inside the *main* checkout — must not be.
+        let root = tmp_root("wt-no-nest");
+        let repo = tmp_repo("wt-no-nest");
+        let outer =
+            GitWorktreeWorkspace::new(&root, &repo).unwrap().prepare("id-1", "MT-1").unwrap().path;
+
+        // repo inside a linked worktree, root inside it too: the exact #29 configuration.
+        let nested_root = outer.join(".symphony/workspaces");
+        let err = GitWorktreeWorkspace::new(&nested_root, &outer).err().expect("must be refused");
+        assert!(
+            matches!(err, WorkspaceError::Nested { .. }),
+            "expected a nesting refusal, got {err:?}"
+        );
+        assert_eq!(registered_count(&repo), 2, "a refused start must register nothing");
+
+        // Only the root inside a linked worktree, repo pointed at the main checkout: the
+        // directories would still be deleted under a later `remove` of the outer worktree.
+        let err = GitWorktreeWorkspace::new(&nested_root, &repo).err().expect("must be refused");
+        assert!(
+            matches!(err, WorkspaceError::Nested { .. }),
+            "expected a nesting refusal, got {err:?}"
+        );
+
+        // Only the repo inside a linked worktree, root elsewhere: metadata still nests.
+        let elsewhere = tmp_root("wt-no-nest-elsewhere");
+        let err = GitWorktreeWorkspace::new(&elsewhere, &outer).err().expect("must be refused");
+        assert!(
+            matches!(err, WorkspaceError::Nested { .. }),
+            "expected a nesting refusal, got {err:?}"
+        );
+
+        // The dogfooding shape — root under the main checkout — is not nesting.
+        let in_main = repo.join(".symphony/workspaces");
+        GitWorktreeWorkspace::new(&in_main, &repo)
+            .expect("a root inside the main checkout is fine");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn removing_a_worktree_reclaims_the_worktrees_nested_inside_it_from_shared_metadata() {
+        // What #29 left behind predates the refusal above, so cleanup has to reconcile it: the
+        // parent's `worktree remove --force` deletes the nested directories without knowing
+        // they were worktrees, leaving registrations that point nowhere and branches those
+        // registrations pin. Both must go by the same path that removed the parent — with the
+        // merged check intact, so a nested branch that carries commits is kept exactly as the
+        // parent's own would be.
+        let root = tmp_root("wt-nested-cleanup");
+        let repo = tmp_repo("wt-nested-cleanup");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let outer = ws.prepare("id-1", "MT-1").unwrap().path;
+
+        let inner_root = outer.join(".symphony/workspaces");
+        std::fs::create_dir_all(&inner_root).unwrap();
+        let empty = inner_root.join("MT-601");
+        let with_work = inner_root.join("MT-602");
+        git_in(
+            &outer,
+            &["worktree", "add", "-q", "-B", "symphony/MT-601", empty.to_str().unwrap()],
+        );
+        git_in(
+            &outer,
+            &["worktree", "add", "-q", "-B", "symphony/MT-602", with_work.to_str().unwrap()],
+        );
+        commit_in(&with_work, "work.txt", "a nested run's output");
+        assert_eq!(registered_count(&repo), 4, "main, outer and two nested");
+
+        ws.remove("id-1", "MT-1").unwrap();
+
+        assert!(!outer.exists());
+        assert_eq!(registered_count(&repo), 1, "no registration may outlive its directory");
+        assert!(!branch_exists(&repo, "symphony/MT-601"), "a nested branch holding nothing goes");
+        assert!(branch_exists(&repo, "symphony/MT-602"), "a nested branch holding commits stays");
+        assert!(
+            !branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")),
+            "the parent's own branch is treated exactly as before"
+        );
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
