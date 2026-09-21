@@ -54,8 +54,10 @@ impl IssueState {
 ///
 /// `ended_at` and `outcome` are `None` while the run is in flight — and stay `None` for a run
 /// whose process was killed with the orchestrator, until the next startup's `recover()` closes
-/// it. The counters are what the run had reported by the time it ended, which is zero for a run
-/// that died with whatever was counting them.
+/// it. `turns` is checkpointed while the run is in flight (`Store::record_progress`, once per
+/// tick) and made final by `finish_run`, so a run that died with its process reports what it
+/// had reached at the last tick rather than zero. The token columns have no such checkpoint —
+/// the CLI reports a total once, at the end, or never.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
@@ -212,9 +214,18 @@ impl Store {
     ///
     /// A run row opens before the worker exists and closes in `finish_run`. A process killed
     /// mid-run closes nothing, so the row reads as in-flight forever. Recovery closes it with
-    /// what is actually known: the turn count stays where it was, and the token columns stay
-    /// NULL, because the total that run would have reported died with the process that was
-    /// waiting for it. It lands in `token_totals`'s uncounted tally, same as a killed run.
+    /// what is actually known: the turn count stays at its last checkpoint
+    /// ([`Store::record_progress`]), and the token columns stay NULL, because the total that
+    /// run would have reported died with the process that was waiting for it. It lands in
+    /// `token_totals`'s uncounted tally, same as a killed run.
+    ///
+    /// The checkpointed turns are folded into the issue's `cumulative_turns` here, in the same
+    /// transaction that closes the rows. Every other path that ends a run calls `add_turns`
+    /// with the handle's final count; this is the one path with no handle, and without the fold
+    /// the interrupted attempt would cost the per-issue budget nothing — which is wrong by
+    /// exactly the work most worth accounting for, since it is the work the resumed
+    /// conversation is about to build on. One transaction, so a second kill between the two
+    /// statements cannot count the same turns twice at the next startup.
     pub fn close_open_runs(
         &self,
         clock: &dyn Clock,
@@ -222,10 +233,21 @@ impl Store {
         outcome: &str,
     ) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE issue_state
+             SET cumulative_turns = cumulative_turns
+                 + (SELECT COALESCE(SUM(turns), 0) FROM run
+                    WHERE issue_id = ?1 AND ended_at IS NULL)
+             WHERE issue_id = ?1",
+            params![issue_id],
+        )?;
+        let closed = tx.execute(
             "UPDATE run SET ended_at = ?2, outcome = ?3 WHERE issue_id = ?1 AND ended_at IS NULL",
             params![issue_id, clock.wall().0, outcome],
-        )
+        )?;
+        tx.commit()?;
+        Ok(closed)
     }
 
     pub fn set_phase(
@@ -572,6 +594,24 @@ impl Store {
         rows.collect()
     }
 
+    /// Checkpoint an in-flight run's turn count.
+    ///
+    /// Until this existed `turns` was written once, by `finish_run`, and the live count existed
+    /// only in the `RunHandle` inside the scheduler's `running` map — which cannot cross a
+    /// process boundary, so a hard kill lost how far every in-flight run had got (issue #25).
+    /// The scheduler calls this once per tick per run, and only when the count has moved, so
+    /// the write rate is bounded by the poll interval rather than by the agent's event rate.
+    /// Guarded on `ended_at IS NULL`: a checkpoint that races a finish must not overwrite the
+    /// final figure with an older one.
+    pub fn record_progress(&self, run_id: &str, turns: u32) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE run SET turns = ?2 WHERE run_id = ?1 AND ended_at IS NULL",
+            params![run_id, turns as i64],
+        )?;
+        Ok(())
+    }
+
     /// `tokens` is `None` for a run that ended without reporting a total — killed, crashed, or
     /// cut off by the turn budget. It is stored as NULL, never as zero: a zero would read as a
     /// free run in every sum, and a run that was killed mid-stream is not free, it is uncounted.
@@ -850,6 +890,44 @@ mod tests {
             TokenTotals { counted: TokenUsage { input: 10, output: 20 }, uncounted_runs: 1 },
             "a run nobody counted contributes nothing to the sum and one to the uncounted tally"
         );
+    }
+
+    #[test]
+    fn an_in_flight_runs_checkpointed_turns_survive_into_the_orphaned_row_and_the_issue_budget() {
+        let (s, c) = setup();
+        s.ensure(&c, "id-1", "MT-1", "MT-1-abc").unwrap();
+        s.start_run(&c, "run-a", "id-1", "sess-a", None).unwrap();
+        s.record_progress("run-a", 2).unwrap();
+        s.record_progress("run-a", 7).unwrap();
+        assert_eq!(s.run("run-a").unwrap().unwrap().turns, 7, "the latest checkpoint wins");
+        assert_eq!(
+            s.get("id-1").unwrap().unwrap().cumulative_turns,
+            0,
+            "a checkpoint is not yet charged to the issue; the run may still finish and report"
+        );
+
+        // The kill, then the next startup's recovery.
+        assert_eq!(s.close_open_runs(&c, "id-1", "orphaned").unwrap(), 1);
+        let rec = s.run("run-a").unwrap().unwrap();
+        assert_eq!(rec.outcome.as_deref(), Some("orphaned"));
+        assert_eq!(rec.turns, 7, "closing the row must keep the last known count, not zero it");
+        assert_eq!(rec.in_tok, None, "and must not invent a total the CLI never reported");
+        assert_eq!(
+            s.get("id-1").unwrap().unwrap().cumulative_turns,
+            7,
+            "the interrupted attempt is charged to the issue exactly once"
+        );
+        s.close_open_runs(&c, "id-1", "orphaned").unwrap();
+        assert_eq!(s.get("id-1").unwrap().unwrap().cumulative_turns, 7, "and not again");
+    }
+
+    #[test]
+    fn a_late_checkpoint_cannot_overwrite_a_finished_runs_final_count() {
+        let (s, c) = setup();
+        s.start_run(&c, "run-a", "id-1", "sess-a", None).unwrap();
+        s.finish_run(&c, "run-a", "done", 5, None).unwrap();
+        s.record_progress("run-a", 3).unwrap();
+        assert_eq!(s.run("run-a").unwrap().unwrap().turns, 5);
     }
 
     #[test]

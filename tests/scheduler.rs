@@ -1030,6 +1030,92 @@ fn a_hard_killed_runs_commits_survive_the_recovery_that_frees_its_issue() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Issue #25. `run.turns` used to be written once, by `finish_run`, so an in-flight run's row
+/// read `0` and the live count existed only in the `RunHandle` inside `running`. That map dies
+/// with the process, so after a hard kill the interrupted run reported zero turns forever and
+/// the conversation `recover()` resumes had a recorded cost of nothing. The count must be
+/// checkpointed as the run advances, survive the kill, and be charged to the issue's budget when
+/// recovery closes the row — without the fake worker ever finishing, which is the only way to
+/// prove `finish_run` is not what wrote it.
+#[test]
+fn a_run_interrupted_by_a_hard_kill_reports_its_last_known_turn_count_after_restart() {
+    let dir = tmp_dir("hard-kill-turns");
+    let db = dir.join("symphony.db");
+    let root = dir.join("workspaces");
+
+    // Ten turns over 600s: one every minute, so the count is unambiguous at any tick.
+    let script = Script { duration_ms: 600_000, turns: 10, ..Script::succeeds_in(600_000) };
+
+    let (run_id, expected) = {
+        let mut h = harness_over(
+            vec![issue(1, "In Progress", Some(1))],
+            root.clone(),
+            Store::open(&db).unwrap(),
+            Arc::new(DirWorkspace::new(&root).unwrap()),
+            |_| {},
+        );
+        h.worker.set_default(script.clone());
+        h.sched.tick().unwrap();
+        assert_eq!(h.sched.running_count(), 1);
+
+        // Three ticks of progress. Each one may write at most once, whatever the agent did in
+        // between: the fake's count moves on every clock advance, and the store must see only
+        // what the tick observed.
+        for _ in 0..3 {
+            h.clock.advance_ms(120_000);
+            h.sched.tick().unwrap();
+        }
+        let snap = h.sched.snapshot().unwrap();
+        let row = &snap.rows[0];
+        let expected = row.turns;
+        assert!(expected > 1, "the run must actually have advanced for this test to mean anything");
+        assert!(row.runs[0].ended_at.is_none(), "and must still be in flight");
+        assert_eq!(
+            row.runs[0].turns, expected,
+            "the published run record tracks the live count while the run is in flight"
+        );
+
+        // More progress the scheduler never gets to observe — the kill lands before the tick.
+        h.clock.advance_ms(60_000);
+        assert!(h.sched.running_count() == 1);
+        let run_id = row.runs[0].run_id.clone();
+        std::mem::forget(h); // no shutdown, no Drop: nothing gets a final `finish_run`
+        (run_id, expected)
+    };
+
+    // The row the kill left behind: still open, but carrying the last checkpoint, not zero.
+    let orphan = Store::open(&db).unwrap().run(&run_id).unwrap().unwrap();
+    assert_eq!(orphan.ended_at, None);
+    assert_eq!(orphan.turns, expected, "the count must have been written before the kill");
+
+    // The restart. Recovery closes the row and charges the issue for what the attempt reached.
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open(&db).unwrap(),
+        Arc::new(DirWorkspace::new(&root).unwrap()),
+        |_| {},
+    );
+    h.worker.set_default(script);
+    restart_took_time(&h);
+    h.sched.tick().unwrap();
+
+    let closed = h.sched.store().run(&run_id).unwrap().unwrap();
+    assert_eq!(closed.outcome.as_deref(), Some("orphaned"));
+    assert_eq!(closed.turns, expected, "closing the orphaned row must not reset its count");
+    assert_eq!(closed.in_tok, None, "and must not invent a total the run never reported");
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(
+        st.cumulative_turns, expected,
+        "the interrupted attempt counts against the per-issue budget it consumed"
+    );
+    assert_eq!(h.sched.running_count(), 1, "and the issue is dispatched again regardless");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The filter that makes recovery safe to run at all: a claim is stale only when *this* process
 /// has no run for it. Drop the check and a recovery pass reconciles away the live work it was
 /// added to rescue.

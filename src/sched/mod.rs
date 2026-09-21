@@ -238,6 +238,7 @@ impl Scheduler {
 
         // Unconditional: in-flight runs are reconciled even when config is broken.
         self.harvest_finished()?;
+        self.observe_progress()?;
         self.detect_stalls()?;
         self.refresh_running()?;
 
@@ -486,6 +487,43 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Read every in-flight run's progress once per tick, and checkpoint the turn count.
+    ///
+    /// The read serves two consumers. `detect_stalls` wants to know *when* progress last moved,
+    /// which `last_progress_at` records. And the store wants to know *how far* the run has got,
+    /// because until this existed `run.turns` was written once, by `finish_run`, and the live
+    /// count lived only in the handle — which dies with the process, so a hard kill lost how far
+    /// every in-flight run had got and `recover()` closed each one at zero (issue #25). The
+    /// conversation it then resumed had a recorded cost of nothing.
+    ///
+    /// Throttled by construction rather than by a timer: one read per run per tick, and a write
+    /// only when the turn count moved since the last one. The tick runs at the poll interval,
+    /// and the TUI's four-a-second repaint republishes the snapshot without ticking, so the
+    /// write rate is bounded by `polling.interval_ms`, not by how chatty the agent is. A
+    /// checkpoint that fails is logged and skipped — losing one costs a restart a tick's worth
+    /// of progress, and this runs ahead of the config gate so it must not stop reconciliation.
+    ///
+    /// Separate from `detect_stalls` because that step is optional (`stall_timeout_ms = 0`) and
+    /// this one is not: a deployment that turns stall detection off must not also, silently,
+    /// turn off durable progress.
+    fn observe_progress(&mut self) -> anyhow::Result<()> {
+        let now = self.clock.mono();
+        for r in self.running.values_mut() {
+            let p = r.handle.progress();
+            if p == r.last_progress {
+                continue;
+            }
+            if p.turns != r.last_progress.turns
+                && let Err(e) = self.store.record_progress(&r.run_id, p.turns)
+            {
+                tracing::warn!(run_id = %r.run_id, error = %e, "progress checkpoint failed");
+            }
+            r.last_progress = p;
+            r.last_progress_at = now;
+        }
+        Ok(())
+    }
+
     fn detect_stalls(&mut self) -> anyhow::Result<()> {
         let limit = self.cfg.agent.stall_timeout_ms;
         if limit == 0 {
@@ -493,17 +531,14 @@ impl Scheduler {
         }
         let now = self.clock.mono();
 
-        // Refresh progress and note who has gone quiet.
-        let mut stalled = Vec::new();
-        for (id, r) in self.running.iter_mut() {
-            let p = r.handle.progress();
-            if p != r.last_progress {
-                r.last_progress = p;
-                r.last_progress_at = now;
-            } else if now.saturating_since(r.last_progress_at) > limit {
-                stalled.push(id.clone());
-            }
-        }
+        // `observe_progress` has just refreshed `last_progress_at`, so anyone whose mark is
+        // older than the limit has been quiet for that long.
+        let stalled: Vec<String> = self
+            .running
+            .iter()
+            .filter(|(_, r)| now.saturating_since(r.last_progress_at) > limit)
+            .map(|(id, _)| id.clone())
+            .collect();
 
         for id in stalled {
             tracing::warn!(issue_id = %id, limit_ms = limit, "stalled; terminating");

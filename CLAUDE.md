@@ -22,7 +22,7 @@ the published snapshot with a `status` client in front of it.
 ## Commands
 
 ```bash
-cargo test                                 # 164 unit + 52 integration
+cargo test                                 # 166 unit + 53 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -108,7 +108,7 @@ no sleeps and nothing to flake — time only moves when a test moves it.
 ```
 recover()                                        ← first tick only
                  ↓
-harvest_finished → detect_stalls → refresh_running   ← unconditional
+harvest_finished → observe_progress → detect_stalls → refresh_running   ← unconditional
                  ↓
             cfg.preflight()                          ← gate: on failure, return here
                  ↓
@@ -368,6 +368,7 @@ reading — check that the named test is still meaningful, not just still green.
 | Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
 | A dead session cannot strand an issue | drop the session name after a run with zero turns | `a_run_that_took_no_turns_is_not_retried_into_the_same_conversation` |
 | A hard kill cannot strand a claim | startup `recover()`: a claim with no live run is stale, because `running` cannot cross a process boundary | `a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup` |
+| A hard kill cannot zero an in-flight run's progress | `observe_progress` checkpoints `run.turns` once per tick when the count moved, and `close_open_runs` keeps it and charges it to `cumulative_turns` in one transaction | `a_run_interrupted_by_a_hard_kill_reports_its_last_known_turn_count_after_restart` |
 | An agent cannot write to another ticket | no tool takes an issue id; the target comes from the per-run token | `a_call_naming_a_different_issue_is_refused_and_the_refusal_is_audited` |
 | A looping agent cannot write without bound | per-run **and** per-issue budgets, charged on attempts not successes | `a_continuation_cannot_refresh_the_budget_by_opening_a_new_session` |
 | A finished run keeps no write authority | the session is an RAII guard living in the `running` entry | `a_run_that_ends_takes_its_broker_authority_with_it` |
