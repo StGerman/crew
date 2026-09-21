@@ -1014,6 +1014,7 @@ impl Scheduler {
             &session,
             broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
+            None,
         );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.

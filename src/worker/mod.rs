@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Issue, Outcome};
+use crate::model::{Feedback, Issue, Outcome, ReviewVerdict};
 use crate::transcript::TranscriptWriter;
 
 /// Where this run's host-side tool broker is, when there is one.
@@ -112,6 +112,13 @@ pub trait RunHandle: Send + Sync {
     fn progress(&self) -> Progress;
     /// True once the run has produced a verdict.
     fn finished(&self) -> Option<Outcome>;
+    /// The review verdicts the run reported, once it has finished. Empty for a run that gave
+    /// none — which is every run not handed review feedback, and also a run that was handed
+    /// it and said nothing, which the scheduler treats as "still outstanding" rather than as
+    /// settled.
+    fn verdicts(&self) -> Vec<ReviewVerdict> {
+        Vec::new()
+    }
     /// Request termination and wait, bounded, for the run to actually stop.
     ///
     /// Must not return until the run is confirmed stopped — the caller deletes the workspace
@@ -140,6 +147,12 @@ pub trait Worker: Send + Sync {
     /// file could not be opened, and carries the same degrade-never-fail contract as `tools`.
     /// An implementation writes to it and never reads it back — where it points is already
     /// known to the scheduler, which is what records the path.
+    ///
+    /// `feedback` is what delivery learned about the previous run's output — a red CI, review
+    /// comments — and is `None` for every run that is not a fix round. The worker renders it
+    /// into the prompt; the scheduler does not, because the prompt's wording and the verdict
+    /// marker the worker parses back are one convention and live in one module.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         &self,
         issue: &Issue,
@@ -148,5 +161,6 @@ pub trait Worker: Send + Sync {
         session: &Session,
         tools: Option<&ToolEndpoint>,
         transcript: Option<TranscriptWriter>,
+        feedback: Option<&Feedback>,
     ) -> Arc<dyn RunHandle>;
 }

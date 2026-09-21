@@ -92,7 +92,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
-use crate::model::{ErrorClass, Issue, Outcome};
+use crate::model::{ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict};
 use crate::transcript::TranscriptWriter;
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
@@ -126,6 +126,11 @@ pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
 ];
 
 const OUTCOME_MARKER: &str = "SYMPHONY_OUTCOME:";
+/// `SYMPHONY_REVIEW: <comment-id>: accepted: <commit>` or `...: rejected: <reason>`, one per
+/// review comment the run was handed. The same kind of soft convention as the outcome marker,
+/// and for the same reason: the CLI has no structured channel for it. A comment the agent
+/// gives no line for simply stays outstanding — see the delivery section of `sched`.
+const REVIEW_MARKER: &str = "SYMPHONY_REVIEW:";
 
 /// Bounded by design: the last thing read from a crashing or malicious child should not become
 /// an unbounded log line or error message.
@@ -151,6 +156,7 @@ impl ClaudeWorker {
 struct Inner {
     progress: Progress,
     outcome: Option<Outcome>,
+    verdicts: Vec<ReviewVerdict>,
     /// Set only once the child has been reaped (`Child::wait` returned). `kill` must not
     /// return before this is true — the caller deletes the workspace next.
     reaped: bool,
@@ -179,6 +185,10 @@ impl RunHandle for ClaudeRun {
 
     fn finished(&self) -> Option<Outcome> {
         self.state.0.lock().unwrap().outcome.clone()
+    }
+
+    fn verdicts(&self) -> Vec<ReviewVerdict> {
+        self.state.0.lock().unwrap().verdicts.clone()
     }
 
     fn kill(&self, grace_ms: u64) -> KillResult {
@@ -225,12 +235,13 @@ impl Worker for ClaudeWorker {
         session: &Session,
         tools: Option<&ToolEndpoint>,
         mut transcript: Option<TranscriptWriter>,
+        feedback: Option<&Feedback>,
     ) -> Arc<dyn RunHandle> {
         // `--resume` is passed with an explicit id, never bare: bare opens an interactive
         // picker, and there is no human here to answer it.
         let (prompt, flag) = match session {
-            Session::New(_) => (build_prompt(issue, tools), "--session-id"),
-            Session::Resume(_) => (build_continuation_prompt(issue, tools), "--resume"),
+            Session::New(_) => (build_prompt(issue, tools, feedback), "--session-id"),
+            Session::Resume(_) => (build_continuation_prompt(issue, tools, feedback), "--resume"),
         };
 
         let mut cmd = Command::new(&self.bin);
@@ -420,6 +431,9 @@ fn run_reader(
                 // confirmed on a real install: SIGTERM mid-run ends the stream with no `result`
                 // — so `tokens` stays `None` for those, which is the intended report.
                 g.progress.tokens = extract_usage(&value);
+                g.verdicts = extract_verdicts(
+                    value.get("result").and_then(|x| x.as_str()).unwrap_or_default(),
+                );
                 g.outcome = Some(interpret_result(&value));
                 drop(g);
                 break;
@@ -503,6 +517,26 @@ fn extract_marker(text: &str, kind: &str) -> Option<String> {
     })
 }
 
+/// Every well-formed `SYMPHONY_REVIEW: <id>: <accepted|rejected>: <detail>` line in the final
+/// text. Malformed lines are skipped rather than failing the run: the run's own outcome does not
+/// depend on this, and a comment left unsettled stays outstanding, which is the safe reading.
+fn extract_verdicts(text: &str) -> Vec<ReviewVerdict> {
+    text.lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix(REVIEW_MARKER)?.trim();
+            let (id, rest) = rest.split_once(':')?;
+            let (kind, detail) = rest.trim().split_once(':')?;
+            let verdict = Verdict::parse(kind)?;
+            let id = id.trim();
+            let detail = detail.trim();
+            if id.is_empty() || detail.is_empty() {
+                return None;
+            }
+            Some(ReviewVerdict { comment_id: id.to_string(), verdict, detail: detail.to_string() })
+        })
+        .collect()
+}
+
 /// Reads the totals off a `result` event's top-level `usage` block. Only that block: the
 /// per-event `message.usage` on `assistant` events is what this replaced, and `modelUsage` on
 /// the same `result` carries the same totals keyed by model, which would only matter if the
@@ -538,7 +572,11 @@ fn truncate(s: &str, n: usize) -> String {
 /// already holds both, and re-sending them spends the turn budget on what the agent is about to
 /// re-read anyway. What it adds is the one thing the agent cannot see from inside — that the
 /// previous session ended without the work being finished.
-fn build_continuation_prompt(issue: &Issue, tools: Option<&ToolEndpoint>) -> String {
+fn build_continuation_prompt(
+    issue: &Issue,
+    tools: Option<&ToolEndpoint>,
+    feedback: Option<&Feedback>,
+) -> String {
     let mut p = format!(
         "Continue working on {}. Your previous session on this issue ended before the work was \
          finished — either you asked for another turn, or the orchestrator's per-session turn \
@@ -552,11 +590,16 @@ fn build_continuation_prompt(issue: &Issue, tools: Option<&ToolEndpoint>) -> Str
          SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
         issue.identifier
     );
+    p.push_str(&feedback_help(feedback));
     p.push_str(&tool_help(tools));
     p
 }
 
-fn build_prompt(issue: &Issue, tools: Option<&ToolEndpoint>) -> String {
+fn build_prompt(
+    issue: &Issue,
+    tools: Option<&ToolEndpoint>,
+    feedback: Option<&Feedback>,
+) -> String {
     let mut p = format!("You are working on issue {}: {}\n\n", issue.identifier, issue.title);
     if let Some(url) = &issue.url {
         p.push_str(&format!("Tracker URL: {url}\n\n"));
@@ -575,8 +618,68 @@ fn build_prompt(issue: &Issue, tools: Option<&ToolEndpoint>) -> String {
          If you are stuck and need a human to unblock you, end your final message with:\n\
          SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
     );
+    p.push_str(&feedback_help(feedback));
     p.push_str(&tool_help(tools));
     p
+}
+
+/// What delivery found wrong with the previous run's output, as work.
+///
+/// A red CI is handed over as the failing check and its detail, with the instruction that the
+/// job is to make it green — not to explain it. Review comments are handed over one by one with
+/// their ids, and the run is asked for a verdict on each in a form this module can parse back:
+/// a fix names the commit that carries it, a refusal names its reason. Comments that came back
+/// unanswered from an earlier round are called out, so silence reads as noticed rather than
+/// accepted.
+fn feedback_help(feedback: Option<&Feedback>) -> String {
+    let Some(fb) = feedback else { return String::new() };
+    let mut s = String::new();
+    match fb {
+        Feedback::Ci { pr_url, failures } => {
+            s.push_str(&format!(
+                "\nCI is red on the pull request for this work ({pr_url}). Your job this run is \
+                 to make it green: reproduce the failure locally, fix it, run the project's \
+                 own gate, and commit. Do not report done while the cause below is unfixed.\n"
+            ));
+            for f in failures {
+                s.push_str(&format!("\n### {}", f.name));
+                if let Some(u) = &f.url {
+                    s.push_str(&format!(" ({u})"));
+                }
+                s.push('\n');
+                if !f.detail.is_empty() {
+                    s.push_str(&f.detail);
+                    s.push('\n');
+                }
+            }
+        }
+        Feedback::Review { pr_url, comments, unanswered_before } => {
+            s.push_str(&format!(
+                "\nThe pull request for this work ({pr_url}) has review comments that need a \
+                 verdict each. For every comment below, either fix what it raises and commit, \
+                 or decide it should not change and say why. Do not merely acknowledge one. \
+                 Then end your final message with one line per comment, exactly:\n\
+                 SYMPHONY_REVIEW: <comment-id>: accepted: <commit sha that resolved it>\n\
+                 SYMPHONY_REVIEW: <comment-id>: rejected: <one-sentence reason>\n"
+            ));
+            if !unanswered_before.is_empty() {
+                s.push_str(&format!(
+                    "\nThese were handed to a previous run and came back without a verdict; \
+                     they are still open: {}\n",
+                    unanswered_before.join(", ")
+                ));
+            }
+            for c in comments {
+                let at = match (&c.path, c.line) {
+                    (Some(p), Some(l)) => format!("{p}:{l}"),
+                    (Some(p), None) => p.clone(),
+                    _ => "(general)".into(),
+                };
+                s.push_str(&format!("\n[{}] {} — {}\n{}\n", c.id, at, c.author, c.body.trim()));
+            }
+        }
+    }
+    s
 }
 
 /// Names the broker's tools in the prompt.
@@ -678,7 +781,7 @@ mod tests {
         // The two disagree on purpose, so this test can only pass by reading the right one.
         let ws = tmp_workspace("done");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let p = h.progress();
@@ -700,7 +803,7 @@ mod tests {
         // long tool call reads as silent.
         let ws = tmp_workspace("events");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -716,7 +819,7 @@ mod tests {
         // number; the number would be wrong by the turn count, so the honest report is none.
         let ws = tmp_workspace("no-total");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -730,7 +833,7 @@ mod tests {
     fn a_symphony_outcome_continue_marker_is_parsed_from_the_final_text() {
         let ws = tmp_workspace("continue");
         let w = ClaudeWorker::new(fixture("explicit_continue.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -741,10 +844,94 @@ mod tests {
     }
 
     #[test]
+    fn review_verdicts_are_parsed_off_the_final_text_and_a_malformed_line_leaves_its_comment_open()
+    {
+        let ws = tmp_workspace("verdicts");
+        let w = ClaudeWorker::new(fixture("review_verdicts.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+        let v = h.verdicts();
+        assert_eq!(v.len(), 2, "two well-formed lines, one malformed: {v:?}");
+        assert_eq!(v[0].comment_id, "4059939692");
+        assert_eq!(v[0].verdict, Verdict::Accepted);
+        assert_eq!(v[0].detail, "a1b2c3d", "an accepted verdict names the resolving commit");
+        assert_eq!(v[1].verdict, Verdict::Rejected);
+        assert!(v[1].detail.starts_with("the umask concern"), "a rejection names its reason");
+        assert!(
+            !v.iter().any(|x| x.comment_id == "4059939694"),
+            "a line with no verdict must leave its comment outstanding, not invent one"
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_run_handed_no_review_reports_no_verdicts() {
+        let ws = tmp_workspace("no-verdicts");
+        let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        wait_for_finish(&h);
+        assert!(h.verdicts().is_empty());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_red_ci_reaches_the_prompt_as_the_failing_check_and_its_detail() {
+        let fb = Feedback::Ci {
+            pr_url: "https://github.com/o/r/pull/9".into(),
+            failures: vec![crate::forge::CiFailure {
+                name: "fmt + clippy + test".into(),
+                url: Some("https://ci/run/1".into()),
+                detail: "error[E0308]: mismatched types\n --> src/x.rs:4:5".into(),
+            }],
+        };
+        for prompt in [
+            build_prompt(&issue(), None, Some(&fb)),
+            build_continuation_prompt(&issue(), None, Some(&fb)),
+        ] {
+            assert!(prompt.contains("CI is red"), "{prompt}");
+            assert!(prompt.contains("fmt + clippy + test"));
+            assert!(
+                prompt.contains("error[E0308]: mismatched types"),
+                "the cause must reach the agent"
+            );
+            assert!(prompt.contains("https://github.com/o/r/pull/9"));
+        }
+        assert!(!build_prompt(&issue(), None, None).contains("CI is red"));
+    }
+
+    #[test]
+    fn review_comments_reach_the_prompt_with_their_ids_and_the_verdict_convention() {
+        let fb = Feedback::Review {
+            pr_url: "https://github.com/o/r/pull/9".into(),
+            comments: vec![crate::forge::ReviewComment {
+                id: "4059939692".into(),
+                author: "Copilot".into(),
+                path: Some("src/config.rs".into()),
+                line: Some(79),
+                body: "This field is missing `#[serde(default)]`".into(),
+                url: None,
+            }],
+            unanswered_before: vec!["4059939600".into()],
+        };
+        let prompt = build_prompt(&issue(), None, Some(&fb));
+        assert!(prompt.contains("[4059939692] src/config.rs:79 — Copilot"), "{prompt}");
+        assert!(prompt.contains("missing `#[serde(default)]`"));
+        assert!(prompt.contains(REVIEW_MARKER), "the agent must be told the marker to answer with");
+        assert!(prompt.contains("accepted: <commit sha"), "an acceptance must name its commit");
+        assert!(prompt.contains("rejected: <one-sentence reason>"));
+        assert!(
+            prompt.contains("4059939600"),
+            "an earlier round's silence is named, not forgotten"
+        );
+    }
+
+    #[test]
     fn a_crash_with_no_result_event_fails_rather_than_hanging_or_inferring_done() {
         let ws = tmp_workspace("crash");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         let outcome = wait_for_finish(&h);
         assert!(
@@ -759,7 +946,7 @@ mod tests {
     fn a_partial_trailing_line_is_skipped_not_fatal_to_the_supervisor() {
         let ws = tmp_workspace("partial");
         let w = ClaudeWorker::new(fixture("partial_trailing_line.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         // The point under test is that a malformed final line does not panic or hang the
         // reader thread — it still reaches a verdict (Failed, since no result event arrived).
@@ -773,7 +960,7 @@ mod tests {
     fn killing_a_process_that_ignores_sigterm_forces_it_and_it_is_actually_gone() {
         let ws = tmp_workspace("silence");
         let w = ClaudeWorker::new(fixture("silence.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         // Give the script time to install its SIGTERM trap and write its own pid before we
         // try to kill it.
@@ -809,7 +996,7 @@ mod tests {
         ] {
             let ws = tmp_workspace(flag.trim_start_matches('-'));
             let w = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
-            let h = w.spawn(&issue(), &ws, 0, &session, None, None);
+            let h = w.spawn(&issue(), &ws, 0, &session, None, None, None);
             wait_for_finish(&h);
 
             let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
@@ -837,7 +1024,7 @@ mod tests {
         }
 
         let w = ClaudeWorker::new(fixture("dump_env.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
         wait_for_finish(&h);
 
         let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
@@ -857,7 +1044,7 @@ mod tests {
         // first and report Continue rather than waiting for (or trusting) the CLI's own exit.
         let ws = tmp_workspace("budget");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 1);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -879,7 +1066,7 @@ mod tests {
         let path = log.path().to_path_buf();
 
         let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 2, &fresh_session(), None, Some(log));
+        let h = w.spawn(&issue(), &ws, 2, &fresh_session(), None, Some(log), None);
         assert_eq!(wait_for_finish(&h), Outcome::Done);
 
         // The reader thread owns the writer, so the file is only certainly complete once the
@@ -916,7 +1103,7 @@ mod tests {
         // the record and nothing else.
         let ws = tmp_workspace("no-transcript");
         let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         assert_eq!(h.progress().turns, 2);
@@ -928,7 +1115,7 @@ mod tests {
     fn a_missing_binary_reports_agent_not_found_immediately() {
         let ws = tmp_workspace("missing-bin");
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
 
         let outcome = wait_for_finish(&h);
         assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }));
@@ -947,7 +1134,7 @@ mod tests {
         let path = log.path().to_path_buf();
 
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, Some(log));
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, Some(log), None);
         assert!(matches!(
             wait_for_finish(&h),
             Outcome::Failed { class: ErrorClass::AgentNotFound, .. }
