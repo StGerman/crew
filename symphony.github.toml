@@ -25,12 +25,27 @@ interval_ms = 30000
 root = ".symphony/workspaces"
 repo = "."
 
+# Live dispatch: real `claude -p` processes, with `--permission-mode bypassPermissions`, against
+# real git worktrees. Flipping this is the separate, deliberate decision `WorkerConfig`'s doc
+# describes — a real tracker on its own only watches; this is what turns watching into working.
+[worker]
+kind = "claude"
+
 [agent]
+# Two real agents means two rust-analyzer indexes and two `cargo check`s on one machine —
+# budget 1-2 GB resident each. Worth it once the single-agent path is proven: the wall clock of
+# a dispatch is the agent's, not the orchestrator's, so the second one is close to free in time.
 max_concurrent = 2
-max_turns_per_session = 20
-max_turns_per_issue = 40
+# Budgets sized for a real agent rather than for the fake worker. A turn is one `assistant`
+# event, so a slice of work runs to dozens of them; at 20 the session was cut every 20 tool
+# calls, and at 40 cumulative the issue quarantined before the work could land.
+max_turns_per_session = 40
+max_turns_per_issue = 200
 max_retry_backoff_ms = 60000
-stall_timeout_ms = 15000
+# 15s was a fake-worker number. Progress only advances on `assistant` events, so one long tool
+# call — a cold `cargo check`, a rust-analyzer index — is indistinguishable from a stalled
+# agent; at 15s the scheduler kills a working agent mid-build and quarantines it after three.
+stall_timeout_ms = 300000
 quarantine_after_identical = 3
 refresh_miss_grace = 2
 
@@ -46,8 +61,9 @@ refresh_miss_grace = 2
 enabled = true
 max_calls_per_run = 10
 max_calls_per_issue = 40
+
 # Inspect a headless run without attaching a terminal:
 #   curl -s localhost:8787/api/v1/snapshot | jq '.rows[] | {identifier, phase, turns}'
 [api]
-enabled = false
+enabled = true
 bind = "127.0.0.1:8787"
