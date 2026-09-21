@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 first edit. It is the authoritative statement of how code is written here, with a check named
 for every rule. This file covers what the system is and why; that file covers how to change it.
 
-Operator-facing material — installing, configuring, running against a real tracker, setting up
-the GitHub App, troubleshooting a broken toolchain — lives in [README.md](README.md). If you
-are about to write down how a *person* runs something, it belongs there, not here.
+Development here is done by agents, so this file is the working surface: every command, every
+switch, every trap. [README.md](README.md) is for a person deciding whether to adopt this and
+what it is for — intention, installation, contribution. Commands belong here, not there.
 
 ## What this is
 
@@ -31,39 +31,57 @@ agent write to its own ticket without ever holding the credential, and an HTTP o
 the published snapshot with a `status` client in front of it for a person and an MCP server in
 front of it for the agent supervising the daemon.
 
-## The commit gate
+## Commands
 
 ```bash
 cargo test                                 # 226 unit + 90 integration
+cargo test --lib                           # unit only
+cargo test --test scheduler                # scheduler integration only
+cargo test --test api                      # ops API integration only
+cargo test a_permanent_failure             # one test; the arg is a substring match
+
 cargo clippy --all-targets -- -D warnings  # the standing bar is zero warnings
 cargo fmt --check
+
+cargo run -- --tui                         # dashboard against the fake tracker
+cargo run -- --max-ticks 20                # headless smoke run, then exit
+cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
+cargo run -- status                        # what a running daemon is doing, read over that API
+cargo run -- status MT-649                 # one issue in full: phase, attempt, turns, cost, branch
+cargo run -- --mcp 127.0.0.1:8788          # the same four routes as MCP tools, for a supervising agent
+claude mcp add --scope local --transport http symphony_ops http://127.0.0.1:8788/ops
+                                           # ...and how that agent gets them. Local scope, never user
+cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
+cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
 
-All three must pass before a commit, and [.github/workflows/ci.yml](.github/workflows/ci.yml)
-runs them on every push and pull request rather than trusting whoever remembers — which is the
-only version that survives a dispatched agent leaving a branch behind. `rust-toolchain.toml`
+The first three are the commit gate, and [.github/workflows/ci.yml](.github/workflows/ci.yml)
+now runs them on every push and pull request rather than trusting whoever remembers — which is
+the only version that survives a dispatched agent leaving a branch behind. `rust-toolchain.toml`
 pins the compiler so CI, this machine and every worktree agree on what "it compiles" means, and
 CI builds `--locked` so a drifted `Cargo.lock` fails rather than being quietly rewritten. One
 thing to preserve if you edit that workflow: it must never *run* an example. `broker_live`
 spawns a real `claude` and spends tokens, and only a Cargo default (examples are `test = false`)
 keeps `cargo test` from calling it — the workflow says so at the top.
 
-The two examples exist for things a test cannot reach. `broker_live` is the only thing that can
-prove the real CLI agrees with this crate's broker: the transport tests drive a socket this
-crate also wrote, and the tool tests drive a fake tracker. `dashboard_preview` renders a canned
-`Snapshot` through ratatui's `TestBackend`, so a layout change can be seen with no terminal and
-no scheduler involved. README.md has how to run them.
+`SYMPHONY_DB=/tmp/x.db` points the store somewhere disposable — worth doing before any run
+that might write state you do not want kept. `SYMPHONY_TASKS_ROOT=/tmp/tasks` does the same
+for the `~/.claude/tasks` projection, so a smoke run's demo issues (`iss-001`, `MT-601`, ...)
+don't land in your real Claude Code task list. `RUST_LOG=symphony_cc=debug` raises the log
+level; logs always go to stderr, because under `--tui` the alternate screen owns stdout.
 
-**Runs touch real disk.** A headless run creates real `git worktree`s under `workspace.root`
-(default `.symphony/workspaces`, gitignored) against `workspace.repo` (default `.`), real files
-under `~/.claude/tasks/<derived-session-id>/`, and a `.jsonl` transcript per run under
-`<workspace.root>/.transcripts/`. The worktree and the projection are best-effort seams — a
-failure in either degrades the run rather than stopping it — but they are disk and git state,
-not a simulation. `SYMPHONY_DB` and `SYMPHONY_TASKS_ROOT` redirect the store and the projection
-when you only want to watch the scheduler; README.md lists them.
+Every run's raw event stream lands under `<workspace.root>/.transcripts/`, one `.jsonl` per
+run, and the `dispatched` log line names the file. That is the first thing to reach for when
+asked what a run actually did — `jq -c 'select(.type=="assistant")' <file>` for the turns,
+`grep symphony_run_end` for how it exited. Tune or switch it off under `[transcripts]`; the
+bounds there are what make it safe to leave on.
 
-A transcript is the first thing to reach for when asked what a run actually did: the path is on
-the run row and in the `dispatched` log line, so it needs no knowledge of the layout.
+Headless runs now create real `git worktree`s under `workspace.root` (default
+`.symphony/workspaces`, gitignored) against `workspace.repo` (default `.`) and real files
+under `~/.claude/tasks/<derived-session-id>/`. Both are best-effort seams — a worktree or
+projection failure degrades the run, it does not stop it — but they are real disk and git
+state, not a simulation, so use the env overrides above when you just want to watch the
+scheduler and don't want the side effects.
 
 One thing the overrides do not cover: running the daemon from *inside* a worktree — which is
 what a dispatched agent's cwd is. `GitWorktreeWorkspace::new` refuses that at startup, because
@@ -72,6 +90,34 @@ in the top-level checkout's shared `.git`, where the orchestrator owning it neve
 (#29). The error names the way out: point `workspace.repo` at a throwaway clone and
 `workspace.root` beside it. Setting `SYMPHONY_DB` alone does not help — the litter was never
 in the store.
+
+```bash
+GITHUB_TOKEN=$(gh auth token) cargo run -- --config symphony.github.toml --max-ticks 3
+```
+
+points the tracker at this repo's own real Issues instead of the fake demo data —
+`symphony.github.toml` is checked in and ready to use, no token in it. Today that lists this
+repo's five open, `agent`-labelled issues and dispatches none of them, because none has an
+assignee yet (see `src/tracker/github.rs`'s module doc for the dispatchability rule and the
+state-label convention).
+
+`worker.kind = "claude"` is the other half — and it is a separate switch from the tracker on
+purpose (see `WorkerConfig`'s doc in [src/config.rs](src/config.rs)): a real tracker with the
+fake worker is a safe way to watch real dispatch decisions without spawning real agents,
+turning "point this at a real repo" into "start editing that repo" only when both are flipped
+deliberately. With it on, `cargo run` spawns real `claude -p` processes with
+`--permission-mode bypassPermissions` — no human answers a tool-use prompt in a headless
+dispatch — against real git worktrees. Treat `--max-ticks` on a config with `worker.kind =
+"claude"` as spawning real, tool-using agent processes, not a dry run.
+
+`broker_live` is the counterpart for the tool broker, and it exists because nothing inside
+this crate can prove the real CLI agrees with it: the transport tests drive a socket this crate
+also wrote, and the tool tests drive a fake tracker. It spawns an actual `claude` process
+against an actual broker and asserts the orchestrator performed exactly one write. It needs a
+working login and spends tokens; it writes to no tracker.
+
+`dashboard_preview` is the fastest way to see a layout change: it renders a canned `Snapshot`
+through ratatui's `TestBackend`, so there is no terminal and no scheduler involved.
 
 ## Architecture
 
@@ -329,9 +375,9 @@ an issue is parked instead of only the log. Setting no gate is a decision, not a
 the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
 agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
 empty command list, which makes the default a rebase and nothing more) and the scheduler tests
-attach `FakeGate` explicitly. `symphony.github.toml` sets the three commands from **The commit
-gate** above; the fake worker never commits, so under `symphony.toml` every gate finds nothing
-to hand off.
+attach `FakeGate` explicitly. `symphony.github.toml` sets the three commands from **Commands**
+above; the fake worker never commits, so under `symphony.toml` every gate finds nothing to hand
+off.
 
 The ops API ([src/api/mod.rs](src/api/mod.rs)) is the second observer of that same published
 snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v1/refresh`,
@@ -592,10 +638,16 @@ still be correct when the agent running it is working on this repo.
 [.mcp.json](.mcp.json) hands the agent rust-analyzer over MCP, so navigation in this repo is
 LSP rather than grep — which is what makes the invariant table above checkable: whether
 `guard_within` is still reached from both `prepare` and `remove` is a find-references
-question. Installing the three pieces it needs is in README.md. Being committed, `.mcp.json` is
-inherited by every worktree under `.symphony/workspaces`, so each dispatched agent indexes its
-own copy of the tree. That is intended, but it is not free — budget roughly 1-2 GB resident and
-one `cargo check` per concurrent run when setting `agent.max_concurrent`.
+question. It needs three pieces on the host — the `rust-analyzer` server, `rust-src`, and the
+`rust-analyzer-mcp` bridge — and how you install the first two depends on whether the
+toolchain came from rustup or Homebrew, which is why `.claude/skills/setup-rust-analyzer`
+exists rather than a command line here. A `SessionStart` hook
+([.claude/hooks/rust-analyzer-check.sh](.claude/hooks/rust-analyzer-check.sh)) probes for all
+three and names whichever is missing; without it the only symptom is an ENOENT at connect
+time, which says nothing about which piece to install. Being committed, it is inherited by every
+worktree under `.symphony/workspaces`, so each dispatched agent indexes its own copy of the
+tree. That is intended, but it is not free — budget roughly 1-2 GB resident and one
+`cargo check` per concurrent run when setting `agent.max_concurrent`.
 
 One trap, and it bites exactly the use above: `references`, `definition` and `hover` answer
 from whatever is indexed *so far* rather than waiting, so during the first load they come
@@ -637,7 +689,14 @@ Decisions already taken that are expensive to rediscover. The first two are impl
 
 ## Troubleshooting
 
-In [README.md](README.md). One that wastes the most time is worth naming here so it is not
-re-diagnosed as a code problem: if linking fails, or `git` refuses every invocation with *"You
-have not agreed to the Xcode license agreements"*, the cause is which developer directory is
-active, and `xcode-select --install` does not fix it.
+If linking fails, or `git` refuses every invocation with *"You have not agreed to the Xcode
+license agreements"*, the problem is which developer directory is active — not your code, and
+not a missing toolchain:
+
+```bash
+xcode-select -p    # pointing at /Applications/Xcode.app means an unaccepted license
+sudo xcode-select --switch /Library/Developer/CommandLineTools
+```
+
+`xcode-select --install` does **not** fix this. It installs the Command Line Tools; it does
+not make them active, so the reported symptom is unchanged and the real cause stays hidden.
