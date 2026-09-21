@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Wall};
 use crate::model::{ErrorClass, Phase};
@@ -37,6 +37,11 @@ pub struct IssueState {
     pub task_ref: Option<String>,
     /// The conversation continuations for this issue resume into, once one has been named.
     pub session_id: Option<String>,
+    /// The branch `Workspace::prepare` actually checked out for this issue's most recent
+    /// dispatch, recorded at that call rather than recomputed later from `identifier`. `None`
+    /// before the first dispatch, and cleared back to `None` when cleanup deletes the ref —
+    /// so a `Some` here always names a branch that still exists.
+    pub branch: Option<String>,
 }
 
 impl IssueState {
@@ -51,7 +56,7 @@ impl IssueState {
 /// whose process was killed with the orchestrator, until the next startup's `recover()` closes
 /// it. The counters are what the run had reported by the time it ended, which is zero for a run
 /// that died with whatever was counting them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
     pub issue_id: String,
@@ -125,7 +130,7 @@ impl Store {
         conn.query_row(
             "SELECT issue_id, identifier, worktree_key, phase, attempt, consecutive_fail,
                     last_fail_class, cumulative_turns, miss_count, parked_state, quarantined_at,
-                    last_error_class, last_error, task_ref, session_id
+                    last_error_class, last_error, task_ref, session_id, branch
              FROM issue_state WHERE issue_id = ?1",
             params![issue_id],
             Self::row_to_state,
@@ -159,6 +164,7 @@ impl Store {
             last_error: row.get(12)?,
             task_ref: row.get(13)?,
             session_id: row.get(14)?,
+            branch: row.get(15)?,
         })
     }
 
@@ -167,7 +173,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT issue_id, identifier, worktree_key, phase, attempt, consecutive_fail,
                     last_fail_class, cumulative_turns, miss_count, parked_state, quarantined_at,
-                    last_error_class, last_error, task_ref, session_id
+                    last_error_class, last_error, task_ref, session_id, branch
              FROM issue_state ORDER BY identifier",
         )?;
         let rows = stmt.query_map([], Self::row_to_state)?;
@@ -362,6 +368,30 @@ impl Store {
         conn.execute(
             "UPDATE issue_state SET session_id = ?2, updated_at = ?3 WHERE issue_id = ?1",
             params![issue_id, session_id, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
+    /// Record the branch `Workspace::prepare` actually checked out, or clear it once cleanup
+    /// deletes that ref.
+    ///
+    /// Written before the worker exists, the same category as the claim and the session id:
+    /// the real name only exists once `prepare` has returned, and the child cannot be what
+    /// records it. Recomputing it later from `identifier` was the bug this replaces —
+    /// `Store::ensure` can rename `identifier` after this call, and `Workspace::remove` deletes
+    /// the branch whenever git's merged check says it carries nothing new, so a name that still
+    /// resolves is not proof the ref still exists. Callers clear it (`None`) exactly when
+    /// `Removed::branch_deleted` says so, and leave it alone otherwise.
+    pub fn set_branch(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        branch: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET branch = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, branch, clock.wall().0],
         )?;
         Ok(())
     }

@@ -10,7 +10,7 @@
 //! | `/refresh` | `POST` | the snapshot the forced tick published |
 //! | `/unquarantine/:identifier` | `POST` | whether a quarantine was actually cleared |
 //!
-//! Three properties decide the shape of everything below:
+//! Four properties decide the shape of everything below:
 //!
 //! * **The snapshot is the whole view.** This type holds a [`watch::Receiver`] and a command
 //!   channel, and no `Store` — so an endpoint that wanted state the snapshot does not carry
@@ -25,6 +25,10 @@
 //!   the scheduler needs.
 //! * **Loopback unless an operator says otherwise.** The two `POST` routes control agent
 //!   execution, so [`bind`] refuses a non-loopback address unless `api.allow_public` is set.
+//! * **Every response proves it came from here.** A status code and a JSON body are exactly
+//!   what an unrelated service on the same port could also produce, so every response this
+//!   module writes — success or error — carries [`API_MARKER_HEADER`], and [`client::Client`]
+//!   refuses to trust anything else in a response that lacks it.
 //!
 //! There is no framework here on purpose. Four routes, no query parameters, no content
 //! negotiation and one response type do not pay for a server stack; `ureq` covers the client
@@ -44,6 +48,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
+pub mod client;
+pub mod render;
+
 use crate::config::ApiConfig;
 use crate::sched::{Row, Snapshot};
 
@@ -57,6 +64,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// lost the plot or is probing.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Every response this API writes carries this header, so [`client::Client`] can tell "the ops
+/// API answered" apart from "something on this port answered" before it trusts anything else in
+/// the response. Without it, a 404 from an unrelated service on the same port reads exactly like
+/// this router's own 404, and `--json` would pass either straight through. A header rather than
+/// a body field: the body is [`Snapshot`]/[`Row`] JSON, handed back to an operator verbatim by
+/// the client's `--json` paths, and a marker key inside it would leak into output meant to be
+/// piped into `jq`.
+const API_MARKER_HEADER: &str = "X-Symphony-Ops-Api";
+/// A version rather than a bare flag, so a wire-incompatible future change has somewhere to say
+/// so. Today the client only checks that this equals what it expects.
+const API_MARKER_VERSION: &str = "1";
 
 /// Work only the scheduler loop may do, with a channel to answer on.
 ///
@@ -76,9 +95,7 @@ pub enum Command {
 /// address that does not parse — and then carry on scheduling. The API failing to start must
 /// not be the reason agents stop being dispatched.
 pub async fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
-    let addr: SocketAddr = cfg
-        .bind
-        .trim()
+    let addr: SocketAddr = normalize_bind(&cfg.bind)
         .parse()
         .with_context(|| format!("api.bind = {:?} is not a host:port address", cfg.bind))?;
 
@@ -89,6 +106,15 @@ pub async fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
         );
     }
     TcpListener::bind(addr).await.with_context(|| format!("binding the ops API to {addr}"))
+}
+
+/// The one normalization `api.bind` gets before it is treated as an address. Shared with
+/// `client::bind_in` (and, through it, [`client::endpoint`]'s `--api` handling) so a client
+/// built from the same config file looks for the daemon at the address the daemon actually
+/// bound — a value with incidental surrounding whitespace must not bind here and build an
+/// unreachable URL there.
+fn normalize_bind(raw: &str) -> &str {
+    raw.trim()
 }
 
 #[derive(Clone)]
@@ -311,9 +337,11 @@ impl Response {
     }
 
     async fn write(self, stream: &mut TcpStream) -> std::io::Result<()> {
+        // Unconditional, on every status this writes — the marker is what lets a client trust
+        // a status code at all, so it cannot itself be gated on one.
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-             Connection: close\r\n",
+             Connection: close\r\n{API_MARKER_HEADER}: {API_MARKER_VERSION}\r\n",
             self.status,
             reason(self.status),
             self.body.len()

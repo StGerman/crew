@@ -32,8 +32,13 @@ fn d_quarantine_after() -> u32 {
 fn d_miss_grace() -> u32 {
     2
 }
+/// Where the ops API listens unless told otherwise, and equally where
+/// [`crate::api::client`] looks for it when neither a flag nor a config names an address. One
+/// constant so those two can never disagree about what "the default" is.
+pub const DEFAULT_API_BIND: &str = "127.0.0.1:8787";
+
 fn d_api_bind() -> String {
-    "127.0.0.1:8787".to_string()
+    DEFAULT_API_BIND.to_string()
 }
 fn d_broker_enabled() -> bool {
     true

@@ -81,6 +81,17 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE run_v3 RENAME TO run;
     CREATE INDEX IF NOT EXISTS run_by_issue ON run(issue_id, started_at DESC);
     "#,
+    // v4
+    r#"
+    -- The branch a dispatched run actually checked out, recorded once at `prepare` time rather
+    -- than recomputed from `identifier` on every read. A recomputed name can drift two ways:
+    -- `Store::ensure` may rename `identifier` after launch, changing what the recompute would
+    -- produce, and `Workspace::remove` deletes the branch whenever git's merged check says it
+    -- holds nothing new, so a name that still resolves says nothing about whether the ref still
+    -- exists. NULL means what it means everywhere else in this table: nothing to report, either
+    -- because the issue has never been dispatched or because cleanup deleted the ref.
+    ALTER TABLE issue_state ADD COLUMN branch TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
