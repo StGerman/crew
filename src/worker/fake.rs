@@ -73,6 +73,9 @@ pub struct FakeWorker {
     /// that failed to open a session hands `None` — so it is the scheduler's tests that need
     /// to see it, and nothing else in the run reveals it.
     endpoints: Mutex<HashMap<String, Vec<Option<ToolEndpoint>>>>,
+    /// The brief each spawn was handed. Whether a gate's failing output actually reached the
+    /// continuation is only observable here.
+    briefs: Mutex<HashMap<String, Vec<Option<String>>>>,
 }
 
 impl FakeWorker {
@@ -83,6 +86,7 @@ impl FakeWorker {
             default_script: Mutex::new(Script::default()),
             sessions: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(HashMap::new()),
+            briefs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,6 +108,11 @@ impl FakeWorker {
     pub fn endpoints_for(&self, issue_id: &str) -> Vec<Option<ToolEndpoint>> {
         self.endpoints.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
     }
+
+    /// The brief each spawn for this issue was handed, oldest first.
+    pub fn briefs_for(&self, issue_id: &str) -> Vec<Option<String>> {
+        self.briefs.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
+    }
 }
 
 impl Worker for FakeWorker {
@@ -115,9 +124,16 @@ impl Worker for FakeWorker {
         session: &Session,
         tools: Option<&ToolEndpoint>,
         transcript: Option<TranscriptWriter>,
+        brief: Option<&str>,
     ) -> Arc<dyn RunHandle> {
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
         self.endpoints.lock().unwrap().entry(issue.id.clone()).or_default().push(tools.cloned());
+        self.briefs
+            .lock()
+            .unwrap()
+            .entry(issue.id.clone())
+            .or_default()
+            .push(brief.map(str::to_string));
 
         let script = self
             .scripts
@@ -286,7 +302,8 @@ mod tests {
     fn a_run_finishes_only_once_the_clock_reaches_its_duration() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
+        let h =
+            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
 
         assert!(h.finished().is_none());
         c.advance_ms(3_999);
@@ -299,7 +316,8 @@ mod tests {
     fn progress_accumulates_turns_as_time_passes_and_totals_appear_only_at_completion() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
+        let h =
+            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
 
         let p0 = h.progress();
         c.advance_ms(3_999);
@@ -317,7 +335,8 @@ mod tests {
         // total, and the fake must not hand the scheduler one the real thing never would.
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
+        let h =
+            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
 
         c.advance_ms(2_000);
         assert_eq!(h.kill(1_000), KillResult::Stopped);
@@ -330,7 +349,8 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
+        let h =
+            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
 
         c.advance_ms(1_000);
         let frozen = h.progress();
@@ -344,7 +364,8 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
+        let h =
+            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
 
         c.advance_ms(5_000);
         assert_eq!(h.kill(1_000), KillResult::Forced);
@@ -355,7 +376,8 @@ mod tests {
     fn killing_an_already_finished_run_is_a_no_op() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
+        let h =
+            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
         c.advance_ms(4_000);
         assert_eq!(h.kill(1_000), KillResult::AlreadyDone);
         assert_eq!(h.finished(), Some(Outcome::Done), "verdict must not be rewritten");

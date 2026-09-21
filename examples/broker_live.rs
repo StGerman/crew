@@ -101,6 +101,7 @@ fn main() -> anyhow::Result<()> {
         &Session::New(symphony_cc::model::session_id("live", 1)),
         Some(session.endpoint()),
         transcript,
+        None,
     );
 
     let deadline = Instant::now() + Duration::from_secs(180);

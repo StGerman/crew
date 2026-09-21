@@ -90,6 +90,7 @@ impl Harness {
             worker: Default::default(),
             api: Default::default(),
             transcripts: Default::default(),
+            gate: Default::default(),
         };
 
         let clock = Arc::new(FakeClock::new());
