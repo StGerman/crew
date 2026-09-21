@@ -119,3 +119,32 @@ max_failures = 3
 # A cold `cargo test` in a fresh worktree builds everything first; 30 minutes is a bound
 # against a hang, not a budget a healthy run approaches.
 timeout_ms = 1800000
+# Delivery (src/sched/delivery.rs). With this on, a run that reports done has its branch pushed
+# to `remote` and a pull request opened against `base`, derived from the run record rather than
+# composed by the agent. A red CI or an outstanding review comment sends the issue back to an
+# agent with the failure in its prompt — the same path a `Continue` takes — and the pull request
+# is left open, ready to merge, for a human. Nothing here merges.
+#
+# Every hand-back is a round. `max_rounds_per_pr` bounds the current pull request and
+# `max_rounds_per_issue` bounds the issue's whole life; the second never resets, not for a new
+# run and not for a new pull request, because a bound that reset would bound nothing — the same
+# reason `max_calls_per_run` alone bounds no broker. At either bound the pull request goes to
+# the operator with the outstanding items named.
+#
+# `reviewers` is empty on purpose. This repository has automatic Copilot review on, and its
+# comments are read and worked whether or not anyone requested them. Requesting Copilot over
+# REST is the case GETT-174120 describes — the provider says yes and attaches nobody — and the
+# verification that follows every request would then hand off every pull request at once, before
+# the automatic review has had its minute to post. Name a human login here to have a review
+# requested and verified; leave it empty to rely on what the repository already does.
+[delivery]
+enabled = true
+base = "master"
+remote = "origin"
+reviewers = []
+max_rounds_per_pr = 3
+max_rounds_per_issue = 6
+# Two or three requests per open pull request per poll, on top of the tracker budget above.
+poll_interval_ms = 120000
+# A head CI never reports on is handed off after this long rather than waited on forever.
+ci_timeout_ms = 3600000

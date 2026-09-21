@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Issue, Outcome};
+use crate::model::{Feedback, Issue, Outcome, ReviewVerdict};
 use crate::transcript::TranscriptWriter;
 
 /// Where this run's host-side tool broker is, when there is one.
@@ -112,6 +112,13 @@ pub trait RunHandle: Send + Sync {
     fn progress(&self) -> Progress;
     /// True once the run has produced a verdict.
     fn finished(&self) -> Option<Outcome>;
+    /// The review verdicts the run reported, once it has finished. Empty for a run that gave
+    /// none — which is every run not handed review feedback, and also a run that was handed
+    /// it and said nothing, which the scheduler treats as "still outstanding" rather than as
+    /// settled.
+    fn verdicts(&self) -> Vec<ReviewVerdict> {
+        Vec::new()
+    }
     /// Request termination and wait, bounded, for the run to actually stop.
     ///
     /// Must not return until the run is confirmed stopped — the caller deletes the workspace
@@ -141,10 +148,12 @@ pub trait Worker: Send + Sync {
     /// An implementation writes to it and never reads it back — where it points is already
     /// known to the scheduler, which is what records the path.
     ///
-    /// `brief` is what the orchestrator knows about why this attempt exists that the agent
-    /// cannot see from inside its worktree: the retry reason, and for a run the handoff gate
-    /// sent back, the gate's failing output. `None` on a first dispatch. It reaches the agent
-    /// through the prompt and nothing else, so a worker that ignores it is degraded, not wrong.
+    /// `feedback` is what the orchestrator knows about why this attempt exists that the agent
+    /// cannot see from inside its worktree — the handoff gate's failing output, a red CI, review
+    /// comments — and is `None` on a first dispatch. The worker renders it into the prompt; the
+    /// scheduler does not, because the prompt's wording and the verdict marker the worker
+    /// parses back are one convention and live in one module. It reaches the agent through the
+    /// prompt and nothing else, so a worker that ignores it is degraded, not wrong.
     #[allow(clippy::too_many_arguments)]
     fn spawn(
         &self,
@@ -154,6 +163,6 @@ pub trait Worker: Send + Sync {
         session: &Session,
         tools: Option<&ToolEndpoint>,
         transcript: Option<TranscriptWriter>,
-        brief: Option<&str>,
+        feedback: Option<&Feedback>,
     ) -> Arc<dyn RunHandle>;
 }

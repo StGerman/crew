@@ -69,3 +69,9 @@ enabled = true
 max_failures = 3
 timeout_ms = 1800000
 commands = []
+# Delivery (src/sched/delivery.rs): push a finished run's branch, open a pull request, read CI,
+# request and verify review, hand review comments back to an agent as work. Off here because
+# the demo tracker has no repository to deliver to; `symphony.github.toml` turns it on. The
+# round bounds are the brake on the review-fix loop this creates — see that file.
+[delivery]
+enabled = false

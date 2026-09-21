@@ -60,6 +60,25 @@ pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
     if let Some(t) = &r.transcript {
         lines.push(field("transcript", t.clone()));
     }
+    if let Some(d) = &r.delivery {
+        let pr = d.pr_url.clone().or_else(|| d.pr_number.map(|n| format!("#{n}")));
+        lines.push(field(
+            "delivery",
+            format!(
+                "{}{}  ·  rounds {}/{}",
+                pr.map(|p| format!("{p}  ·  ")).unwrap_or_default(),
+                d.stage,
+                d.rounds_pr,
+                d.rounds_issue
+            ),
+        ));
+        if let Some(why) = d.handoff_reason.as_ref().or(d.review_error.as_ref()) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<12}", "handed off"), Style::default().fg(Color::DarkGray)),
+                Span::styled(why.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+    }
     if let Some(url) = &r.url {
         lines.push(field("url", url.clone()));
     }

@@ -71,6 +71,24 @@ fn d_gate_max_failures() -> u32 {
 fn d_gate_timeout() -> u64 {
     1_800_000
 }
+fn d_delivery_base() -> String {
+    "master".into()
+}
+fn d_delivery_remote() -> String {
+    "origin".into()
+}
+fn d_rounds_per_pr() -> u32 {
+    3
+}
+fn d_rounds_per_issue() -> u32 {
+    6
+}
+fn d_delivery_poll() -> u64 {
+    120_000
+}
+fn d_ci_timeout() -> u64 {
+    60 * 60 * 1000
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -92,6 +110,8 @@ pub struct Config {
     pub transcripts: TranscriptsConfig,
     #[serde(default)]
     pub gate: GateConfig,
+    #[serde(default)]
+    pub delivery: DeliveryConfig,
 }
 
 /// The handoff gate (see [`crate::gate`]): rebase a `Done` run's branch onto `base`, then run
@@ -134,6 +154,65 @@ impl Default for GateConfig {
             commands: Vec::new(),
             max_failures: d_gate_max_failures(),
             timeout_ms: d_gate_timeout(),
+        }
+    }
+}
+
+/// Delivery: push, pull request, CI, review — the path from a run's `Done` to a pull request
+/// an operator can merge (see [`crate::sched`]'s delivery section and [`crate::forge`]).
+///
+/// Off by default, on the same reasoning as `worker.kind`: it publishes branches and opens
+/// pull requests under the operator's credentials, and that is a decision to make in the
+/// config that names the real repository, not one to inherit by upgrading.
+///
+/// The two round bounds are the brakes on the loop this feature creates. A reviewer that
+/// comments on every push, answered by an agent that pushes a fix, has no bound of its own;
+/// each round also spends a reviewer's quota and an operator's attention, not only tokens.
+/// `max_rounds_per_pr` alone is not enough — a pull request closed and reopened would start it
+/// over — which is what `max_rounds_per_issue` is for, and why it never resets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The branch pull requests target unless the work is stacked on another issue's branch.
+    #[serde(default = "d_delivery_base")]
+    pub base: String,
+    /// The git remote the branch is pushed to.
+    #[serde(default = "d_delivery_remote")]
+    pub remote: String,
+    /// Logins to request a review from once the pull request is open. Each request is verified
+    /// afterwards: a provider that accepts the request and attaches nobody is reported as a
+    /// failure, not a success. Empty means no review is requested and none is waited for.
+    #[serde(default)]
+    pub reviewers: Vec<String>,
+    /// Times delivery may hand the *current pull request* back to an agent — for a red CI or
+    /// for review comments — before handing it to the operator instead.
+    #[serde(default = "d_rounds_per_pr")]
+    pub max_rounds_per_pr: u32,
+    /// The same bound over the issue's whole life. Survives a new run and a new pull request.
+    #[serde(default = "d_rounds_per_issue")]
+    pub max_rounds_per_issue: u32,
+    /// How often an open delivery is polled for CI and review. Costs two or three provider
+    /// requests per open pull request per poll, on top of the tracker's own budget.
+    #[serde(default = "d_delivery_poll")]
+    pub poll_interval_ms: u64,
+    /// How long to wait for CI to report on a pushed head before handing off. A repository
+    /// with no CI configured would otherwise wait forever, looking healthy.
+    #[serde(default = "d_ci_timeout")]
+    pub ci_timeout_ms: u64,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base: d_delivery_base(),
+            remote: d_delivery_remote(),
+            reviewers: vec![],
+            max_rounds_per_pr: d_rounds_per_pr(),
+            max_rounds_per_issue: d_rounds_per_issue(),
+            poll_interval_ms: d_delivery_poll(),
+            ci_timeout_ms: d_ci_timeout(),
         }
     }
 }
@@ -463,6 +542,25 @@ impl Config {
                 )));
             }
         }
+        // A zero round bound would refuse the first fix round and read as delivery being
+        // broken; an empty base or remote would push nowhere. Same shape as the broker check.
+        if self.delivery.enabled {
+            if self.delivery.max_rounds_per_pr == 0 || self.delivery.max_rounds_per_issue == 0 {
+                return Err(ConfigError::Invalid(
+                    "delivery round bounds must be > 0; use delivery.enabled = false to \
+                     deliver nothing"
+                        .into(),
+                ));
+            }
+            if self.delivery.base.trim().is_empty() || self.delivery.remote.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "delivery.base and delivery.remote are required".into(),
+                ));
+            }
+            if self.delivery.poll_interval_ms == 0 || self.delivery.ci_timeout_ms == 0 {
+                return Err(ConfigError::Invalid("delivery intervals must be > 0".into()));
+            }
+        }
         // Overlap makes startup cleanup delete a workspace for an issue about to be dispatched.
         let overlap: Vec<_> = self
             .tracker
@@ -529,6 +627,7 @@ mod tests {
             api: Default::default(),
             transcripts: Default::default(),
             gate: Default::default(),
+            delivery: Default::default(),
         };
         c.normalize();
         c
@@ -548,6 +647,30 @@ mod tests {
         c.gate.enabled = false;
         c.gate.max_failures = 0;
         assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_zero_delivery_round_bound_is_rejected_rather_than_refusing_every_fix() {
+        let mut c = base();
+        c.delivery.enabled = true;
+        assert!(c.preflight().is_ok());
+        c.delivery.max_rounds_per_issue = 0;
+        assert!(c.preflight().is_err());
+        c.delivery.max_rounds_per_issue = 6;
+        c.delivery.max_rounds_per_pr = 0;
+        assert!(c.preflight().is_err());
+        // Off, the bounds are not consulted, so a stale zero cannot stop dispatch.
+        c.delivery.enabled = false;
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_config_written_before_delivery_existed_still_loads() {
+        // The finding on PR #30, made structural: a new top-level section must default.
+        let text = "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(!cfg.delivery.enabled);
+        assert_eq!(cfg.delivery.base, "master");
     }
 
     #[test]

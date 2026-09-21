@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::forge::{ForgeError, Published, Publisher};
 use crate::model::worktree_key;
 
 #[derive(Debug, thiserror::Error)]
@@ -407,6 +408,84 @@ impl Workspace for GitWorktreeWorkspace {
             }
         }
         Ok(Removed { branch_deleted })
+    }
+}
+
+/// The git half of delivery, on the type that already owns every other git call.
+///
+/// `publish` pushes from the *worktree*, not from `repo`: the worktree's HEAD is the branch,
+/// and pushing from `repo` would mean naming a ref `repo` may have checked out under a
+/// different name. The commit list is taken over the remote's copy of `base` when the remote
+/// has one, because that is the base the pull request will actually be opened against; a
+/// local `base` that has fallen behind would list commits the remote already has.
+impl Publisher for GitWorktreeWorkspace {
+    fn publish(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        remote: &str,
+        base: &str,
+    ) -> Result<Published, ForgeError> {
+        self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        Self::git(worktree, &["push", "--set-upstream", remote, branch]).map_err(|e| {
+            // A rejected push will be rejected again; anything else is the network.
+            let text = e.to_string();
+            if text.contains("rejected") || text.contains("permission") || text.contains("denied") {
+                ForgeError::Permanent(text)
+            } else {
+                ForgeError::Transient(text)
+            }
+        })?;
+        let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
+            .map_err(|e| ForgeError::Transient(e.to_string()))?;
+
+        // Best-effort: a fetch that fails leaves the local `base`, which is right whenever the
+        // remote has nothing newer, and only over-lists commits otherwise.
+        let _ = Self::git(worktree, &["fetch", "--quiet", remote, base]);
+        let remote_base = format!("refs/remotes/{remote}/{base}");
+        let base_ref =
+            if Self::git(worktree, &["rev-parse", "--verify", "--quiet", &remote_base]).is_ok() {
+                remote_base
+            } else {
+                base.to_string()
+            };
+        let range = format!("{base_ref}..{branch}");
+        let log = Self::git(worktree, &["log", "--format=%s", &range])
+            .map_err(|e| ForgeError::Transient(e.to_string()))?;
+        let commits = log.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
+        Ok(Published { head_sha, commits })
+    }
+
+    fn stacked_on(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        base: &str,
+        candidates: &[String],
+    ) -> Result<Option<String>, ForgeError> {
+        // A candidate is "under" this branch when it is an ancestor of it and carries commits
+        // `base` does not — a branch already merged into `base` is not a stack, it is history.
+        let under: Vec<&String> = candidates
+            .iter()
+            .filter(|c| *c != branch)
+            .filter(|c| {
+                Self::git(
+                    worktree,
+                    &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{c}")],
+                )
+                .is_ok()
+            })
+            .filter(|c| Self::git(worktree, &["merge-base", "--is-ancestor", c, branch]).is_ok())
+            .filter(|c| Self::git(worktree, &["merge-base", "--is-ancestor", c, base]).is_err())
+            .collect();
+        // Of a stack of several, the pull request is based on the nearest: the one no other
+        // candidate under this branch descends from.
+        let nearest = under.iter().find(|c| {
+            !under.iter().any(|o| {
+                o != *c && Self::git(worktree, &["merge-base", "--is-ancestor", c, o]).is_ok()
+            })
+        });
+        Ok(nearest.map(|s| s.to_string()))
     }
 }
 
@@ -890,6 +969,124 @@ mod tests {
         assert!(
             !branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")),
             "the parent's own branch is treated exactly as before"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ---- Publisher -----------------------------------------------------------
+
+    fn git_out(at: &Path, args: &[&str]) -> Result<String, String> {
+        let out = Command::new("git").arg("-C").arg(at).args(args).output().unwrap();
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    /// A repo with a bare `origin` it has already pushed `main` to, so a publish has somewhere
+    /// real to land and a remote-tracking base to be measured against.
+    fn repo_with_remote(tag: &str) -> (PathBuf, PathBuf) {
+        let repo = tmp_repo(tag);
+        let bare = tmp_root(&format!("bare-{tag}"));
+        git_out(&bare, &["init", "-q", "--bare"]).unwrap();
+        git_out(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).unwrap();
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        (repo, bare)
+    }
+
+    #[test]
+    fn publish_pushes_the_branch_to_the_remote_and_lists_its_commits_over_the_base() {
+        let root = tmp_root("wt-publish");
+        let (repo, bare) = repo_with_remote("wt-publish");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        commit_in(&p.path, "b.txt", "second change");
+
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(published.head_sha, head_of(&p.path));
+        assert_eq!(published.commits, vec!["second change", "first change"], "newest first");
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            published.head_sha,
+            "the remote must hold exactly the head that was reported"
+        );
+
+        // Pushing again with nothing new is idempotent, which delivery relies on.
+        let again = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(again, published);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn a_branch_carrying_nothing_over_its_base_publishes_an_empty_commit_list() {
+        let root = tmp_root("wt-publish-empty");
+        let (repo, bare) = repo_with_remote("wt-publish-empty");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let published =
+            ws.publish(&p.path, p.branch.as_deref().unwrap(), "origin", "main").unwrap();
+        assert!(published.commits.is_empty(), "nothing to open a pull request over");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn stacked_on_names_the_nearest_branch_under_the_work_and_ignores_ones_already_in_the_base() {
+        let root = tmp_root("wt-stack");
+        let repo = tmp_repo("wt-stack");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        // Lower carries a commit over main; upper is built on top of lower; sibling sits on
+        // main by itself; merged is a branch main already contains.
+        let lower = ws.prepare("id-1", "MT-1").unwrap();
+        commit_in(&lower.path, "lower.txt", "lower");
+        let lower_branch = lower.branch.clone().unwrap();
+
+        let upper = ws.prepare("id-2", "MT-2").unwrap();
+        git_out(&upper.path, &["merge", "-q", "--ff-only", &lower_branch]).unwrap();
+        commit_in(&upper.path, "upper.txt", "upper");
+        let upper_branch = upper.branch.clone().unwrap();
+
+        let sibling = ws.prepare("id-3", "MT-3").unwrap();
+        commit_in(&sibling.path, "sibling.txt", "sibling");
+        let sibling_branch = sibling.branch.clone().unwrap();
+
+        let merged = ws.prepare("id-4", "MT-4").unwrap();
+        let merged_branch = merged.branch.clone().unwrap();
+
+        let candidates = vec![lower_branch.clone(), sibling_branch.clone(), merged_branch];
+
+        assert_eq!(
+            ws.stacked_on(&upper.path, &upper_branch, "main", &candidates).unwrap(),
+            Some(lower_branch.clone()),
+            "upper's work sits on lower"
+        );
+        assert_eq!(
+            ws.stacked_on(&sibling.path, &sibling_branch, "main", &candidates).unwrap(),
+            None,
+            "a branch straight off main is not stacked, even with merged-in candidates around"
+        );
+
+        // A third storey: the nearest branch wins, not the lowest.
+        let top = ws.prepare("id-5", "MT-5").unwrap();
+        git_out(&top.path, &["merge", "-q", "--ff-only", &upper_branch]).unwrap();
+        commit_in(&top.path, "top.txt", "top");
+        let all = vec![lower_branch, upper_branch.clone(), sibling_branch];
+        assert_eq!(
+            ws.stacked_on(&top.path, top.branch.as_deref().unwrap(), "main", &all).unwrap(),
+            Some(upper_branch)
         );
 
         std::fs::remove_dir_all(&root).ok();

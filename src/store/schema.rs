@@ -100,6 +100,51 @@ pub(super) const MIGRATIONS: &[&str] = &[
     -- run X did" answerable from the run record alone, without knowing the layout on disk.
     ALTER TABLE run ADD COLUMN transcript TEXT;
     "#,
+    // v6
+    r#"
+    -- Delivery: what happened to an issue's branch after a run reported done. One row per
+    -- issue, because one issue has one branch and therefore at most one open pull request at
+    -- a time. The row is a cache of judgment like everything else here — losing it costs a
+    -- re-push and a re-read of the pull request, both idempotent — with one exception that is
+    -- the reason two of these counters exist: `rounds_issue` is the bound on how many times
+    -- delivery may hand an issue back to an agent over its whole life, and a bound that reset
+    -- with every fresh run (or every fresh pull request, which is what `rounds_pr` tracks)
+    -- would bound nothing, for the same reason `max_calls_per_run` alone bounds no broker.
+    CREATE TABLE IF NOT EXISTS delivery (
+      issue_id          TEXT PRIMARY KEY REFERENCES issue_state(issue_id),
+      stage             TEXT NOT NULL,
+      pr_number         INTEGER,
+      pr_url            TEXT,
+      base              TEXT,
+      head_sha          TEXT,
+      head_pushed_at    INTEGER,
+      review_requested  INTEGER NOT NULL DEFAULT 0,
+      review_error      TEXT,
+      rounds_pr         INTEGER NOT NULL DEFAULT 0,
+      rounds_issue      INTEGER NOT NULL DEFAULT 0,
+      pending_feedback  TEXT,
+      pending_verdicts  TEXT,
+      -- Comment ids handed to the most recent fix round, so the next one can name the threads
+      -- a run was told about and left unanswered, rather than presenting them as new.
+      handed_comments   TEXT,
+      handoff_reason    TEXT,
+      updated_at        INTEGER NOT NULL
+    );
+
+    -- Every review comment that has been settled, and how. Keyed by the provider's comment id
+    -- so a later round can be handed only the threads still open, and so nobody re-argues one
+    -- already accepted or rejected. `detail` is the commit that resolved it or the reason it
+    -- was declined — never empty, because a verdict without its grounds is just a label.
+    CREATE TABLE IF NOT EXISTS review_verdict (
+      issue_id     TEXT NOT NULL REFERENCES issue_state(issue_id),
+      comment_id   TEXT NOT NULL,
+      pr_number    INTEGER NOT NULL,
+      verdict      TEXT NOT NULL,
+      detail       TEXT NOT NULL,
+      recorded_at  INTEGER NOT NULL,
+      PRIMARY KEY (issue_id, comment_id)
+    );
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

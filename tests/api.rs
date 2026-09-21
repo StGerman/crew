@@ -85,6 +85,7 @@ impl Harness {
             api: Default::default(),
             transcripts: Default::default(),
             gate: Default::default(),
+            delivery: Default::default(),
         };
 
         let clock = Arc::new(FakeClock::new());
