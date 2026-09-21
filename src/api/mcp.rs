@@ -59,6 +59,14 @@
 //! the two surfaces carry the same two write actions and one flag should govern both. A bind
 //! failure costs this server alone — `main` logs it and schedules on — matching how
 //! [`super::bind`] already fails.
+//!
+//! `allow_public` is what makes the transport's own bounds load-bearing here, and it is the
+//! reason they exist: the broker's listener is always loopback and serves a handful of workers,
+//! but this one is an address an operator picks, on a server that spends a thread per
+//! connection. [`Limits`](crate::broker::server::Limits) is what the HTTP API's `READ_TIMEOUT`
+//! is over there — a deadline on a request that has begun and never ends, split from the idle
+//! wait so keep-alive still works, plus a cap on connections in flight.
+//! `a_client_that_never_finishes_its_request_cannot_hold_a_connection_thread` holds it.
 
 use std::net::TcpListener;
 
@@ -90,8 +98,10 @@ pub const TOOLS: &[&str] = &[TOOL_SNAPSHOT, TOOL_ISSUE, TOOL_REFRESH, TOOL_UNQUA
 /// Bind the ops MCP listener, refusing an exposure nobody asked for.
 ///
 /// Synchronous, unlike [`super::bind`], because the transport it feeds is the broker's
-/// thread-per-connection server rather than a tokio task. Separate from serving for the same
-/// reason as the HTTP one: `main` reports a failure and carries on scheduling.
+/// thread-per-connection server rather than a tokio task — which is also why a public bind
+/// here is bounded by [`Limits`](crate::broker::server::Limits) rather than by the address
+/// being loopback. Separate from serving for the same reason as the HTTP one: `main` reports
+/// a failure and carries on scheduling.
 pub fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
     let addr = super::resolve_bind("api.mcp_bind", &cfg.mcp_bind, cfg.allow_public)?;
     TcpListener::bind(addr).with_context(|| format!("binding the ops MCP server to {addr}"))

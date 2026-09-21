@@ -23,7 +23,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 175 unit + 59 integration
+cargo test                                 # 177 unit + 59 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -380,6 +380,16 @@ nowhere to put one. `api.mcp_enabled` or `--mcp <addr>`, off by default, loopbac
 broker's hand-rolled server made generic over `McpService` rather than copied or replaced with
 `rmcp`; `src/broker/server.rs`'s module doc records what that cost.
 
+That transport spends a thread per connection, and this is the first listener on it whose
+address an operator chooses — `allow_public` can put it on a routable interface, where a client
+that connects and then says nothing would hold a thread for free. `broker::server::Limits` is
+the HTTP API's `READ_TIMEOUT` arriving here: a deadline on a request that has begun and never
+ends, deliberately *split* from the idle wait between requests so keep-alive still works (the
+real client depends on it), and a cap on connections in flight, because a client that
+reconnects rather than dribbles pays nothing for a deadline. The broker's own listener gets
+both for free and keeps a separate count, so a flood at the public address cannot starve a
+dispatched run of its tools.
+
 **This server must never reach a dispatched agent**, and that is the thing to hold when
 touching any of this. The broker gives a worker authority scoped to one issue; this is scoped
 to the whole daemon, and a worker that could call `unquarantine` could clear its own quarantine
@@ -435,6 +445,7 @@ reading — check that the named test is still meaningful, not just still green.
 | Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
 | The ops tools never reach a dispatched worker | the ops MCP server has its own listener and its own path, and is never passed to `Broker`, whose `open` writes the only `--mcp-config` a worker is handed | `a_dispatched_worker_is_not_handed_the_ops_tools` |
 | An operator's question cannot disturb the daemon it asks about | `OpsMcp` holds an `Api` — a `watch::Receiver` and a `Command` sender, no `Store` — and a read sends no `Command` at all | `an_ops_read_cannot_disturb_the_daemon_it_asks_about` |
+| A wedged or hostile client cannot exhaust the MCP transport | `broker::server::Limits`: a deadline on a request that has started, split from the idle wait so keep-alive survives, plus a per-listener cap on connections in flight, released by RAII | `a_client_that_never_finishes_its_request_cannot_hold_a_connection_thread`, `a_flood_of_connections_is_refused_rather_than_served_without_bound` |
 | A parked run's worktree is reclaimed once its ticket closes | `sweep_parked` re-reads parked ids on a bounded cadence, unparks what it cleans, and clears the published branch when cleanup deleted the ref | `a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart`, `sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks`, `a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes` |
 | One orchestrator cannot nest its worktrees inside another's | `GitWorktreeWorkspace::new` refuses a `repo` or `root` inside a linked worktree of the repository; `remove` prunes registrations beneath the path it deletes, then `branch -d`s their branches with the merged check intact | `an_orchestrator_cannot_be_started_inside_another_runs_worktree`, `removing_a_worktree_reclaims_the_worktrees_nested_inside_it_from_shared_metadata` |
 
