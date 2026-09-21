@@ -319,6 +319,24 @@ impl<H: Http> Forge for GithubForge<H> {
         );
         let existing: Vec<GhPullRequest> = self.get_json(&list_url)?;
         if let Some(gh) = existing.into_iter().next() {
+            if gh.base.r#ref == spec.base {
+                return Ok(to_pull_request(gh));
+            }
+            // Found, but pointed at a base the scheduler no longer wants — a lower branch of
+            // the stack merged, most often. Returning it as is would leave the scheduler
+            // recording the base it computed while the provider targets another, and the pull
+            // request body claiming a stack that is over. Retargeted with the body, because the
+            // body is where the old base is named; the title has no base in it and is left.
+            let url = format!("{API_BASE}/repos/{}/{}/pulls/{}", self.owner, self.repo, gh.number);
+            let resp = self.send_json(
+                "PATCH",
+                &url,
+                &json!({
+                    "base": spec.base,
+                    "body": spec.body,
+                }),
+            )?;
+            let gh: GhPullRequest = parse(&resp)?;
             return Ok(to_pull_request(gh));
         }
 
@@ -666,6 +684,36 @@ mod tests {
         assert_eq!(pr.number, 7);
         assert!(f.http.writes().is_empty(), "an existing pull request must not be re-opened");
         assert!(f.http.gets()[0].contains("head=o%3Afeature"));
+    }
+
+    /// Finding 1 on #47: #42 is stacked on #43, and when #43 merges, #42's base has to move to
+    /// `master`. Reusing the open pull request as found dropped the new base on the floor, so
+    /// the scheduler recorded one thing and the provider targeted another.
+    #[test]
+    fn a_reused_pull_request_whose_desired_base_has_changed_is_retargeted() {
+        let http = FakeHttp::new();
+        http.push(ok(json!([gh_pr(7, "sha1", "symphony/lower", "open")])));
+        http.push(ok(gh_pr(7, "sha1", "master", "open")));
+        let f = forge(http);
+
+        let spec = PullRequestSpec {
+            title: "t".into(),
+            body: "no longer stacked".into(),
+            head: "feature".into(),
+            base: "master".into(),
+        };
+        let pr = f.open_pull_request(&spec).unwrap();
+
+        assert_eq!(pr.number, 7, "the same pull request, not a second one");
+        assert_eq!(pr.base, "master", "and it now targets what the scheduler asked for");
+        let writes = f.http.writes();
+        assert_eq!(writes.len(), 1, "one retarget, no open: {writes:?}");
+        let (method, url, body) = &writes[0];
+        assert_eq!(method, "PATCH");
+        assert!(url.ends_with("/repos/o/r/pulls/7"), "{url}");
+        assert_eq!(body["base"], "master");
+        assert_eq!(body["body"], "no longer stacked", "the body named the old base; it moves too");
+        assert!(body.get("head").is_none(), "the head is the one thing a retarget never touches");
     }
 
     #[test]

@@ -17,10 +17,31 @@ use super::{
 /// One call the fake saw, for asserting on sequences and absences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    Publish { branch: String, base: String },
-    OpenPr { head: String, base: String, title: String, body: String },
-    RequestReview { number: u64, reviewer: String },
-    Reply { number: u64, comment_id: String, body: String },
+    Publish {
+        branch: String,
+        base: String,
+    },
+    OpenPr {
+        head: String,
+        base: String,
+        title: String,
+        body: String,
+    },
+    /// An open pull request found for the head was pointed at a different base and moved.
+    Retarget {
+        number: u64,
+        from: String,
+        to: String,
+    },
+    RequestReview {
+        number: u64,
+        reviewer: String,
+    },
+    Reply {
+        number: u64,
+        comment_id: String,
+        body: String,
+    },
 }
 
 struct PrRecord {
@@ -243,8 +264,24 @@ impl Forge for FakeForge {
             body: spec.body.clone(),
         });
         if let Some(rec) =
-            g.prs.values().find(|r| r.spec.head == spec.head && r.pr.state == PrState::Open)
+            g.prs.values_mut().find(|r| r.spec.head == spec.head && r.pr.state == PrState::Open)
         {
+            if rec.pr.base != spec.base {
+                // The real forge retargets a pull request found pointing elsewhere, body
+                // included; recorded as its own op so a test can assert it happened — or that
+                // it did not.
+                let retarget = Op::Retarget {
+                    number: rec.pr.number,
+                    from: rec.pr.base.clone(),
+                    to: spec.base.clone(),
+                };
+                rec.pr.base = spec.base.clone();
+                rec.spec.base = spec.base.clone();
+                rec.spec.body = spec.body.clone();
+                let pr = rec.pr.clone();
+                g.ops.push(retarget);
+                return Ok(pr);
+            }
             return Ok(rec.pr.clone());
         }
         if g.commits.is_empty() {

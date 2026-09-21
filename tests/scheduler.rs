@@ -2319,6 +2319,65 @@ fn a_stacked_branch_opens_its_pull_request_against_the_branch_it_sits_on() {
     assert!(forge.spec_of(top).unwrap().body.contains("Stacked on"), "and the body says so");
 }
 
+/// Finding 1 on #47, and the situation #42 is in as this is written: stacked on #43, whose merge
+/// moves #42's base to `master`. A reused pull request was returned as found, so the scheduler
+/// recorded the base it had computed while the provider still targeted the merged branch —
+/// and the pull request body claimed a stack that was over. Today that is a person clicking.
+#[test]
+fn a_pull_request_whose_desired_base_has_changed_is_retargeted_and_the_snapshot_agrees() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    h.worker.script("iss-2", Script::succeeds_in(2_000));
+    h.sched.tick().unwrap();
+    let under = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    forge.set_stacked_on(Some(under.clone()));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let top = forge.open_prs().iter().find(|p| p.base == under).expect("stacked").number;
+    assert_eq!(delivery_of(&h, "iss-2").base.as_deref(), Some(under.as_str()));
+
+    // The lower branch merges: iss-2's work now sits directly on the trunk. A review comment
+    // then sends iss-2 round once more, and the push after that round recomputes the base.
+    forge.set_stacked_on(None);
+    let c = forge.add_comment(top, "reviewer", "src/x.rs", "nit");
+    h.worker.script(
+        "iss-2",
+        Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+            comment_id: c,
+            verdict: Verdict::Rejected,
+            detail: "intended".into(),
+        }]),
+    );
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let pr = forge.pr(top).unwrap();
+    assert_eq!(pr.base, "master", "the provider targets the new base: {:?}", forge.ops());
+    assert!(
+        forge.ops().iter().any(
+            |o| matches!(o, Op::Retarget { number, to, .. } if *number == top && to == "master")
+        ),
+        "moved, not reopened: {:?}",
+        forge.ops()
+    );
+    assert_eq!(forge.open_prs().len(), 2, "still one pull request per issue");
+    assert_eq!(delivery_of(&h, "iss-2").base.as_deref(), Some("master"), "the store agrees");
+    let row = h.sched.snapshot().unwrap().rows.into_iter().find(|r| r.issue_id == "iss-2").unwrap();
+    assert_eq!(row.delivery.unwrap().base.as_deref(), Some("master"), "and so does the snapshot");
+    assert!(
+        !forge.spec_of(top).unwrap().body.contains("Stacked on"),
+        "the body no longer claims a stack that is over"
+    );
+    assert_eq!(delivery_of(&h, "iss-2").stage, symphony_cc::store::DeliveryStage::Ready);
+}
+
 /// Finding 2 on #47. Every issue's branch was a stack candidate, pushed or not; when the upper
 /// one finished first the pull request named a base the remote had never seen, and the
 /// provider's 422 read as permanent — a handoff for a branch with nothing wrong but its timing.

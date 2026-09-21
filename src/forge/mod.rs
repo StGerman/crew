@@ -131,8 +131,10 @@ pub struct ReviewComment {
 
 pub trait Forge: Send + Sync {
     /// Open a pull request for `spec.head` against `spec.base`, or return the one already open
-    /// for that head. Idempotent by contract, because the scheduler calls it after every run
-    /// that reports done — the second and later calls must find the first call's result.
+    /// for that head — retargeted to `spec.base` if it was pointing elsewhere. Idempotent by
+    /// contract, because the scheduler calls it after every run that reports done: the second
+    /// and later calls must find the first call's result, and must leave it targeting what the
+    /// caller asked for, since the caller records `spec.base` as the truth about it.
     fn open_pull_request(&self, spec: &PullRequestSpec) -> Result<PullRequest, ForgeError>;
 
     /// The pull request as it is now: head, state, outstanding review requests.
