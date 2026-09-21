@@ -22,7 +22,7 @@ the published snapshot with a `status` client in front of it.
 ## Commands
 
 ```bash
-cargo test                                 # 164 unit + 48 integration
+cargo test                                 # 164 unit + 52 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -112,11 +112,17 @@ harvest_finished → detect_stalls → refresh_running   ← unconditional
                  ↓
             cfg.preflight()                          ← gate: on failure, return here
                  ↓
-dispatch_due_retries → dispatch_new → publish
+sweep_parked → dispatch_due_retries → dispatch_new → publish
 ```
 
 Reconciliation runs before the gate so that a broken config stops *new* dispatch without also
-stranding the runs already in flight. Do not move the `preflight()` call earlier.
+stranding the runs already in flight. Do not move the `preflight()` call earlier. `sweep_parked`
+is the one reconciliation step deliberately *behind* it: it deletes workspaces on the strength
+of `is_terminal`, and an active/terminal overlap — one of the things the gate rejects — is
+exactly what would make it delete the workspace of an issue about to be dispatched. It also
+runs on its own cadence (`agent.parked_sweep_interval_ms`, default 5 min) rather than every
+tick, because parked issues are not urgent and each sweep is one `by_ids` read per issue still
+parked.
 
 `recover()` is startup reconciliation, and it runs ahead of the gate for the same reason: a
 claim stranded by the last process must not stay stranded behind a config typo. It lives inside
@@ -343,12 +349,12 @@ tried, where that address came from, and the way out.
 Each of these closes a defect found in the original spec. The later rows came instead from
 dogfooding this orchestrator against its own backlog: the first review, the operator surface
 built over the same state, issue #1's acceptance criterion made executable, the first live
-dispatch and the review that followed it, the client put in front of that operator surface, and
-making a finished run diagnosable.
+dispatch and the review that followed it, the client put in front of that operator surface,
+making a finished run diagnosable, and a closed ticket whose worktree outlived it.
 
 Every row has a test that fails without its mechanism. Several of those tests only fail in the
 exact scenario they were written for, so a regression here can pass a casual `cargo test`
-reading — check the named test is still meaningful, not just still green.
+reading — check that the named test is still meaningful, not just still green.
 
 | Invariant | Mechanism | Guard test |
 |---|---|---|
@@ -374,6 +380,7 @@ reading — check the named test is still meaningful, not just still green.
 | The branch an operator is sent to is the one git checked out | `Workspace::branch_for` is the same naming function `prepare` uses, not a second spelling of it | `the_branch_the_snapshot_publishes_is_the_one_prepare_checks_out` |
 | The published branch never names a ref that is gone or was never this run's | `Store::set_branch` persists what `prepare` returned and is cleared exactly when `Removed::branch_deleted` says cleanup deleted it — never recomputed from `identifier`, which `Store::ensure` can rename after dispatch | `the_published_branch_is_the_one_prepare_recorded_not_one_recomputed_from_the_current_identifier` |
 | Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
+| A parked run's worktree is reclaimed once its ticket closes | `sweep_parked` re-reads parked ids on a bounded cadence, unparks what it cleans, and clears the published branch when cleanup deleted the ref | `a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart`, `sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks`, `a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the

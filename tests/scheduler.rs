@@ -345,6 +345,178 @@ fn moving_the_ticket_makes_a_parked_issue_live_again() {
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_none());
 }
 
+/// Bring a fresh harness to the point where `iss-1` has finished `Done` and is parked, and
+/// return its workspace path. The first tick dispatches; the second harvests and parks.
+fn park_one(h: &mut Harness) -> PathBuf {
+    h.worker.set_default(Script::succeeds_in(1_000));
+    h.sched.tick().unwrap();
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "parked");
+    assert!(ws.exists(), "a parked issue keeps its warm workspace");
+    ws
+}
+
+/// The leak this closes: a `Done` run is released and parked, which takes it out of `running`,
+/// and once the ticket closes the active-state poll never returns it again. Every cleanup path
+/// before this one hung off `running` or a retry row, so the worktree stayed on disk for good.
+#[test]
+fn a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |c| {
+        c.agent.parked_sweep_interval_ms = 300_000;
+    });
+    let ws = park_one(&mut h);
+
+    // While the ticket stays where the run left it, sweeps find nothing to reclaim.
+    h.clock.advance_ms(300_000);
+    h.sched.tick().unwrap();
+    assert!(ws.exists(), "a parked issue in a non-terminal state keeps its workspace");
+
+    // A human closes it. The next sweep is what notices — no restart, no re-dispatch.
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(300_000);
+    h.sched.tick().unwrap();
+
+    assert!(!ws.exists(), "the closed issue's workspace must be reclaimed");
+    assert_eq!(h.sched.running_count(), 0, "cleanup must not dispatch anything");
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert!(
+        st.parked_state.is_none(),
+        "a reclaimed issue leaves the parked set, or every later sweep would pay for it"
+    );
+    assert_eq!(st.phase, Phase::Released);
+}
+
+/// The sweep is the one path that reaches `Workspace::remove` with no live run behind it, so
+/// it is the one a reviewer forgets when `remove`'s contract changes. It did: the branch a run
+/// leaves behind is published from the store, and cleanup deletes that ref whenever git's
+/// merged check says it carries nothing new — so a sweep that reclaims a worktree without
+/// clearing the stored name leaves `status` pointing at a branch that is gone.
+#[test]
+fn a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes() {
+    let dir = tmp_dir("sweep-clears-branch");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open_in_memory().unwrap(),
+        Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+        |c| c.agent.parked_sweep_interval_ms = 300_000,
+    );
+
+    // A run that finishes without committing: cleanup will delete its branch, because the
+    // merged check finds nothing on it that HEAD does not already have.
+    h.worker.set_default(Script::succeeds_in(1_000));
+    h.sched.tick().unwrap();
+    // `Row.workspace` describes a live run, so it has to be read while the run is still in
+    // flight. `Row.branch` comes from the store and outlives it — which is the point.
+    let ws = PathBuf::from(
+        h.sched.snapshot().unwrap().rows[0]
+            .workspace
+            .clone()
+            .expect("a running row names its worktree"),
+    );
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "the run is parked, not running");
+
+    let parked = h.sched.snapshot().unwrap();
+    let row = parked.rows.iter().find(|r| r.issue_id == "iss-1").unwrap();
+    assert!(row.branch.is_some(), "a parked run still publishes the branch it checked out");
+    assert!(ws.exists(), "a parked issue keeps its warm workspace");
+
+    // The ticket closes later, so the sweep is what reclaims it — no restart, no re-dispatch.
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(300_000);
+    h.sched.tick().unwrap();
+
+    assert!(!ws.exists(), "the sweep must reclaim the closed issue's workspace");
+    let after = h.sched.snapshot().unwrap();
+    let row = after.rows.iter().find(|r| r.issue_id == "iss-1").unwrap();
+    assert_eq!(
+        row.branch, None,
+        "the sweep deleted the ref, so the published name must go with it rather than \
+         sending an operator to a branch that no longer exists"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The sweep is a poll over ids the scheduler is otherwise not watching, so its cost has to be
+/// set by the interval and the number of parked issues — not by how many ticks an issue spends
+/// parked. An implementation that swept every tick would pass the test above and fail this one.
+#[test]
+fn sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks() {
+    let interval = 300_000u64;
+    let poll = 30_000u64;
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |c| {
+        c.agent.parked_sweep_interval_ms = interval;
+    });
+    park_one(&mut h);
+    let (_, by_ids_before) = h.tracker.call_counts();
+
+    let ticks = 20u64;
+    for _ in 0..ticks {
+        h.clock.advance_ms(poll);
+        h.sched.tick().unwrap();
+    }
+
+    let (_, by_ids_after) = h.tracker.call_counts();
+    let sweeps = (by_ids_after - by_ids_before) as u64;
+    let elapsed = ticks * poll;
+    assert!(sweeps >= 1, "the sweep has to run at all for the bound to mean anything");
+    assert!(
+        sweeps <= elapsed / interval + 1,
+        "{sweeps} by_ids calls over {elapsed}ms with a {interval}ms interval: the sweep is \
+         running more often than its cadence allows"
+    );
+    assert!(sweeps < ticks, "and it certainly must not run once per tick");
+}
+
+/// Reclaiming a parked worktree must keep the branch-survival contract that every other cleanup
+/// path keeps: the directory is scratch, the commits are the deliverable. Closing the ticket is
+/// not a decision to throw the work away.
+#[test]
+fn a_parked_issues_committed_work_survives_the_sweep_that_reclaims_its_worktree() {
+    let dir = tmp_dir("parked-sweep-git");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open_in_memory().unwrap(),
+        Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+        |c| c.agent.parked_sweep_interval_ms = 300_000,
+    );
+    let ws = park_one(&mut h);
+    commit_in(&ws, "work.txt", "what the agent delivered");
+    std::fs::write(ws.join("scratch.txt"), b"never committed").unwrap();
+
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(300_000);
+    h.sched.tick().unwrap();
+    assert!(!ws.exists(), "the worktree itself must be reclaimed");
+
+    // Reopening is how the branch is proven to have survived: the next dispatch attaches to
+    // it, so the committed file comes back while the uncommitted one stays gone.
+    h.tracker.set_state("iss-1", "In Progress");
+    h.worker.set_default(Script::succeeds_in(600_000));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "a reopened issue is dispatchable again");
+    assert!(ws.join("work.txt").exists(), "the commits must outlive the worktree they were in");
+    assert!(
+        !ws.join("scratch.txt").exists(),
+        "which is only meaningful if the directory was rebuilt"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_blocked_verdict_releases_without_scheduling_a_retry() {
     let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});

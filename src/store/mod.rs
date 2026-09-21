@@ -193,6 +193,21 @@ impl Store {
         Ok(self.all()?.into_iter().filter(|s| s.phase == Phase::Running).collect())
     }
 
+    /// Issues parked after a `Done`/`Blocked` verdict and not currently running.
+    ///
+    /// These are the rows the scheduler has stopped watching: not in `running`, not waiting on
+    /// a retry, and invisible to the active-state poll once the ticket closes. The parked-issue
+    /// sweep is the only reader. A running issue cannot also be parked — `unpark` precedes
+    /// every launch — so the phase filter is belt-and-braces against a future path that forgets
+    /// that, rather than a case that occurs today.
+    pub fn parked(&self) -> rusqlite::Result<Vec<IssueState>> {
+        Ok(self
+            .all()?
+            .into_iter()
+            .filter(|s| s.parked_state.is_some() && s.phase != Phase::Running)
+            .collect())
+    }
+
     /// Close every still-open run row for an issue, returning how many there were.
     ///
     /// A run row opens before the worker exists and closes in `finish_run`. A process killed

@@ -1,7 +1,11 @@
 //! The coordination layer: one tick, one authority, no model in the loop.
 //!
 //! Tick order is deliberate. Reconciliation runs *first and unconditionally*, so a broken
-//! config stops new dispatch without also stranding the runs already in flight.
+//! config stops new dispatch without also stranding the runs already in flight. The one piece
+//! of reconciliation that sits *behind* the gate is the parked-issue sweep, because it deletes
+//! workspaces on the strength of `is_terminal`, and an overlapping active/terminal config —
+//! one of the things the gate rejects — is exactly what would make it delete the workspace of
+//! an issue about to be dispatched.
 //!
 //! Deviation from the plan: reconciliation lives here rather than in its own module, because
 //! it mutates the same `running` map as dispatch and splitting it would mean threading the
@@ -153,6 +157,10 @@ pub struct Scheduler {
     no_progress: HashMap<String, u32>,
     /// Whether startup reconciliation has run. See [`Scheduler::recover`].
     recovered: bool,
+    /// When parked issues were last re-read from the tracker. `None` until the first sweep, so
+    /// a restart reclaims what closed while the process was down without waiting a full
+    /// interval. See [`Scheduler::sweep_parked`].
+    last_parked_sweep: Option<Mono>,
     ticks: u64,
     last_error: Option<String>,
 }
@@ -182,6 +190,7 @@ impl Scheduler {
             seen: HashMap::new(),
             no_progress: HashMap::new(),
             recovered: false,
+            last_parked_sweep: None,
             ticks: 0,
             last_error: None,
         }
@@ -239,6 +248,7 @@ impl Scheduler {
             return Ok(());
         }
 
+        self.sweep_parked()?;
         self.dispatch_due_retries()?;
         self.dispatch_new()?;
         self.publish()?;
@@ -569,6 +579,104 @@ impl Scheduler {
                 tracing::debug!(issue_id = %id, misses, "not visible; within grace");
             }
         }
+        Ok(())
+    }
+
+    /// Reclaim the worktrees of parked issues whose tickets have since closed.
+    ///
+    /// A run that ends `Done` or `Blocked` is released and parked, which takes it out of
+    /// `running`; `refresh_running` never sees it again, it has no retry row for
+    /// `dispatch_due_retries` to find, and once the ticket reaches a terminal state
+    /// `by_states` over the active set stops returning it too. Every existing cleanup path is
+    /// downstream of one of those three, so nothing ever matched — observed as a worktree, a
+    /// branch and a rust-analyzer index per finished issue, left behind for good.
+    ///
+    /// Parked issues are not urgent, so this runs on its own, slower cadence
+    /// (`parked_sweep_interval_ms`) rather than every tick, and asks about all of them in one
+    /// `by_ids` batch. The cost per interval is therefore the number of issues still parked,
+    /// not the number of ticks they have spent parked. The timestamp is taken before the call,
+    /// so a tracker failure waits a full interval rather than retrying every tick.
+    ///
+    /// A cleaned issue is unparked. Left parked, it would be re-fetched on every sweep for the
+    /// rest of the process's life, so the sweep's cost would grow with every ticket ever
+    /// closed; unparked and in a terminal state it is inert, and should a human reopen it into
+    /// an active state `dispatch_new` treats it like any issue with no park, which is what a
+    /// state change means everywhere else here. An issue that has moved to a state that is
+    /// neither active nor terminal keeps its warm worktree and stays parked, the same choice
+    /// `refresh_running` makes for a running one. An issue the tracker no longer returns is
+    /// left alone as well: a genuinely deleted ticket and an eventual-consistency blip look the
+    /// same from here, and this path has no grace count. It costs one id in the batch.
+    fn sweep_parked(&mut self) -> anyhow::Result<()> {
+        let interval = self.cfg.agent.parked_sweep_interval_ms;
+        if interval == 0 {
+            return Ok(()); // disabled
+        }
+        let now = self.clock.mono();
+        if let Some(last) = self.last_parked_sweep
+            && now.saturating_since(last) < interval
+        {
+            return Ok(());
+        }
+        self.last_parked_sweep = Some(now);
+
+        let parked: Vec<_> = self
+            .store
+            .parked()?
+            .into_iter()
+            .filter(|s| !self.running.contains_key(&s.issue_id))
+            .collect();
+        if parked.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = parked.iter().map(|s| s.issue_id.clone()).collect();
+
+        let refreshed = match self.tracker.by_ids(&ids) {
+            Ok(v) => v,
+            Err(e) => {
+                log_tracker_failure("parked-issue sweep failed", &e);
+                self.last_error = Some(format!("parked sweep: {e}"));
+                return Ok(());
+            }
+        };
+
+        let mut reclaimed = 0usize;
+        for issue in refreshed {
+            let key = issue.state_key();
+            self.seen.insert(issue.id.clone(), issue.clone());
+            if !self.cfg.is_terminal(&key) {
+                continue;
+            }
+            // The directory goes; the branch is `Workspace::remove`'s call, and it keeps one
+            // that carries commits HEAD does not have. Closing a ticket is not a decision to
+            // throw away the work done under it.
+            match self.workspace.remove(&issue.id, &issue.identifier) {
+                Ok(removed) => {
+                    // The stored branch follows what cleanup actually did, here as at every
+                    // other `remove` call site: a name that outlives its ref sends an operator
+                    // to something that is no longer there. This path is the one a reviewer
+                    // will forget, because the sweep is the only caller that reaches `remove`
+                    // without a live run behind it.
+                    if removed.branch_deleted {
+                        self.store.set_branch(self.clock.as_ref(), &issue.id, None)?;
+                    }
+                    reclaimed += 1;
+                }
+                Err(e) => {
+                    // Not fatal, and the issue stays parked so the next sweep tries again.
+                    tracing::warn!(
+                        issue_id = %issue.id, error = %e,
+                        "parked workspace cleanup failed; will retry next sweep"
+                    );
+                    continue;
+                }
+            }
+            self.store.unpark(self.clock.as_ref(), &issue.id)?;
+            tracing::info!(
+                issue_id = %issue.id, identifier = %issue.identifier, state = %issue.state,
+                "parked issue reached a terminal state; workspace reclaimed"
+            );
+        }
+        tracing::debug!(parked = ids.len(), reclaimed, "parked-issue sweep complete");
         Ok(())
     }
 
