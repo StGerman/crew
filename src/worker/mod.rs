@@ -10,7 +10,7 @@ pub mod fake;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{Issue, Outcome};
 
@@ -72,7 +72,7 @@ pub struct Progress {
 /// counted twice; and the per-event `output_tokens` is a streaming placeholder that reads `1`
 /// for a full paragraph. The first live dispatch recorded ten million input tokens and four
 /// hundred output tokens over eighty-three turns that way.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Prompt-side tokens billed for the run: fresh input plus cache creation plus cache reads.
     /// One figure rather than three because the dashboard has one column; the split is in the

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Wall};
 use crate::model::{ErrorClass, Phase};
@@ -51,7 +51,7 @@ impl IssueState {
 /// whose process was killed with the orchestrator, until the next startup's `recover()` closes
 /// it. The counters are what the run had reported by the time it ended, which is zero for a run
 /// that died with whatever was counting them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
     pub issue_id: String,

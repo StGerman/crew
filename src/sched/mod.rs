@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::broker::{Broker, BrokerSession};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
@@ -66,7 +66,7 @@ struct Running {
     _broker: Option<BrokerSession>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Row {
     pub issue_id: String,
     pub identifier: String,
@@ -85,6 +85,14 @@ pub struct Row {
     pub last_error: Option<String>,
     pub last_event: Option<String>,
     pub workspace: Option<String>,
+    /// The branch this issue's runs commit on, once it has been dispatched at least once.
+    ///
+    /// Outlives `workspace`, and deliberately: the worktree directory is scratch that cleanup
+    /// deletes, while the branch is what a finished run leaves behind for a reviewer to find.
+    /// `None` for an issue never dispatched — naming a branch that was never written would
+    /// send that reviewer after nothing — and for a [`crate::workspace::DirWorkspace`]
+    /// deployment, which has no branches at all.
+    pub branch: Option<String>,
     /// This issue's most recent runs, newest first, at most [`RUNS_PER_ISSUE`].
     pub runs: Vec<RunRecord>,
 }
@@ -96,7 +104,7 @@ pub struct Row {
 /// It follows that this type is the *whole* published view: an observer that needs something
 /// it does not carry does not get a `Store`, it gets a new field here. That is why run history
 /// lives on [`Row`] rather than being read back out of the database by whoever wants it.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub generated_at: i64,
     pub rows: Vec<Row>,
@@ -861,6 +869,11 @@ impl Scheduler {
             let issue = self.seen.get(&st.issue_id);
             let progress = run.map(|r| r.handle.progress()).unwrap_or_default();
 
+            let runs = history.remove(&st.issue_id).unwrap_or_default();
+            // A branch is worth naming only once something has run on it; before that the
+            // name is a prediction, not a place to look.
+            let dispatched = run.is_some() || !runs.is_empty();
+
             rows.push(Row {
                 issue_id: st.issue_id.clone(),
                 identifier: st.identifier.clone(),
@@ -877,7 +890,10 @@ impl Scheduler {
                 last_error: st.last_error.clone(),
                 last_event: progress.last_event,
                 workspace: run.map(|r| r.workspace.display().to_string()),
-                runs: history.remove(&st.issue_id).unwrap_or_default(),
+                branch: dispatched
+                    .then(|| self.workspace.branch_for(&st.issue_id, &st.identifier))
+                    .flatten(),
+                runs,
             });
         }
 
