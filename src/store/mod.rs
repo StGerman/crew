@@ -1172,7 +1172,11 @@ impl Store {
     }
 
     /// The push landed and the pull request is known. A *different* pull request number than
-    /// before resets the per-PR round count; the per-issue count is untouched either way.
+    /// before resets the per-PR round count; the per-issue count is untouched either way. A
+    /// different *head* resets `review_requested`, whatever the number: a reviewer verified
+    /// against the old head has not seen the new one, and a pull request reaching `Ready` with
+    /// its current head unreviewed is exactly what the verification after each request exists
+    /// to rule out. A re-push of the same head — the idempotent case — leaves both alone.
     ///
     /// `pending_verdicts` is deliberately left alone: the verdicts a run reported are applied
     /// after this, one reply at a time, and each leaves the queue only once its reply has
@@ -1192,8 +1196,10 @@ impl Store {
         conn.execute(
             "UPDATE delivery SET
                rounds_pr = CASE WHEN pr_number IS ?2 THEN rounds_pr ELSE 0 END,
-               review_requested = CASE WHEN pr_number IS ?2 THEN review_requested ELSE 0 END,
-               review_error = CASE WHEN pr_number IS ?2 THEN review_error ELSE NULL END,
+               review_requested = CASE WHEN pr_number IS ?2 AND head_sha IS ?5
+                                       THEN review_requested ELSE 0 END,
+               review_error = CASE WHEN pr_number IS ?2 AND head_sha IS ?5
+                                   THEN review_error ELSE NULL END,
                pr_number = ?2, pr_url = ?3, base = ?4, head_sha = ?5, head_pushed_at = ?6,
                stage = 'awaiting', updated_at = ?6
              WHERE issue_id = ?1",
@@ -1421,6 +1427,29 @@ mod delivery_tests {
         s.set_delivery_pr(&c, "iss-1", 8, "u", "master", "ccc").unwrap();
         let d = s.delivery("iss-1").unwrap().unwrap();
         assert_eq!((d.rounds_pr, d.rounds_issue), (0, 2), "the issue-wide bound must survive");
+    }
+
+    /// Finding 4 on #47. A fix round pushes a new head to the same pull request; a reviewer
+    /// verified against the old one has not seen it, and a `review_requested` that survived the
+    /// push meant nobody was asked again — the pull request could reach `Ready` with its current
+    /// head unreviewed, which is the gap the verification after each request was built to close.
+    #[test]
+    fn a_new_head_on_the_same_pull_request_needs_its_review_requested_again() {
+        let (s, c) = store_with("iss-1");
+        s.begin_delivery(&c, "iss-1", None).unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
+        s.set_review_requested(&c, "iss-1", None).unwrap();
+        assert!(s.delivery("iss-1").unwrap().unwrap().review_requested);
+
+        // The same head pushed again — idempotent — keeps the request.
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
+        assert!(s.delivery("iss-1").unwrap().unwrap().review_requested, "nothing changed");
+
+        // A new head on the same pull request does not.
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "bbb").unwrap();
+        let d = s.delivery("iss-1").unwrap().unwrap();
+        assert!(!d.review_requested, "the reviewer verified against `aaa`, not `bbb`");
+        assert!(d.review_error.is_none());
     }
 
     #[test]

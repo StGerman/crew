@@ -2157,6 +2157,44 @@ fn a_verdict_is_not_settled_by_a_reply_that_did_not_land() {
     assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and it cost no agent run");
 }
 
+/// Finding 4 on #47, end to end: the reviewer approves the first head, CI sends the issue round,
+/// and the fix lands as a second head on the same pull request. Nobody had asked the reviewer
+/// again, so `Ready` was reached on a head no one had looked at.
+#[test]
+fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["reviewer".into()];
+        },
+    );
+    forge.red_ci(&FakeForge::head_after_publish(1), "error[E0308]: mismatched types");
+
+    // First head: review requested and verified, then CI sends the issue back.
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let requests = |forge: &FakeForge| {
+        forge.ops().iter().filter(|o| matches!(o, Op::RequestReview { .. })).count()
+    };
+    assert_eq!(requests(&forge), 1);
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    // The reviewer answers on that head while the fix is being written.
+    forge.add_review(pr, "reviewer", "APPROVED");
+
+    // Second head, same pull request: the reviewer is asked again before it can read as ready.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.head_sha.as_deref(), Some(FakeForge::head_after_publish(2).as_str()));
+    assert_eq!(requests(&forge), 2, "a new head is a new request: {:?}", forge.ops());
+    assert!(
+        forge.pr(pr).unwrap().requested_reviewers.contains(&"reviewer".to_string()),
+        "and it verifiably attached"
+    );
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready);
+}
+
 /// The new runaway, bounded. A reviewer that comments on every push, answered by an agent
 /// that pushes, would loop forever; every hand-back is a round and the two bounds hold across
 /// a restart and across a fresh pull request.
