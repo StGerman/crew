@@ -22,6 +22,21 @@
 //! [`Tracker`]: crate::tracker::Tracker
 //! [`TrackerWrites`]: super::TrackerWrites
 //!
+//! ## Two servers, one transport
+//!
+//! The same four methods later had to serve a second, unrelated set of tools: the operator's
+//! [ops tools](crate::api::mcp), which answer from the published snapshot rather than writing to
+//! a tracker. Rather than a second copy of this file or `rmcp` after all, the transport is
+//! generic over [`McpService`] — the part that differs between the two is which tools exist
+//! and what a call does, and that is the whole trait. What the decision cost: the transport
+//! knows nothing about authority, so each service does its own scoping from the request path
+//! (the broker reads a per-run token out of it; the ops service accepts one fixed path and
+//! nothing else), and the two **never share a listener**. They could have — one accept loop,
+//! routed by prefix — and it was not done, because the per-run token path and the operator path
+//! would then answer at the same address, which is exactly the address every dispatched worker
+//! is handed. Keeping them on separate ports is what makes "the ops tools are not reachable
+//! from a worker" a property of the wiring rather than of a prefix check.
+//!
 //! ## What the real client does
 //!
 //! Confirmed by pointing `claude 2.1.278` at a recording server rather than read off a spec,
@@ -58,7 +73,21 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use super::Broker;
+/// What the transport needs from a set of tools, and nothing more.
+///
+/// A service sees the request path so it can do its own scoping — the transport does not know
+/// what a token is. `call` answers `Err` for anything the agent should read as a failed tool
+/// rather than a broken server; the transport turns it into a result with `isError: true`, so
+/// no implementation can accidentally produce the JSON-RPC error shape that fails a run.
+pub trait McpService: Send + Sync + 'static {
+    /// Reported in `initialize` as `serverInfo.name`. Tools reach the agent as
+    /// `mcp__<name>__<tool>`.
+    fn name(&self) -> &str;
+    /// The `tools/list` answer for a client that connected at `path`.
+    fn tools(&self, path: &str) -> Value;
+    /// Perform one call for a client that connected at `path`.
+    fn call(&self, path: &str, tool: &str, args: &Value) -> Result<String, String>;
+}
 
 /// The revision this server implements when the client does not name one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -71,7 +100,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Bind the broker's listener on loopback, letting the OS pick the port.
 ///
 /// Separate from [`serve`] so the caller can learn the address *before* constructing the
-/// [`Broker`] that has to embed it in every session URL.
+/// [`Broker`](super::Broker) that has to embed it in every session URL.
 pub fn bind() -> std::io::Result<TcpListener> {
     TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
 }
@@ -82,19 +111,19 @@ pub fn bind() -> std::io::Result<TcpListener> {
 /// it could serve is revoked independently when its [`BrokerSession`](super::BrokerSession) is
 /// dropped. Stopping the listener would add a second thing to get right for no property the
 /// token lifetime does not already provide.
-pub fn serve(broker: Arc<Broker>, listener: TcpListener) {
+pub fn serve<S: McpService>(service: Arc<S>, listener: TcpListener) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
-                    let broker = Arc::clone(&broker);
+                    let broker = Arc::clone(&service);
                     // `Builder::spawn` rather than `thread::spawn`: the latter panics when the
                     // process is out of threads, and a panic on this thread would take the
                     // whole orchestrator down over a connection it could simply have refused.
                     let spawned = std::thread::Builder::new()
                         .name("symphony-broker-conn".into())
                         .spawn(move || {
-                            if let Err(e) = handle_conn(&broker, s) {
+                            if let Err(e) = handle_conn(broker.as_ref(), s) {
                                 tracing::debug!(error = %e, "broker connection ended");
                             }
                         });
@@ -114,15 +143,13 @@ struct Request {
     body: Vec<u8>,
 }
 
-fn handle_conn(broker: &Broker, stream: TcpStream) -> std::io::Result<()> {
+fn handle_conn<S: McpService>(service: &S, stream: TcpStream) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
     // Keep-alive: one accept serves the whole run's traffic.
     while let Some(req) = read_request(&mut reader)? {
-        let token = req.path.strip_prefix("/mcp/").unwrap_or("").to_string();
-
         match req.method.as_str() {
             // The SSE stream. Nothing here ever pushes, so decline it.
             "GET" => respond(&mut writer, 405, "Method Not Allowed", None)?,
@@ -136,7 +163,7 @@ fn handle_conn(broker: &Broker, stream: TcpStream) -> std::io::Result<()> {
                     respond(&mut writer, 200, "OK", Some(&body))?;
                     continue;
                 };
-                match handle_rpc(broker, &token, &rpc) {
+                match handle_rpc(service, &req.path, &rpc) {
                     // A notification: acknowledged, never answered.
                     None => respond(&mut writer, 202, "Accepted", None)?,
                     Some(v) => {
@@ -152,7 +179,7 @@ fn handle_conn(broker: &Broker, stream: TcpStream) -> std::io::Result<()> {
 }
 
 /// `None` means the message was a notification and takes no reply.
-fn handle_rpc(broker: &Broker, token: &str, rpc: &Value) -> Option<Value> {
+fn handle_rpc<S: McpService>(service: &S, path: &str, rpc: &Value) -> Option<Value> {
     let method = rpc.get("method").and_then(Value::as_str).unwrap_or_default();
     let id = rpc.get("id").cloned();
 
@@ -169,11 +196,11 @@ fn handle_rpc(broker: &Broker, token: &str, rpc: &Value) -> Option<Value> {
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": super::SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
+                "serverInfo": { "name": service.name(), "version": env!("CARGO_PKG_VERSION") }
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": broker.tools_json() }),
+        "tools/list" => json!({ "tools": service.tools(path) }),
         "tools/call" => {
             let name = rpc.pointer("/params/name").and_then(Value::as_str).unwrap_or_default();
             let empty = json!({});
@@ -182,13 +209,13 @@ fn handle_rpc(broker: &Broker, token: &str, rpc: &Value) -> Option<Value> {
             // A refusal is a tool *result*, not a transport error: the agent is meant to read
             // it and pick something else, which is the "a tool failure is not a run failure"
             // rule from the issue.
-            match broker.call(token, name, args) {
+            match service.call(path, name, args) {
                 Ok(text) => json!({
                     "content": [{ "type": "text", "text": text }],
                     "isError": false
                 }),
-                Err(e) => json!({
-                    "content": [{ "type": "text", "text": e.to_string() }],
+                Err(text) => json!({
+                    "content": [{ "type": "text", "text": text }],
                     "isError": true
                 }),
             }
@@ -291,7 +318,7 @@ mod tests {
 
     use super::*;
     use crate::broker::fake::FakeWrites;
-    use crate::broker::{BrokerLimits, BrokerSession, TrackerWrites};
+    use crate::broker::{Broker, BrokerLimits, BrokerSession, TrackerWrites};
     use crate::clock::FakeClock;
     use crate::model::Issue;
 
