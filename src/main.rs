@@ -28,6 +28,9 @@ use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
 use symphony_cc::config::Config;
+use symphony_cc::forge::fake::FakeForge;
+use symphony_cc::forge::github::GithubForge;
+use symphony_cc::forge::{Forge, Publisher};
 use symphony_cc::gate::{Gate, GitGate};
 use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use symphony_cc::sched::{Scheduler, Snapshot};
@@ -173,22 +176,32 @@ async fn main() -> anyhow::Result<()> {
 
     // One adapter, two traits: the GitHub tracker reads for the scheduler and writes for the
     // broker over the same credential, which never leaves this process either way.
-    let (tracker, writes): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>) = if use_github_tracker {
-        let token = std::env::var("GITHUB_TOKEN")
-            .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
-        let gh = Arc::new(GithubTracker::new(
-            UreqHttp::default(),
-            &cfg.tracker.owner,
-            &cfg.tracker.repo,
-            &token,
-            &cfg.tracker.required_labels,
-        ));
-        (gh.clone(), gh)
-    } else {
-        // The demo tracker has nothing to write to, so broker calls are recorded and dropped.
-        // That still exercises the whole path — scoping, budgets, audit — without a network.
-        (Arc::new(FakeTracker::demo()), Arc::new(FakeWrites::new()))
-    };
+    let (tracker, writes, forge): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>, Arc<dyn Forge>) =
+        if use_github_tracker {
+            let token = std::env::var("GITHUB_TOKEN")
+                .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
+            let gh = Arc::new(GithubTracker::new(
+                UreqHttp::default(),
+                &cfg.tracker.owner,
+                &cfg.tracker.repo,
+                &token,
+                &cfg.tracker.required_labels,
+            ));
+            // The forge is the same repository on GitHub, so the same credential; on any
+            // other provider it would be a separate adapter with its own.
+            let forge = Arc::new(GithubForge::new(
+                UreqHttp::default(),
+                &cfg.tracker.owner,
+                &cfg.tracker.repo,
+                &token,
+            ));
+            (gh.clone(), gh, forge)
+        } else {
+            // The demo tracker has nothing to write to, so broker calls are recorded and
+            // dropped. That still exercises the whole path — scoping, budgets, audit — without
+            // a network. The fake forge likewise: green CI, reviewers that attach.
+            (Arc::new(FakeTracker::demo()), Arc::new(FakeWrites::new()), Arc::new(FakeForge::new()))
+        };
 
     // Best-effort, like the projector: a root that cannot be created costs post-mortems, not
     // dispatch. Defaults beside the worktrees rather than inside one — see `TranscriptsConfig`.
@@ -262,12 +275,26 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("handoff gate off: done runs are released as the agent left them");
         None
     };
+    // Attached whenever the config asks, and the real git worktree is always the publisher:
+    // there is no fake half here, because the branch that gets pushed is a real one.
+    let delivery = cfg.delivery.enabled.then(|| {
+        tracing::info!(
+            base = %cfg.delivery.base, remote = %cfg.delivery.remote, reviewers = ?cfg.delivery.reviewers,
+            rounds_per_pr = cfg.delivery.max_rounds_per_pr, rounds_per_issue = cfg.delivery.max_rounds_per_issue,
+            "delivery on: finished runs will be pushed and opened as pull requests"
+        );
+        let publisher: Arc<dyn Publisher> = workspace.clone();
+        (forge, publisher)
+    });
 
     let mut sched =
         Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
     sched.set_broker(broker);
     sched.set_transcripts(transcripts);
     sched.set_gate(gate);
+    if let Some((forge, publisher)) = delivery {
+        sched.set_delivery(Some(forge), Some(publisher));
+    }
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
     let (act_tx, mut act_rx) = mpsc::unbounded_channel::<UiAction>();

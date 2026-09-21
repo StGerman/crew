@@ -23,7 +23,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 189 unit + 72 integration
+cargo test                                 # 226 unit + 90 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -122,6 +122,8 @@ recover()                                        ← first tick only
                  ↓
 harvest_finished → observe_progress → harvest_gates → detect_stalls → refresh_running
                  ↓
+         advance_deliveries                          ← unconditional too
+                 ↓
             cfg.preflight()                          ← gate: on failure, return here
                  ↓
 sweep_parked → dispatch_due_retries → dispatch_new → publish
@@ -135,6 +137,16 @@ exactly what would make it delete the workspace of an issue about to be dispatch
 runs on its own cadence (`agent.parked_sweep_interval_ms`, default 5 min) rather than every
 tick, because parked issues are not urgent and each sweep is one `by_ids` read per issue still
 parked.
+
+`advance_deliveries` is reconciliation too — it reads the outside world (CI, review) about runs
+already over and may queue a retry the gate below then decides whether to dispatch — and only
+touches issues nothing else owns. It comes *after* `harvest_gates` in the tick and, more to the
+point, after it in the life of a `Done`: with a gate attached, a run's `Done` enters `gating`
+and only the gate's pass reaches the `Done` arm of `apply_outcome` that queues delivery, so the
+branch delivery pushes is the rebased, re-gated one. That order is the stack #43/#42 were built
+as — gate, then delivery — and
+`a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes_nothing` is
+what fails if it is ever inverted.
 
 `harvest_gates` is where a `Done` becomes a verdict. With a handoff gate attached (see below), a
 run whose agent reports `Done` leaves `running` for a `gating` map instead of being released: its
@@ -343,8 +355,9 @@ with no agent involved. The verdict is deliberately three-way and the split is t
 **conflict** is a human's problem, so the rebase is aborted (the branch goes back to exactly what
 the agent committed, which is what keeps `remove`'s merged check on its side) and the issue parks
 `Blocked` naming the paths; a **failing command** is the agent's, so the verdict is `Continue` and
-the output rides into the next spawn as the `brief` parameter on `Worker::spawn`, where the real
-worker puts it in the prompt; and `gate.max_failures` **consecutive** failures escalate to
+the output rides into the next spawn as `Feedback::Gate` on `Worker::spawn` — the same
+parameter delivery's CI and review feedback travel on, so there is one channel and one rendering
+site for "why this attempt exists" — where the real worker puts it in the prompt; and `gate.max_failures` **consecutive** failures escalate to
 `Blocked`, because a gate that can be failed forever is the continuation runaway wearing a new
 name. A `Blocked` reason now also lands in the store's `last_error`, so the dashboard shows why
 an issue is parked instead of only the log. Setting no gate is a decision, not a degrade — unlike
@@ -438,6 +451,65 @@ the worker runs without `--strict-mcp-config` on purpose, so it inherits *user-s
 servers. Register this one in the supervising agent's **local or project scope, never user
 scope**, or every worker inherits it and the wiring is bypassed by configuration.
 
+
+**Delivery** ([src/sched/delivery.rs](src/sched/delivery.rs), behind the `Forge` and
+`Publisher` traits in [src/forge/](src/forge/)) is what happens after a run reports `Done`,
+when `[delivery] enabled` is on. `Done` still releases the claim and parks the issue exactly as
+before; delivery is then a row in the store advanced on the tick — after reconciliation,
+before the dispatch gate, at `delivery.poll_interval_ms` — through: push the branch
+(`Publisher`, implemented by `GitWorktreeWorkspace`, from the worktree), open or find the pull
+request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the configured
+reviewers *and read back whether they attached*, read CI, read the review threads. A red CI or
+an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
+due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
+`Feedback::Review` — which is the literal form of "a red gate is a `Continue`, never a `Done`".
+The handoff gate's failing output travels the same way, as `Feedback::Gate`: `launch` builds one
+`Feedback` from delivery's structured row when there is one and from the retry reason otherwise,
+so `Worker::spawn` has a single parameter for the question and `feedback_help` in the worker is
+the single place its wording lives. And delivery only ever sees a branch the gate has passed —
+see the tick order above. The pull request body is derived
+from the run record (commits, runs, turns, tokens), never composed by the agent. Verdicts on
+review comments come back as `SYMPHONY_REVIEW: <id>: accepted: <commit>` or `rejected:
+<reason>` lines in the agent's final text, the same soft convention as `SYMPHONY_OUTCOME`; the
+orchestrator replies on the thread and, once that reply has landed, records the verdict in
+`review_verdict`, and a settled thread is never handed out again. A comment the agent gives no
+line for stays open — and so does one whose acceptance names no commit, or a commit the branch
+does not carry: the worker drops an `accepted:` whose detail is not shaped like a commit, and
+the scheduler checks the rest against the branch (`Publisher::carries`) at the moment the run
+reports `Done`, before the gate's rebase rewrites the shas the agent named.
+
+Four things there are load-bearing. Every hand-back is a *round*, bounded per pull request
+(`max_rounds_per_pr`) and per issue (`max_rounds_per_issue`), and the per-issue count never
+resets — not for a new run and not for a new pull request — because a reviewer that comments
+on every push, answered by an agent that pushes, is a loop with no bound of its own, and one
+that reset with the pull request would bound nothing (the same gap `max_calls_per_issue`
+closes for the broker). At either bound the pull request is handed to the operator with the
+outstanding items named. A review request is followed by a read of the pull request and its
+reviews, because GitHub answers a request for a bot reviewer with `200` and attaches nobody
+(GETT-174120); a request that verifiably attached nobody is a handoff with that reason on the
+issue's row, not a success. `Forge` has no `merge` method, and must not grow one — merging is
+the operator's, and the trait's shape is what enforces it. And a delivery step only runs for an
+issue nothing else owns (phase `released`, no live run), so a push cannot land under a running
+agent and a hand-back cannot race a dispatch. A branch whose work sits on another issue's branch
+gets its pull request based on that branch (`Publisher::stacked_on`), so the two stay
+reviewable apart — provided the remote has that branch. A lower branch still running, or done
+and not yet pushed, is not a base a pull request can be opened against, so the upper one opens
+against the trunk rather than handing off on the provider's 422; and when a later push computes
+a different base than the open pull request targets — the lower branch merged — `open_pull_request`
+retargets it, body included, so the store, the snapshot and the provider agree.
+
+The review on PR #42 found the handoff itself wrong in six places (#47), and two of them are
+worth knowing the shape of before touching `publish` or `apply_verdicts`. The push is
+`--force-with-lease`, because the gate rebases an already-published branch before every
+re-delivery and a plain push then fails non-fast-forward in exactly the round the base moved;
+forcing is sanctioned because the branch is the orchestrator's own, and the lease is what keeps
+that apart from forcing over someone else's — a lease failure is classified on its own,
+permanent, naming the remote branch that moved. And a verdict is settled by its reply landing
+and by nothing else: `apply_verdicts` replies first and records second, a failed reply leaves
+the verdict queued on the row and the step returns the error, so the threads are not read — or
+handed back to an agent — until it lands. Recording first, as it did, hid a verdict from its
+reviewer for good over one transient error while delivery went on to `Ready`.
+
 ## Invariants
 
 Each of these closes a defect found in the original spec. The later rows came instead from
@@ -446,8 +518,9 @@ built over the same state, issue #1's acceptance criterion made executable, the 
 dispatch and the review that followed it, the client put in front of that operator surface,
 making a finished run diagnosable, a closed ticket whose worktree outlived it, an
 orchestrator that ran inside its own worktree, the agent supervising the daemon getting
-the same surface as data, and two branches that were each green alone and broken
-together.
+the same surface as data, two branches that were each green alone and broken together, and
+the review of the handoff path that found it handing off, retrying or settling in six cases
+where it should not.
 
 Every row has a test that fails without its mechanism. Several of those tests only fail in the
 exact scenario they were written for, so a regression here can pass a casual `cargo test`
@@ -492,6 +565,28 @@ reading — check that the named test is still meaningful, not just still green.
 | The gate's own git subprocesses are killable | every `git` the gate runs goes through `spawn_tracked`, so `pgid` is set for the rebase and not only for a configured command | `killing_a_gate_during_the_rebase_step_stops_the_git_subprocess_instead_of_leaving_it_running` |
 | A gate that cannot start reports rather than panics | a supervising thread the OS refuses becomes `Verdict::Failed`, which is what `Gate::start` promises; a panic here would strand the claim until the next startup | `a_gate_whose_supervising_thread_cannot_be_spawned_reports_failed_instead_of_panicking` |
 | A brief describes the tree the agent will find | `Verdict::Failed` carries `on_base`, false for every step before the rebase and for a rebase that was aborted | `a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_rebased` |
+| A red gate cannot rest on `Done` | delivery reads CI after every push and hands a failure back through the retry path with the failure in the prompt | `a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_run_does_not_rest_on_done` |
+| A review request that attached nobody is not a success | the request is followed by a read of `requested_reviewers` and `reviews`; a missing login hands off with the reason | `a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reported_as_a_failure` |
+| A settled review comment is not re-argued | verdicts are recorded by comment id, first one stands, and open threads are computed against that table | `each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and_is_not_re_argued` |
+| The review-fix loop is bounded, and the bound survives a new run and a new pull request | `rounds_pr` resets only when the pull request number changes; `rounds_issue` never resets; both checked before charging | `fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_a_new_run_and_a_new_pull_request` |
+| Nothing merges without a human | `Forge` has no merge method; a ready pull request is polled, never advanced | `nothing_merges_without_a_human` |
+| Delivery never publishes an ungated branch | a `Done` enters `gating` first and only the gate's pass reaches the `Done` arm that queues delivery; a failing gate is a `Continue` the forge never hears about | `a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes_nothing` |
+| A reused pull request targets the base the scheduler recorded | `open_pull_request` compares the base it finds with `spec.base` and retargets — body included — when they differ, instead of returning the pull request as found | `a_reused_pull_request_whose_desired_base_has_changed_is_retargeted`, `a_pull_request_whose_desired_base_has_changed_is_retargeted_and_the_snapshot_agrees` |
+| A stack base the remote does not have is not a base | `Publisher::stacked_on` takes the remote and keeps only the candidates it has, asked directly with `ls-remote` rather than read off remote-tracking refs | `a_stack_candidate_the_remote_does_not_have_is_not_selected_as_a_base`, `a_base_that_is_not_published_is_not_selected_as_a_stack_base` |
+| A verdict is settled only by a reply that landed | `apply_verdicts` replies first and records second; a failed reply leaves the verdict in `pending_verdicts` — which the push no longer clears — and returns the error, so the threads are neither read nor handed back until it lands | `a_verdict_is_not_settled_by_a_reply_that_did_not_land` |
+| A new head is not left unreviewed | `set_delivery_pr` resets `review_requested` when the head changes, not only when the pull request number does, so the request-then-verify runs again for every push | `a_new_head_on_the_same_pull_request_needs_its_review_requested_again`, `a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed` |
+| An acceptance names a commit the branch carries, never a bare acknowledgement | `extract_verdicts` drops an `accepted:` whose detail is not commit-shaped; `verified_verdicts` checks the rest with `Publisher::carries` as the run reports `Done`, before the gate's rebase rewrites the shas | `an_acceptance_that_names_no_commit_leaves_its_comment_outstanding`, `an_acceptance_is_believed_only_for_a_commit_the_delivered_branch_carries`, `an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_outstanding` |
+| A rebased branch updates its pull request, and never overwrites someone else's work | `publish` pushes `--force-with-lease`; a lease failure is classified on its own as permanent, naming the remote branch that moved, so it stays distinct from a stale-base rejection | `a_rebased_branch_is_pushed_over_its_own_history_but_never_over_someone_elses` |
+
+The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
+way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop
+the per-issue bound or reset it with the pull request, stop consulting the verdict table — and
+the named test fails. The six rows from #47 were checked the same way — a plain push, then a
+bare `--force`; the pull request returned as found; the remote filter dropped from both
+`stacked_on`s; the verdict recorded before its reply; `review_requested` keyed on the number
+alone; the commit check removed from the worker, from `carries` and from the scheduler in turn —
+and each named test failed, with the file restored by `cp` rather than `mv`, because a preserved
+mtime leaves cargo running the stale binary.
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the
@@ -525,7 +620,9 @@ Every seam symphony-cc needs to dispatch against its own backlog now has a real
 implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`
 (`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`), the tool broker
 (`[broker]`, on by default), run transcripts (`[transcripts]`, likewise) and the handoff gate
-(`[gate]`, on by default with `symphony.github.toml` naming the three commit-gate commands). The broker is on by default where the worker is not, because the
+(`[gate]`, on by default with `symphony.github.toml` naming the three commit-gate commands) and
+delivery (`[delivery]`, off by default and on in `symphony.github.toml`, for the same reason
+`worker.kind` is: it publishes under the operator's credentials). The broker is on by default where the worker is not, because the
 two switches mean opposite things: `worker.kind` decides whether an agent runs at all, while
 the broker only decides whether an agent that is already running has a *scoped, logged* way to
 do what it could otherwise do ambiently. Turning it off removes the audit trail, not the

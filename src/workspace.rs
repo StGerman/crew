@@ -6,10 +6,12 @@
 //! well as before launch — deletion is the more dangerous of the two, and the spec only
 //! mandates the check for launch.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::model::worktree_key;
+use crate::forge::{ForgeError, Published, Publisher};
+use crate::model::{looks_like_commit, worktree_key};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -407,6 +409,135 @@ impl Workspace for GitWorktreeWorkspace {
             }
         }
         Ok(Removed { branch_deleted })
+    }
+}
+
+/// The git half of delivery, on the type that already owns every other git call.
+///
+/// `publish` pushes from the *worktree*, not from `repo`: the worktree's HEAD is the branch,
+/// and pushing from `repo` would mean naming a ref `repo` may have checked out under a
+/// different name. The commit list is taken over the remote's copy of `base` when the remote
+/// has one, because that is the base the pull request will actually be opened against; a
+/// local `base` that has fallen behind would list commits the remote already has.
+impl Publisher for GitWorktreeWorkspace {
+    fn publish(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        remote: &str,
+        base: &str,
+    ) -> Result<Published, ForgeError> {
+        self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        // With a lease, not plain: the gate rebases an already-published branch onto a newer
+        // base before every re-delivery, and a rebase rewrites the history the remote holds, so
+        // a plain push is rejected non-fast-forward in exactly the round the base moved and
+        // delivery hands off instead of updating the pull request. Forcing is sanctioned
+        // because the branch is the orchestrator's own; the lease is what keeps that apart from
+        // forcing over somebody else's — it expects the remote ref to be what this repository
+        // last saw of it, and a remote that has moved since is refused, not overwritten.
+        Self::git(worktree, &["push", "--force-with-lease", "--set-upstream", remote, branch])
+            .map_err(|e| {
+                let text = e.to_string();
+                if text.contains("stale info") {
+                    // The lease failed: the remote branch carries something this repository
+                    // never pushed. A real conflict, and the one case forcing must not resolve.
+                    ForgeError::Permanent(format!(
+                        "{remote}/{branch} has moved since it was last fetched; refusing to \
+                         force over work this orchestrator did not push: {text}"
+                    ))
+                } else if text.contains("rejected")
+                    || text.contains("permission")
+                    || text.contains("denied")
+                {
+                    // Any other rejection will be rejected again; the rest is the network.
+                    ForgeError::Permanent(text)
+                } else {
+                    ForgeError::Transient(text)
+                }
+            })?;
+        let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
+            .map_err(|e| ForgeError::Transient(e.to_string()))?;
+
+        // Best-effort: a fetch that fails leaves the local `base`, which is right whenever the
+        // remote has nothing newer, and only over-lists commits otherwise.
+        let _ = Self::git(worktree, &["fetch", "--quiet", remote, base]);
+        let remote_base = format!("refs/remotes/{remote}/{base}");
+        let base_ref =
+            if Self::git(worktree, &["rev-parse", "--verify", "--quiet", &remote_base]).is_ok() {
+                remote_base
+            } else {
+                base.to_string()
+            };
+        let range = format!("{base_ref}..{branch}");
+        let log = Self::git(worktree, &["log", "--format=%s", &range])
+            .map_err(|e| ForgeError::Transient(e.to_string()))?;
+        let commits = log.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
+        Ok(Published { head_sha, commits })
+    }
+
+    fn stacked_on(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        remote: &str,
+        base: &str,
+        candidates: &[String],
+    ) -> Result<Option<String>, ForgeError> {
+        // What the remote actually has, asked for directly rather than read off the
+        // remote-tracking refs: those say what this repository last fetched, and a lower branch
+        // pushed by another clone — or deleted after its merge — would be misread either way.
+        // One round trip for every candidate at once; a network failure here is the same
+        // transient the push after it would hit.
+        let heads = Self::git(worktree, &["ls-remote", "--heads", remote])
+            .map_err(|e| ForgeError::Transient(format!("listing {remote}'s branches: {e}")))?;
+        let on_remote: HashSet<&str> = heads
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter_map(|(_, r)| r.strip_prefix("refs/heads/"))
+            .collect();
+
+        // A candidate is "under" this branch when the remote has it, it is an ancestor of
+        // this branch, and it carries commits `base` does not — a branch already merged into
+        // `base` is not a stack, it is history.
+        let under: Vec<&String> = candidates
+            .iter()
+            .filter(|c| *c != branch)
+            .filter(|c| on_remote.contains(c.as_str()))
+            .filter(|c| {
+                Self::git(
+                    worktree,
+                    &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{c}")],
+                )
+                .is_ok()
+            })
+            .filter(|c| Self::git(worktree, &["merge-base", "--is-ancestor", c, branch]).is_ok())
+            .filter(|c| Self::git(worktree, &["merge-base", "--is-ancestor", c, base]).is_err())
+            .collect();
+        // Of a stack of several, the pull request is based on the nearest: the one no other
+        // candidate under this branch descends from.
+        let nearest = under.iter().find(|c| {
+            !under.iter().any(|o| {
+                o != *c && Self::git(worktree, &["merge-base", "--is-ancestor", c, o]).is_ok()
+            })
+        });
+        Ok(nearest.map(|s| s.to_string()))
+    }
+
+    fn carries(&self, worktree: &Path, branch: &str, sha: &str) -> Result<bool, ForgeError> {
+        // Shape first, so a bare acknowledgement never reaches git as a revision expression —
+        // `fixed` is not a ref, but `HEAD` or `@{-1}` would be, and an agent's text is input.
+        if !looks_like_commit(sha) {
+            return Ok(false);
+        }
+        self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        // Existence before ancestry: `merge-base --is-ancestor` fails the same way for a commit
+        // that is not an ancestor and for a name that resolves to nothing, and only the first
+        // of those is a fact about the branch.
+        let object = format!("{sha}^{{commit}}");
+        if Self::git(worktree, &["rev-parse", "--verify", "--quiet", &object]).is_err() {
+            return Ok(false);
+        }
+        Ok(Self::git(worktree, &["merge-base", "--is-ancestor", sha, branch]).is_ok())
     }
 }
 
@@ -891,6 +1022,262 @@ mod tests {
             !branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")),
             "the parent's own branch is treated exactly as before"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ---- Publisher -----------------------------------------------------------
+
+    fn git_out(at: &Path, args: &[&str]) -> Result<String, String> {
+        let out = Command::new("git").arg("-C").arg(at).args(args).output().unwrap();
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    /// A repo with a bare `origin` it has already pushed `main` to, so a publish has somewhere
+    /// real to land and a remote-tracking base to be measured against.
+    fn repo_with_remote(tag: &str) -> (PathBuf, PathBuf) {
+        let repo = tmp_repo(tag);
+        let bare = tmp_root(&format!("bare-{tag}"));
+        git_out(&bare, &["init", "-q", "--bare"]).unwrap();
+        git_out(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).unwrap();
+        git_out(&repo, &["push", "-q", "origin", "main"]).unwrap();
+        (repo, bare)
+    }
+
+    #[test]
+    fn publish_pushes_the_branch_to_the_remote_and_lists_its_commits_over_the_base() {
+        let root = tmp_root("wt-publish");
+        let (repo, bare) = repo_with_remote("wt-publish");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        commit_in(&p.path, "b.txt", "second change");
+
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(published.head_sha, head_of(&p.path));
+        assert_eq!(published.commits, vec!["second change", "first change"], "newest first");
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            published.head_sha,
+            "the remote must hold exactly the head that was reported"
+        );
+
+        // Pushing again with nothing new is idempotent, which delivery relies on.
+        let again = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(again, published);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn a_branch_carrying_nothing_over_its_base_publishes_an_empty_commit_list() {
+        let root = tmp_root("wt-publish-empty");
+        let (repo, bare) = repo_with_remote("wt-publish-empty");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let published =
+            ws.publish(&p.path, p.branch.as_deref().unwrap(), "origin", "main").unwrap();
+        assert!(published.commits.is_empty(), "nothing to open a pull request over");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// Finding 6 on #47. The gate rebases a published branch before every re-delivery, so the
+    /// second push of a branch is routinely a history rewrite; a plain push refuses it and the
+    /// pull request never sees the fix. Forcing is right only because the branch is the
+    /// orchestrator's — the second half of this test is what keeps that from becoming forcing
+    /// over anyone's: a remote that moved under us is a refusal, with the reason, not a push.
+    #[test]
+    fn a_rebased_branch_is_pushed_over_its_own_history_but_never_over_someone_elses() {
+        let root = tmp_root("wt-publish-lease");
+        let (repo, bare) = repo_with_remote("wt-publish-lease");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        let first = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        // The gate's rebase, in miniature: the same change under a rewritten commit.
+        git_out(&p.path, &["commit", "--amend", "-q", "-m", "first change, rebased"]).unwrap();
+        assert_ne!(head_of(&p.path), first.head_sha, "the history was rewritten");
+        let second = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(second.head_sha, head_of(&p.path));
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            second.head_sha,
+            "the remote must follow the orchestrator's own rewrite"
+        );
+        assert_eq!(second.commits, vec!["first change, rebased"]);
+
+        // Somebody else pushes to the branch from a clone this repository has never fetched.
+        let other = tmp_root("wt-publish-lease-other");
+        std::fs::remove_dir_all(&other).ok();
+        git_out(
+            &std::env::temp_dir(),
+            &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()],
+        )
+        .unwrap();
+        git_out(&other, &["config", "user.email", "test@example.com"]).unwrap();
+        git_out(&other, &["config", "user.name", "test"]).unwrap();
+        git_out(&other, &["checkout", "-q", &branch]).unwrap();
+        commit_in(&other, "theirs.txt", "a reviewer's own commit");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        let theirs = head_of(&other);
+
+        commit_in(&p.path, "b.txt", "second change");
+        let err = ws.publish(&p.path, &branch, "origin", "main").unwrap_err();
+        assert!(
+            matches!(err, ForgeError::Permanent(_)),
+            "a lease failure is a real conflict: {err}"
+        );
+        assert!(err.to_string().contains("did not push"), "and says whose work stopped it: {err}");
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            theirs,
+            "their commit must still be on the remote"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn stacked_on_names_the_nearest_branch_under_the_work_and_ignores_ones_already_in_the_base() {
+        let root = tmp_root("wt-stack");
+        let (repo, bare) = repo_with_remote("wt-stack");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        // Lower carries a commit over main; upper is built on top of lower; sibling sits on
+        // main by itself; merged is a branch main already contains. All of them are on the
+        // remote, so this test is about ancestry alone.
+        let lower = ws.prepare("id-1", "MT-1").unwrap();
+        commit_in(&lower.path, "lower.txt", "lower");
+        let lower_branch = lower.branch.clone().unwrap();
+        ws.publish(&lower.path, &lower_branch, "origin", "main").unwrap();
+
+        let upper = ws.prepare("id-2", "MT-2").unwrap();
+        git_out(&upper.path, &["merge", "-q", "--ff-only", &lower_branch]).unwrap();
+        commit_in(&upper.path, "upper.txt", "upper");
+        let upper_branch = upper.branch.clone().unwrap();
+        ws.publish(&upper.path, &upper_branch, "origin", "main").unwrap();
+
+        let sibling = ws.prepare("id-3", "MT-3").unwrap();
+        commit_in(&sibling.path, "sibling.txt", "sibling");
+        let sibling_branch = sibling.branch.clone().unwrap();
+        ws.publish(&sibling.path, &sibling_branch, "origin", "main").unwrap();
+
+        let merged = ws.prepare("id-4", "MT-4").unwrap();
+        let merged_branch = merged.branch.clone().unwrap();
+        ws.publish(&merged.path, &merged_branch, "origin", "main").unwrap();
+
+        let candidates = vec![lower_branch.clone(), sibling_branch.clone(), merged_branch];
+
+        assert_eq!(
+            ws.stacked_on(&upper.path, &upper_branch, "origin", "main", &candidates).unwrap(),
+            Some(lower_branch.clone()),
+            "upper's work sits on lower"
+        );
+        assert_eq!(
+            ws.stacked_on(&sibling.path, &sibling_branch, "origin", "main", &candidates).unwrap(),
+            None,
+            "a branch straight off main is not stacked, even with merged-in candidates around"
+        );
+
+        // A third storey: the nearest branch wins, not the lowest.
+        let top = ws.prepare("id-5", "MT-5").unwrap();
+        git_out(&top.path, &["merge", "-q", "--ff-only", &upper_branch]).unwrap();
+        commit_in(&top.path, "top.txt", "top");
+        let all = vec![lower_branch, upper_branch.clone(), sibling_branch];
+        assert_eq!(
+            ws.stacked_on(&top.path, top.branch.as_deref().unwrap(), "origin", "main", &all)
+                .unwrap(),
+            Some(upper_branch)
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// Finding 2 on #47. The pull request is opened against the remote's branches, so a lower
+    /// branch that exists only locally — still running, or finished and not yet pushed — is
+    /// a `422` from the provider and a handoff for the upper one. Not a base, however plainly
+    /// the work sits on it; and a base once it has been pushed.
+    #[test]
+    fn a_stack_candidate_the_remote_does_not_have_is_not_selected_as_a_base() {
+        let root = tmp_root("wt-stack-unpushed");
+        let (repo, bare) = repo_with_remote("wt-stack-unpushed");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let lower = ws.prepare("id-1", "MT-1").unwrap();
+        commit_in(&lower.path, "lower.txt", "lower");
+        let lower_branch = lower.branch.clone().unwrap();
+
+        let upper = ws.prepare("id-2", "MT-2").unwrap();
+        git_out(&upper.path, &["merge", "-q", "--ff-only", &lower_branch]).unwrap();
+        commit_in(&upper.path, "upper.txt", "upper");
+        let upper_branch = upper.branch.clone().unwrap();
+
+        let candidates = vec![lower_branch.clone()];
+        assert_eq!(
+            ws.stacked_on(&upper.path, &upper_branch, "origin", "main", &candidates).unwrap(),
+            None,
+            "lower is under upper locally, but the remote has never seen it"
+        );
+
+        ws.publish(&lower.path, &lower_branch, "origin", "main").unwrap();
+        assert_eq!(
+            ws.stacked_on(&upper.path, &upper_branch, "origin", "main", &candidates).unwrap(),
+            Some(lower_branch),
+            "once pushed, the same branch is the base"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// Finding 5 on #47. An acceptance names the commit that resolved the comment, and the
+    /// delivered branch is what that claim is checked against: a commit on the base only, a
+    /// sha that resolves to nothing, or a word that is no sha at all is not an acceptance.
+    #[test]
+    fn an_acceptance_is_believed_only_for_a_commit_the_delivered_branch_carries() {
+        let root = tmp_root("wt-carries");
+        let repo = tmp_repo("wt-carries");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "the fix");
+        let on_branch = head_of(&p.path);
+        let abbreviated = on_branch[..7].to_string();
+        // A real commit that is not on the branch: main moves on without it.
+        std::fs::write(repo.join("main.txt"), b"elsewhere").unwrap();
+        git_out(&repo, &["add", "main.txt"]).unwrap();
+        git_out(&repo, &["commit", "-q", "-m", "on main only"]).unwrap();
+        let on_main = git_out(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        assert!(ws.carries(&p.path, &branch, &on_branch).unwrap());
+        assert!(ws.carries(&p.path, &branch, &abbreviated).unwrap(), "abbreviated is still it");
+        assert!(!ws.carries(&p.path, &branch, &on_main).unwrap(), "a commit the branch lacks");
+        assert!(!ws.carries(&p.path, &branch, "deadbeefdeadbeef").unwrap(), "resolves to nothing");
+        assert!(!ws.carries(&p.path, &branch, "fixed").unwrap(), "not a commit at all");
+        assert!(!ws.carries(&p.path, &branch, "HEAD").unwrap(), "a ref is not a commit named");
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();

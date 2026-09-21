@@ -11,7 +11,7 @@ use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, FakeClock};
 use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
-use symphony_cc::gate::Verdict;
+use symphony_cc::gate::Verdict as GateVerdict;
 use symphony_cc::gate::fake::{FakeGate, GateScript};
 use symphony_cc::model::{ErrorClass, Issue, Outcome, Phase};
 use symphony_cc::project::{NoopProjector, Projector, TasksProjector};
@@ -104,6 +104,7 @@ fn harness_full(
         api: Default::default(),
         transcripts: Default::default(),
         gate: Default::default(),
+        delivery: Default::default(),
     };
     tune(&mut cfg);
     cfg.preflight().expect("test config must be valid");
@@ -759,7 +760,7 @@ fn a_done_verdict_is_gated_in_its_own_worktree_before_the_claim_is_released() {
 #[test]
 fn a_branch_with_nothing_to_hand_off_passes_straight_through() {
     let (mut h, gate) = gated_harness(|_| {});
-    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::NoCommits));
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::NoCommits));
     dispatch_and_finish(&mut h);
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
@@ -775,7 +776,7 @@ fn a_branch_with_nothing_to_hand_off_passes_straight_through() {
 #[test]
 fn a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths() {
     let (mut h, gate) = gated_harness(|c| c.gate.base = Some("master".into()));
-    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::Conflict {
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
         paths: vec!["src/sched/mod.rs".into(), "CLAUDE.md".into()],
     }));
     dispatch_and_finish(&mut h);
@@ -806,7 +807,7 @@ fn a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths() {
 #[test]
 fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
     let (mut h, gate) = gated_harness(|_| {});
-    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::Failed {
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "cargo test".into(),
         output: "test a_thing ... FAILED\nassertion `left == right` failed".into(),
         on_base: true,
@@ -829,12 +830,14 @@ fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
     assert_eq!(h.sched.running_count(), 1, "the continuation is dispatched");
     let sessions = h.worker.sessions_for("iss-1");
     assert!(matches!(sessions[1], Session::Resume(_)), "into the same conversation");
-    let briefs = h.worker.briefs_for("iss-1");
-    assert_eq!(briefs[0], None, "a first dispatch has nothing to explain");
-    let brief = briefs[1].as_deref().expect("the continuation must be told why it exists");
-    assert!(brief.contains("cargo test"), "which step: {brief}");
-    assert!(brief.contains("a_thing ... FAILED"), "and what it said: {brief}");
-    assert!(brief.contains("1 of 3"), "and how many tries are left: {brief}");
+    let feedback = h.worker.feedback_for("iss-1");
+    assert_eq!(feedback[0], None, "a first dispatch has nothing to explain");
+    let Some(Feedback::Gate { output }) = &feedback[1] else {
+        panic!("the continuation must be told why it exists, by the gate: {:?}", feedback[1]);
+    };
+    assert!(output.contains("cargo test"), "which step: {output}");
+    assert!(output.contains("a_thing ... FAILED"), "and what it said: {output}");
+    assert!(output.contains("1 of 3"), "and how many tries are left: {output}");
 }
 
 /// The brief must describe the tree the agent will actually find. A base that will not
@@ -846,7 +849,7 @@ fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
 #[test]
 fn a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_rebased() {
     let (mut h, gate) = gated_harness(|_| {});
-    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::Failed {
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "resolve base release-1.2".into(),
         output: "cannot resolve rebase base `release-1.2`".into(),
         on_base: false,
@@ -857,8 +860,11 @@ fn a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_reb
     h.clock.advance_ms(5_000);
     h.sched.tick().unwrap();
 
-    let briefs = h.worker.briefs_for("iss-1");
-    let brief = briefs[1].as_deref().expect("the continuation must be told why it exists");
+    // Delivery folded the gate's brief into `Feedback::Gate`; the fact under test is the same.
+    let brief = match &h.worker.feedback_for("iss-1")[1] {
+        Some(Feedback::Gate { output }) => output.clone(),
+        other => panic!("the continuation must be told why it exists, got {other:?}"),
+    };
     assert!(
         !brief.contains("has been rebased"),
         "nothing was rebased, so the brief must not claim it was: {brief}"
@@ -875,7 +881,7 @@ fn a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_reb
 #[test]
 fn repeated_gate_failures_escalate_to_blocked_rather_than_looping() {
     let (mut h, gate) = gated_harness(|c| c.gate.max_failures = 2);
-    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::Failed {
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "cargo clippy".into(),
         output: "error: unused variable".into(),
         on_base: true,
@@ -919,7 +925,7 @@ fn a_passing_gate_resets_the_failure_streak() {
         c.gate.max_failures = 2;
         c.tracker.active_states = vec!["in progress".into(), "in review".into()];
     });
-    let failing = GateScript::passes_in(1_000).with_verdict(Verdict::Failed {
+    let failing = GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "cargo test".into(),
         output: "boom".into(),
         on_base: true,
@@ -1823,4 +1829,815 @@ fn retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file(
         stalled.exists(),
         "a live run's transcript must survive retention, however old the file looks"
     );
+}
+
+// ---- delivery ------------------------------------------------------------------
+
+use symphony_cc::forge::fake::{FakeForge, Op};
+use symphony_cc::forge::{CiStatus, ForgeError, PrState, Publisher};
+use symphony_cc::model::{Feedback, ReviewVerdict, Verdict};
+use symphony_cc::workspace::{Prepared, Removed, WorkspaceError};
+
+/// A plain-directory workspace that names a branch, the way a git one would.
+///
+/// Delivery is keyed on the branch `prepare` recorded, and `DirWorkspace` honestly reports
+/// none. These tests are about the scheduler's decisions, not git's, so the wrapper gives the
+/// scheduler a name to deliver without paying for a real repository per test.
+struct NamedBranches(DirWorkspace);
+
+impl Workspace for NamedBranches {
+    fn prepare(&self, issue_id: &str, identifier: &str) -> Result<Prepared, WorkspaceError> {
+        let p = self.0.prepare(issue_id, identifier)?;
+        Ok(Prepared { branch: self.branch_for(issue_id, identifier), ..p })
+    }
+    fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
+        self.0.remove(issue_id, identifier)
+    }
+    fn path_for(&self, issue_id: &str, identifier: &str) -> PathBuf {
+        self.0.path_for(issue_id, identifier)
+    }
+    fn branch_for(&self, issue_id: &str, identifier: &str) -> Option<String> {
+        Some(format!("symphony/{}", symphony_cc::model::worktree_key(issue_id, identifier)))
+    }
+}
+
+/// A harness with delivery on: a fake forge that reports green CI and attaches reviewers
+/// unless told otherwise, polled every second so a test can advance the clock past it cheaply.
+fn delivery_harness(
+    issues: Vec<Issue>,
+    store: Store,
+    tune: impl FnOnce(&mut Config),
+) -> (Harness, Arc<FakeForge>) {
+    delivery_harness_with(issues, store, Arc::new(FakeForge::new()), tune)
+}
+
+/// The same, over a forge the caller already holds — what a restart looks like from the
+/// provider's side: the pull requests it has are still there, only the process is new.
+fn delivery_harness_with(
+    issues: Vec<Issue>,
+    store: Store,
+    forge: Arc<FakeForge>,
+    tune: impl FnOnce(&mut Config),
+) -> (Harness, Arc<FakeForge>) {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!("symphony-deliver-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let workspace = Arc::new(NamedBranches(DirWorkspace::new(&root).unwrap()));
+
+    let mut h = harness_over(issues, root, store, workspace, |c| {
+        c.delivery.enabled = true;
+        c.delivery.poll_interval_ms = 1_000;
+        tune(c);
+    });
+    let publisher: Arc<dyn Publisher> = forge.clone();
+    h.sched.set_delivery(Some(forge.clone()), Some(publisher));
+    h.worker.set_default(Script::succeeds_in(1_000));
+    (h, forge)
+}
+
+fn delivery_of(h: &Harness, id: &str) -> symphony_cc::store::DeliveryRecord {
+    h.sched.store().delivery(id).unwrap().expect("a delivery row")
+}
+
+/// Run one attempt to completion and harvest it: dispatch, let the fake finish, tick again.
+fn run_once(h: &mut Harness) {
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+}
+
+#[test]
+fn a_run_that_finishes_leaves_an_open_pull_request_not_only_a_branch() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+
+    run_once(&mut h);
+
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "a done run must leave a pull request, got {:?}", forge.ops());
+    let spec = forge.spec_of(prs[0].number).unwrap();
+    assert!(spec.head.starts_with("symphony/MT-1-"), "opened from the run's branch: {}", spec.head);
+    assert_eq!(spec.base, "master");
+    assert!(spec.title.contains("MT-1"), "{}", spec.title);
+    assert!(
+        spec.body.contains("do the work"),
+        "the body lists the branch's commits: {}",
+        spec.body
+    );
+    assert!(spec.body.contains("symphony-cc"), "and says who opened it: {}", spec.body);
+
+    // The push comes before the pull request, and the snapshot carries both.
+    assert!(matches!(forge.ops()[0], Op::Publish { .. }));
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready, "green CI, nothing outstanding");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert_eq!(row.delivery.as_ref().unwrap().pr_url.as_deref(), Some(prs[0].url.as_str()));
+    // Delivery does not disturb the parked issue: it is still released, still parked.
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Released);
+}
+
+/// The done bar this project states: a red gate is a `Continue`, never a `Done`. The run said
+/// done; CI disagreed; the issue must go back to an agent with the failure in its prompt rather
+/// than rest as finished.
+#[test]
+fn a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_run_does_not_rest_on_done()
+ {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.red_ci(
+        &FakeForge::head_after_publish(1),
+        "error[E0308]: mismatched types\n --> src/x.rs:4:5",
+    );
+
+    run_once(&mut h);
+
+    // Not resting: the retry delivery queued was due at once, so by the end of the tick that
+    // harvested the "done" the fix round is already running — into the same conversation,
+    // with the failure in hand.
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Running, "a red gate must send the issue back, not park it");
+    assert!(st.parked_state.is_none(), "and lift the park so the retry is not refused");
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    let fb = h.worker.feedback_for("iss-1");
+    assert_eq!(fb.len(), 2, "one first run, one fix round: {fb:?}");
+    assert!(fb[0].is_none(), "the first run had nothing to be told");
+    match &fb[1] {
+        Some(Feedback::Ci { failures, .. }) => {
+            assert!(
+                failures[0].detail.contains("E0308"),
+                "the cause reaches the agent: {failures:?}"
+            );
+        }
+        other => panic!("the fix round must be handed the CI failure, got {other:?}"),
+    }
+    let sessions = h.worker.sessions_for("iss-1");
+    assert!(
+        matches!(sessions[1], Session::Resume(_)),
+        "a fix round resumes, it does not re-orient"
+    );
+
+    // The fix lands green, and only then does the issue come to rest.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(forge.open_prs().len(), 1, "the same pull request, updated, not a second one");
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
+}
+
+/// GETT-174120: requesting a bot reviewer over REST returns success and adds nobody. The
+/// provider's answer is not evidence; the pull request's own state is, and a request that did
+/// not take must be reported as the failure it is.
+#[test]
+fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reported_as_a_failure() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()];
+        },
+    );
+    forge.set_attach_reviewers(false);
+
+    run_once(&mut h);
+
+    assert!(
+        forge.ops().iter().any(|o| matches!(o, Op::RequestReview { .. })),
+        "the request was made: {:?}",
+        forge.ops()
+    );
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::HandedOff, "not a success");
+    let why = d.review_error.expect("the failure is recorded on the delivery");
+    assert!(why.contains("attached nobody"), "{why}");
+    assert!(why.contains("copilot-pull-request-reviewer[bot]"), "and names who: {why}");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert!(
+        row.last_error.as_deref().is_some_and(|e| e.contains("attached nobody")),
+        "surfaced to the operator: {row:?}"
+    );
+
+    // The same request, verifiably attached, is a success — so the check is about attachment,
+    // not about requesting bots.
+    let (mut h2, forge2) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()];
+        },
+    );
+    run_once(&mut h2);
+    assert_eq!(delivery_of(&h2, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert!(delivery_of(&h2, "iss-1").review_error.is_none());
+    drop(forge2);
+}
+
+#[test]
+fn each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and_is_not_re_argued()
+{
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+
+    // A reviewer leaves two comments after the pull request opens.
+    let fix_me = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    let no = forge.add_comment(pr, "Copilot", "src/transcript.rs", "umask concern");
+    // The fix round will settle one and decline the other.
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![
+        ReviewVerdict {
+            comment_id: fix_me.clone(),
+            verdict: Verdict::Accepted,
+            detail: "abc1234".into(),
+        },
+        ReviewVerdict {
+            comment_id: no.clone(),
+            verdict: Verdict::Rejected,
+            detail: "restrict() sets the mode two lines below".into(),
+        },
+    ]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    // Handed to a run as work, not as text: the round is dispatched with both comments.
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    match &h.worker.feedback_for("iss-1")[1] {
+        Some(Feedback::Review { comments, .. }) => {
+            assert_eq!(comments.len(), 2, "{comments:?}");
+        }
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+
+    // The run settles both; delivery records each verdict and replies on its thread.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let verdicts = h.sched.store().verdicts_for("iss-1").unwrap();
+    assert_eq!(
+        verdicts[&fix_me],
+        (Verdict::Accepted, "abc1234".to_string()),
+        "accepted, with the commit"
+    );
+    assert_eq!(verdicts[&no].0, Verdict::Rejected, "rejected, with the reason");
+    assert!(forge.replies_to(pr, &fix_me)[0].contains("abc1234"));
+    assert!(forge.replies_to(pr, &no)[0].contains("restrict()"));
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+
+    // Settled threads are not handed out again, however many times the pull request is polled.
+    for _ in 0..5 {
+        h.clock.advance_ms(2_000);
+        h.sched.tick().unwrap();
+    }
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "no further round over settled comments");
+    assert_eq!(forge.replies_to(pr, &fix_me).len(), 1, "one reply per verdict, ever");
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
+}
+
+/// Finding 3 on #47. The verdict was recorded — durably settled, excluded from every later
+/// poll — and *then* the reply was attempted, with a failure merely logged. One transient error
+/// on that write hid the verdict from the reviewer for good while delivery advanced to `Ready`.
+/// The ordering is the bug: a verdict is settled by a reply that landed, and by nothing else.
+#[test]
+fn a_verdict_is_not_settled_by_a_reply_that_did_not_land() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c.clone(),
+        verdict: Verdict::Rejected,
+        detail: "the default is set two lines below".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+
+    // The run settles the comment; the network drops the reply that would say so.
+    forge.fail_reply_with(Some(ForgeError::Transient("connection reset".into())));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert!(
+        !h.sched.store().verdicts_for("iss-1").unwrap().contains_key(&c),
+        "a verdict whose reply did not land is not settled"
+    );
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.stage, symphony_cc::store::DeliveryStage::Ready, "and delivery cannot rest on it");
+    assert!(d.pending_verdicts.is_some(), "the verdict is still queued, not dropped: {d:?}");
+    assert!(
+        h.sched.snapshot().unwrap().last_error.as_deref().unwrap().contains("connection reset"),
+        "the failure is visible"
+    );
+    // Not handed back to an agent either: the thread is unsettled, but the run already spoke.
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "no round is opened over a failed reply");
+    assert_eq!(d.rounds_pr, 1);
+
+    // The network comes back: the same reply is retried, the verdict recorded, and only then
+    // does the pull request read as ready.
+    forge.fail_reply_with(None);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(forge.replies_to(pr, &c).len(), 1, "one reply, once it could land");
+    assert_eq!(h.sched.store().verdicts_for("iss-1").unwrap()[&c].0, Verdict::Rejected);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready);
+    assert!(d.pending_verdicts.is_none(), "the queue is empty once every reply has landed");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and it cost no agent run");
+}
+
+/// Finding 4 on #47, end to end: the reviewer approves the first head, CI sends the issue round,
+/// and the fix lands as a second head on the same pull request. Nobody had asked the reviewer
+/// again, so `Ready` was reached on a head no one had looked at.
+#[test]
+fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["reviewer".into()];
+        },
+    );
+    forge.red_ci(&FakeForge::head_after_publish(1), "error[E0308]: mismatched types");
+
+    // First head: review requested and verified, then CI sends the issue back.
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let requests = |forge: &FakeForge| {
+        forge.ops().iter().filter(|o| matches!(o, Op::RequestReview { .. })).count()
+    };
+    assert_eq!(requests(&forge), 1);
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    // The reviewer answers on that head while the fix is being written.
+    forge.add_review(pr, "reviewer", "APPROVED");
+
+    // Second head, same pull request: the reviewer is asked again before it can read as ready.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.head_sha.as_deref(), Some(FakeForge::head_after_publish(2).as_str()));
+    assert_eq!(requests(&forge), 2, "a new head is a new request: {:?}", forge.ops());
+    assert!(
+        forge.pr(pr).unwrap().requested_reviewers.contains(&"reviewer".to_string()),
+        "and it verifiably attached"
+    );
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready);
+}
+
+/// Finding 5 on #47, the half the parser cannot do: `deadbee` is shaped like a commit, and only
+/// the branch can say it is not one of its. An acceptance naming it is not recorded and not
+/// posted; the comment stays open and goes round again, named as one the agent left unanswered.
+#[test]
+fn an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_outstanding() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let real = forge.add_comment(pr, "Copilot", "src/a.rs", "handle the empty case");
+    let bogus = forge.add_comment(pr, "Copilot", "src/b.rs", "this leaks the handle");
+    forge.set_commits_on_branch(Some(vec!["abc1234".into()]));
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![
+        ReviewVerdict {
+            comment_id: real.clone(),
+            verdict: Verdict::Accepted,
+            detail: "abc1234".into(),
+        },
+        ReviewVerdict {
+            comment_id: bogus.clone(),
+            verdict: Verdict::Accepted,
+            detail: "deadbee".into(),
+        },
+    ]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let verdicts = h.sched.store().verdicts_for("iss-1").unwrap();
+    assert_eq!(verdicts[&real].0, Verdict::Accepted, "a commit the branch carries is believed");
+    assert!(!verdicts.contains_key(&bogus), "one it does not is not: {verdicts:?}");
+    assert_eq!(forge.replies_to(pr, &real).len(), 1);
+    assert!(forge.replies_to(pr, &bogus).is_empty(), "and nobody is told it was resolved");
+
+    // The comment is still open, so it goes back to an agent — as one it already left hanging.
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Redispatched, "{d:?}");
+    assert_eq!(d.rounds_pr, 2);
+    match &h.worker.feedback_for("iss-1")[2] {
+        Some(Feedback::Review { comments, unanswered_before, .. }) => {
+            let ids: Vec<&str> = comments.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(ids, vec![bogus.as_str()], "only the unsettled comment is handed back");
+            assert_eq!(unanswered_before, &vec![bogus.clone()], "named as left unanswered");
+        }
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+}
+
+/// The new runaway, bounded. A reviewer that comments on every push, answered by an agent
+/// that pushes, would loop forever; every hand-back is a round and the two bounds hold across
+/// a restart and across a fresh pull request.
+#[test]
+fn fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_a_new_run_and_a_new_pull_request()
+ {
+    let dir = tmp_dir("delivery-rounds");
+    let db = dir.join("symphony.db");
+    let tune = |c: &mut Config| {
+        c.delivery.max_rounds_per_pr = 2;
+        c.delivery.max_rounds_per_issue = 3;
+        c.tracker.active_states = vec!["in progress".into(), "in review".into()];
+    };
+
+    let (mut h, forge) =
+        delivery_harness(vec![issue(1, "In Progress", Some(1))], Store::open(&db).unwrap(), tune);
+    // Every head is red, every run says done: the loop with no bound of its own.
+    forge.set_ci_default(Some(CiStatus::Failure {
+        failures: vec![symphony_cc::forge::CiFailure {
+            name: "gate".into(),
+            url: None,
+            detail: "still red".into(),
+        }],
+    }));
+
+    for _ in 0..12 {
+        h.sched.tick().unwrap();
+        h.clock.advance_ms(1_000);
+    }
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(
+        d.stage,
+        symphony_cc::store::DeliveryStage::HandedOff,
+        "the per-PR bound must stop it"
+    );
+    assert_eq!((d.rounds_pr, d.rounds_issue), (2, 2));
+    assert!(
+        d.handoff_reason.as_deref().unwrap().contains("gate"),
+        "the outstanding item is named: {d:?}"
+    );
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 3, "first run plus exactly two rounds");
+    let pr1 = forge.open_prs()[0].number;
+
+    // A restart, a closed pull request and a ticket moved on: the per-PR count starts over
+    // with the new pull request, the per-issue count does not.
+    drop(h);
+    forge.set_state(pr1, PrState::Closed);
+    let (mut h, _same) = delivery_harness_with(
+        vec![issue(1, "In Review", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        tune,
+    );
+    // Past everything the first process did: run ids are wall-clock stamped.
+    h.clock.advance_ms(100_000);
+    for _ in 0..12 {
+        h.sched.tick().unwrap();
+        h.clock.advance_ms(1_000);
+    }
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::HandedOff);
+    assert_eq!(d.rounds_issue, 3, "the issue-wide bound is what stopped the second pull request");
+    assert_eq!(d.rounds_pr, 1, "with the new pull request's own count nowhere near its bound");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "one fresh run plus the single round left");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nothing_merges_without_a_human() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.reviewers = vec!["reviewer".into()];
+        },
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_review(pr, "reviewer", "APPROVED");
+
+    // Green, approved, nothing outstanding, polled for a long time: it stays open.
+    for _ in 0..20 {
+        h.clock.advance_ms(60_000);
+        h.sched.tick().unwrap();
+    }
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(
+        forge.pr(pr).unwrap().state,
+        PrState::Open,
+        "ready to merge is where the orchestrator stops"
+    );
+
+    // And once the human merges, delivery notices and stops polling.
+    forge.set_state(pr, PrState::Merged);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Closed);
+    let before = forge.ops().len();
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    assert_eq!(forge.ops().len(), before, "a closed delivery makes no further forge calls");
+}
+
+#[test]
+fn a_transient_forge_failure_retries_delivery_without_re_running_the_agent() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
+
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Pending);
+    assert!(forge.open_prs().is_empty());
+    assert!(
+        h.sched.snapshot().unwrap().last_error.as_deref().unwrap().contains("connection reset")
+    );
+
+    // Still failing: still pending, still no second run.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        h.worker.sessions_for("iss-1").len(),
+        1,
+        "a network blip must not cost an agent run"
+    );
+
+    forge.fail_with(None);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(forge.open_prs().len(), 1, "and the next poll finishes the job");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+}
+
+#[test]
+fn a_permanent_forge_failure_hands_off_rather_than_retrying_forever() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.fail_with(Some(ForgeError::Permanent("401 bad credentials".into())));
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::HandedOff);
+    assert!(d.handoff_reason.unwrap().contains("bad credentials"));
+    let calls = forge.ops().len();
+    for _ in 0..5 {
+        h.clock.advance_ms(5_000);
+        h.sched.tick().unwrap();
+    }
+    assert_eq!(forge.ops().len(), calls, "a handed-off delivery is not polled again");
+}
+
+#[test]
+fn a_run_that_committed_nothing_delivers_nothing_and_stays_parked() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_commits(vec![]);
+    run_once(&mut h);
+    assert!(!forge.ops().iter().any(|o| matches!(o, Op::OpenPr { .. })), "{:?}", forge.ops());
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Closed);
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"));
+}
+
+#[test]
+fn delivery_is_inert_unless_the_config_turns_it_on() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| {
+            c.delivery.enabled = false;
+        },
+    );
+    run_once(&mut h);
+    assert!(forge.ops().is_empty(), "a forge that is attached but not enabled must not be used");
+    assert!(h.sched.store().delivery("iss-1").unwrap().is_none());
+}
+
+#[test]
+fn a_stacked_branch_opens_its_pull_request_against_the_branch_it_sits_on() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    // The lower branch finishes, and is pushed, before the one on top of it.
+    h.worker.script("iss-2", Script::succeeds_in(2_000));
+    h.sched.tick().unwrap();
+    let under = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    // The publisher reports iss-2's work as sitting on iss-1's branch.
+    forge.set_stacked_on(Some(under.clone()));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let bases: Vec<(String, String)> = forge
+        .open_prs()
+        .iter()
+        .map(|p| (forge.spec_of(p.number).unwrap().head, p.base.clone()))
+        .collect();
+    let of =
+        |n: &str| bases.iter().find(|(head, _)| head.contains(n)).map(|(_, b)| b.clone()).unwrap();
+    assert_eq!(of("MT-1-"), "master", "the branch under the stack targets the trunk");
+    assert_eq!(of("MT-2-"), under, "the branch on top targets the one it sits on");
+    let top = forge.open_prs().iter().find(|p| p.base == under).unwrap().number;
+    assert!(forge.spec_of(top).unwrap().body.contains("Stacked on"), "and the body says so");
+}
+
+/// Finding 1 on #47, and the situation #42 is in as this is written: stacked on #43, whose merge
+/// moves #42's base to `master`. A reused pull request was returned as found, so the scheduler
+/// recorded the base it had computed while the provider still targeted the merged branch —
+/// and the pull request body claimed a stack that was over. Today that is a person clicking.
+#[test]
+fn a_pull_request_whose_desired_base_has_changed_is_retargeted_and_the_snapshot_agrees() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    h.worker.script("iss-2", Script::succeeds_in(2_000));
+    h.sched.tick().unwrap();
+    let under = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    forge.set_stacked_on(Some(under.clone()));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let top = forge.open_prs().iter().find(|p| p.base == under).expect("stacked").number;
+    assert_eq!(delivery_of(&h, "iss-2").base.as_deref(), Some(under.as_str()));
+
+    // The lower branch merges: iss-2's work now sits directly on the trunk. A review comment
+    // then sends iss-2 round once more, and the push after that round recomputes the base.
+    forge.set_stacked_on(None);
+    let c = forge.add_comment(top, "reviewer", "src/x.rs", "nit");
+    h.worker.script(
+        "iss-2",
+        Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+            comment_id: c,
+            verdict: Verdict::Rejected,
+            detail: "intended".into(),
+        }]),
+    );
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let pr = forge.pr(top).unwrap();
+    assert_eq!(pr.base, "master", "the provider targets the new base: {:?}", forge.ops());
+    assert!(
+        forge.ops().iter().any(
+            |o| matches!(o, Op::Retarget { number, to, .. } if *number == top && to == "master")
+        ),
+        "moved, not reopened: {:?}",
+        forge.ops()
+    );
+    assert_eq!(forge.open_prs().len(), 2, "still one pull request per issue");
+    assert_eq!(delivery_of(&h, "iss-2").base.as_deref(), Some("master"), "the store agrees");
+    let row = h.sched.snapshot().unwrap().rows.into_iter().find(|r| r.issue_id == "iss-2").unwrap();
+    assert_eq!(row.delivery.unwrap().base.as_deref(), Some("master"), "and so does the snapshot");
+    assert!(
+        !forge.spec_of(top).unwrap().body.contains("Stacked on"),
+        "the body no longer claims a stack that is over"
+    );
+    assert_eq!(delivery_of(&h, "iss-2").stage, symphony_cc::store::DeliveryStage::Ready);
+}
+
+/// Finding 2 on #47. Every issue's branch was a stack candidate, pushed or not; when the upper
+/// one finished first the pull request named a base the remote had never seen, and the
+/// provider's 422 read as permanent — a handoff for a branch with nothing wrong but its timing.
+#[test]
+fn a_base_that_is_not_published_is_not_selected_as_a_stack_base() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    // The branch on top finishes first; the one under it is still running.
+    h.worker.script("iss-1", Script::succeeds_in(5_000));
+    h.sched.tick().unwrap();
+    let under = h.sched.store().get("iss-1").unwrap().unwrap().branch.unwrap();
+    forge.set_stacked_on(Some(under.clone()));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert!(
+        !forge.ops().iter().any(|o| matches!(o, Op::Publish { branch, .. } if *branch == under)),
+        "the lower branch has not been pushed: {:?}",
+        forge.ops()
+    );
+    let prs = forge.open_prs();
+    assert_eq!(prs.len(), 1, "the upper branch delivered: {:?}", forge.ops());
+    assert_eq!(prs[0].base, "master", "against the trunk, not a base the remote does not have");
+    assert_eq!(delivery_of(&h, "iss-2").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-2").base.as_deref(), Some("master"));
+}
+
+/// Merging is the operator's, and it closes the ticket; `sweep_parked` then reclaims the
+/// worktree and may delete the branch. The delivery row polled after that must read the merged
+/// pull request as the end of the story, not the missing branch as a failure.
+#[test]
+fn a_merged_pull_request_whose_branch_cleanup_deleted_closes_delivery_rather_than_failing_it() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+
+    // The human merges; the ticket closes; cleanup deletes the now-merged branch.
+    forge.set_state(pr, PrState::Merged);
+    h.sched.store().set_branch(h.clock.as_ref(), "iss-1", None).unwrap();
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Closed, "{d:?}");
+    assert_eq!(d.handoff_reason.as_deref(), Some("merged"));
+    assert!(
+        h.sched.store().get("iss-1").unwrap().unwrap().last_error.is_none(),
+        "a merged pull request is not an error to report"
+    );
+}
+
+/// The stack is gate first, delivery second (#44). A `Done` with both attached goes to the gate
+/// before anything is pushed: a failing gate sends the issue back to an agent and the forge sees
+/// nothing at all, and only the gate's pass hands the branch — rebased and re-gated — to
+/// delivery. Push on the agent's `Done` instead and the first op below lands before the gate
+/// has spoken, which is this stack built upside down.
+#[test]
+fn a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes_nothing() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
+        step: "cargo test".into(),
+        output: "test a_thing ... FAILED".into(),
+        on_base: true,
+    }));
+
+    // The agent finishes; the gate takes over; nothing has been pushed.
+    run_once(&mut h);
+    assert_eq!(h.sched.gating_count(), 1, "the gate must have the branch first");
+    assert!(forge.ops().is_empty(), "nothing is pushed while the gate runs: {:?}", forge.ops());
+    assert!(h.sched.store().delivery("iss-1").unwrap().is_none(), "and no delivery is queued");
+
+    // The gate fails: a continuation, still nothing on the forge.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::RetryQueued, "a failing gate is a continuation");
+    assert!(forge.ops().is_empty(), "an ungated branch is never published: {:?}", forge.ops());
+    assert!(h.sched.store().delivery("iss-1").unwrap().is_none());
+
+    // The continuation is told why by the gate, through the one channel delivery also uses.
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1);
+    assert!(
+        matches!(&h.worker.feedback_for("iss-1")[1], Some(Feedback::Gate { output }) if output.contains("cargo test")),
+        "{:?}",
+        h.worker.feedback_for("iss-1")
+    );
+
+    // This time the gate passes, and only then does delivery push and open the pull request.
+    gate.set_default(GateScript::passes_in(1_000));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "gated again, on the rebased tree");
+    assert!(forge.ops().is_empty());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(gate.starts_for("iss-1").len(), 2, "one gate per Done");
+    let ops = forge.ops();
+    assert!(matches!(ops.first(), Some(Op::Publish { .. })), "pushed after the pass: {ops:?}");
+    assert!(ops.iter().any(|o| matches!(o, Op::OpenPr { .. })), "and opened: {ops:?}");
+    assert_eq!(forge.open_prs().len(), 1);
 }

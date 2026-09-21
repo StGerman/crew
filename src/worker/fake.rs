@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
 use crate::clock::{Clock, Mono};
-use crate::model::{ErrorClass, Issue, Outcome};
+use crate::model::{ErrorClass, Feedback, Issue, Outcome, ReviewVerdict};
 use crate::transcript::TranscriptWriter;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,9 @@ pub struct Script {
     pub outcome: Outcome,
     /// Stop emitting progress at this point while never finishing — a stalled agent.
     pub silent_after_ms: Option<u64>,
+    /// Review verdicts reported at completion, the way the real worker parses them off the
+    /// final message. Empty by default: most scripted runs were never handed a review.
+    pub verdicts: Vec<ReviewVerdict>,
 }
 
 impl Script {
@@ -36,7 +39,13 @@ impl Script {
             tokens: TokenUsage { input: 1_200, output: 750 },
             outcome: Outcome::Done,
             silent_after_ms: None,
+            verdicts: vec![],
         }
+    }
+
+    pub fn with_verdicts(mut self, v: Vec<ReviewVerdict>) -> Self {
+        self.verdicts = v;
+        self
     }
 
     pub fn with_outcome(mut self, o: Outcome) -> Self {
@@ -51,6 +60,7 @@ impl Script {
             tokens: TokenUsage { input: 600, output: 240 },
             outcome: Outcome::Failed { class: ErrorClass::Stall, msg: "no output".into() },
             silent_after_ms: Some(ms),
+            verdicts: vec![],
         }
     }
 }
@@ -73,9 +83,10 @@ pub struct FakeWorker {
     /// that failed to open a session hands `None` — so it is the scheduler's tests that need
     /// to see it, and nothing else in the run reveals it.
     endpoints: Mutex<HashMap<String, Vec<Option<ToolEndpoint>>>>,
-    /// The brief each spawn was handed. Whether a gate's failing output actually reached the
-    /// continuation is only observable here.
-    briefs: Mutex<HashMap<String, Vec<Option<String>>>>,
+    /// What delivery told each spawn about the previous run's output. The scheduler decides
+    /// this, and whether a red CI or a review actually reached the next run is exactly what
+    /// its tests need to see.
+    feedback: Mutex<HashMap<String, Vec<Option<Feedback>>>>,
 }
 
 impl FakeWorker {
@@ -86,7 +97,7 @@ impl FakeWorker {
             default_script: Mutex::new(Script::default()),
             sessions: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(HashMap::new()),
-            briefs: Mutex::new(HashMap::new()),
+            feedback: Mutex::new(HashMap::new()),
         }
     }
 
@@ -109,9 +120,9 @@ impl FakeWorker {
         self.endpoints.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
     }
 
-    /// The brief each spawn for this issue was handed, oldest first.
-    pub fn briefs_for(&self, issue_id: &str) -> Vec<Option<String>> {
-        self.briefs.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
+    /// The delivery feedback each spawn for this issue was handed, oldest first.
+    pub fn feedback_for(&self, issue_id: &str) -> Vec<Option<Feedback>> {
+        self.feedback.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
     }
 }
 
@@ -124,16 +135,11 @@ impl Worker for FakeWorker {
         session: &Session,
         tools: Option<&ToolEndpoint>,
         transcript: Option<TranscriptWriter>,
-        brief: Option<&str>,
+        feedback: Option<&Feedback>,
     ) -> Arc<dyn RunHandle> {
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
         self.endpoints.lock().unwrap().entry(issue.id.clone()).or_default().push(tools.cloned());
-        self.briefs
-            .lock()
-            .unwrap()
-            .entry(issue.id.clone())
-            .or_default()
-            .push(brief.map(str::to_string));
+        self.feedback.lock().unwrap().entry(issue.id.clone()).or_default().push(feedback.cloned());
 
         let script = self
             .scripts
@@ -242,6 +248,12 @@ impl RunHandle for FakeRun {
             tokens: self.completed().then_some(self.script.tokens),
             last_event: Some(if turns == 0 { "starting" } else { "turn_completed" }.into()),
         }
+    }
+
+    /// Reported the way the real worker reports them: only once the run has completed under
+    /// its own power. A killed run's verdicts, like its totals, never arrive.
+    fn verdicts(&self) -> Vec<ReviewVerdict> {
+        if self.completed() { self.script.verdicts.clone() } else { Vec::new() }
     }
 
     fn finished(&self) -> Option<Outcome> {

@@ -17,7 +17,10 @@
 //! it mutates the same `running` map as dispatch and splitting it would mean threading the
 //! whole scheduler through a free function for no readability gain.
 
+pub mod delivery;
 pub mod retry;
+
+pub use delivery::DeliveryView;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,8 +31,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
+use crate::forge::{Forge, Publisher};
 use crate::gate::{Gate, GateHandle, Verdict};
-use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
+use crate::model::{
+    ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, session_id, worktree_key,
+};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RunRecord, Store};
 use crate::tracker::{Tracker, TrackerError};
@@ -74,6 +80,10 @@ struct Running {
     last_progress_at: Mono,
     /// Tracker state when this run began, to tell real progress from spinning.
     state_at_start: String,
+    /// The run's review verdicts as delivery will apply them: read off the handle the moment
+    /// the run reports `Done`, with each acceptance checked against the branch *then* — before
+    /// a gate can rebase it and rewrite the commits they name. Empty until that moment.
+    verdicts: Vec<ReviewVerdict>,
     /// This run's authority to write to the tracker, held for exactly as long as the run is in
     /// the `running` map. Never read — dropping it is the point. Every path that ends a run
     /// removes the entry, so every path revokes the token and deletes the config file without
@@ -125,6 +135,9 @@ pub struct Row {
     /// The most recent run's transcript, so "show me what this issue did" is one path away
     /// from the dashboard rather than a layout someone has to know.
     pub transcript: Option<String>,
+    /// Where the branch is on its way to a mergeable pull request, once a run has reported
+    /// done with delivery on. `None` before that, and always for a deployment without a forge.
+    pub delivery: Option<DeliveryView>,
 }
 
 /// Immutable view published to observers. The TUI renders this and never touches the store,
@@ -172,6 +185,13 @@ pub struct Scheduler {
     /// which is the exact handoff issue #21 is about, so `main.rs` sets one whenever
     /// `gate.enabled` is true and the tests say so explicitly when they want it.
     gate: Option<Arc<dyn Gate>>,
+    /// The delivery pair (see [`delivery`]). Both `None` until `set_delivery`, and inert even
+    /// then unless `cfg.delivery.enabled` — the config decides, the wiring only enables.
+    forge: Option<Arc<dyn Forge>>,
+    publisher: Option<Arc<dyn Publisher>>,
+    /// When each open delivery was last polled, so the forge is asked at
+    /// `delivery.poll_interval_ms` rather than on every tick. Monotonic, like every interval.
+    delivery_polled: HashMap<String, Mono>,
     running: HashMap<String, Running>,
     /// Runs between the agent's `Done` and the verdict the gate turns it into. Disjoint from
     /// `running`; an issue is in at most one of the two.
@@ -215,6 +235,9 @@ impl Scheduler {
             broker: None,
             transcripts: None,
             gate: None,
+            forge: None,
+            publisher: None,
+            delivery_polled: HashMap::new(),
             running: HashMap::new(),
             gating: HashMap::new(),
             gate_failures: HashMap::new(),
@@ -285,6 +308,9 @@ impl Scheduler {
         self.harvest_gates()?;
         self.detect_stalls()?;
         self.refresh_running()?;
+        // Reconciliation too: it reads the outside world about runs already over, and may
+        // queue a retry that the gate below then decides whether to dispatch.
+        self.advance_deliveries()?;
 
         if let Err(e) = self.cfg.preflight() {
             self.last_error = Some(format!("preflight: {e}"));
@@ -403,6 +429,14 @@ impl Scheduler {
         for (issue_id, outcome) in done {
             let mut r = self.running.remove(&issue_id).expect("just listed");
 
+            if outcome == Outcome::Done {
+                // Now, and not when delivery applies them: the gate below rebases the branch,
+                // and a rebase rewrites the very shas these verdicts name. Checked against the
+                // branch as the agent left it, an acceptance either names a commit on it or it
+                // does not; checked afterwards, an honest one and an invented one look alike.
+                r.verdicts = self.verified_verdicts(&issue_id, &r.workspace, r.handle.verdicts());
+            }
+
             // `Done` is a claim, not a verdict, while there is a gate to check it against. The
             // run row stays open and the store claim stays held; what ends here is the agent's
             // authority — the broker session is dropped now rather than when the gate finishes,
@@ -465,6 +499,9 @@ impl Scheduler {
                 self.gate_failures.remove(issue_id);
                 self.store.release(self.clock.as_ref(), issue_id)?;
                 self.park_here(issue_id, r)?;
+                // After the park, so the issue is in the state delivery polls it in. Delivery
+                // is what turns this `Done` back into a `Continue` if CI or review disagree.
+                self.queue_delivery(issue_id, r.verdicts.clone())?;
             }
             Outcome::Blocked { why } => {
                 tracing::info!(issue_id, identifier = %r.issue.identifier, why, "run blocked; parking");
@@ -1266,6 +1303,25 @@ impl Scheduler {
             }
         });
 
+        // Taken, not read: whatever delivery queued for this issue reaches exactly this run.
+        // A feedback row that failed to parse is dropped with a warning rather than blocking
+        // the dispatch — the pull request still shows the failure, and the agent still has
+        // the issue. Delivery's word wins over the retry reason when both exist, because a
+        // delivery hand-back writes both and the structured one carries more; the reason is
+        // what is left when there is no row, or the row could not be read — for a gate-sent
+        // continuation, the output of the suite that disagreed with the agent's `Done`.
+        let feedback: Option<Feedback> = self
+            .store
+            .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
+            .and_then(|j| match serde_json::from_str(&j) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(issue_id = %issue.id, error = %e, "unreadable delivery feedback dropped");
+                    None
+                }
+            })
+            .or_else(|| brief.map(|b| Feedback::Gate { output: b.to_string() }));
+
         let handle = self.worker.spawn(
             issue,
             &prepared.path,
@@ -1273,7 +1329,7 @@ impl Scheduler {
             &session,
             broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
-            brief,
+            feedback.as_ref(),
         );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
@@ -1290,6 +1346,7 @@ impl Scheduler {
             session = session.id(),
             resumed = session.is_resume(),
             tools = broker_session.is_some(),
+            feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
             "dispatched"
         );
@@ -1306,6 +1363,7 @@ impl Scheduler {
                 transcript: transcript_path,
                 last_progress: Progress::default(),
                 last_progress_at: now,
+                verdicts: Vec::new(),
                 _broker: broker_session,
             },
         );
@@ -1339,6 +1397,7 @@ impl Scheduler {
         }
         // For issues with no live run: the last transcript is what a post-mortem starts from.
         let transcripts = self.store.latest_transcripts()?;
+        let mut deliveries = self.delivery_views()?;
 
         let mut rows = Vec::new();
         for st in &states {
@@ -1381,6 +1440,7 @@ impl Scheduler {
                 transcript: run
                     .and_then(|r| r.transcript.as_ref().map(|p| p.display().to_string()))
                     .or_else(|| transcripts.get(&st.issue_id).cloned()),
+                delivery: deliveries.remove(&st.issue_id),
             });
         }
 

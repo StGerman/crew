@@ -184,6 +184,93 @@ impl ErrorClass {
     }
 }
 
+/// What the orchestrator knows about why this attempt exists that the agent cannot see from
+/// inside its worktree. `None` on a first dispatch; otherwise exactly one of these, whichever
+/// sent the issue back — the handoff gate, CI on the pull request, or a reviewer.
+///
+/// One channel on purpose. The gate (#21) and delivery (#32) each arrived with their own
+/// parameter on `Worker::spawn` for the same idea, and two channels would have meant two
+/// prompt conventions for one question. Structured rather than pre-rendered text where the
+/// structure earns its place, because the two sides have different jobs: the scheduler knows
+/// *what* went wrong (which check, which comments) and the worker knows how to ask its agent to
+/// act on it (the prompt wording, the verdict marker it will parse back). Keeping the marker in
+/// one module is what stops the two from drifting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Feedback {
+    /// CI went red on the pull request. The run is told to make it green.
+    Ci { pr_url: String, failures: Vec<crate::forge::CiFailure> },
+    /// Review comments are outstanding. The run is told to settle each one, with a verdict.
+    Review {
+        pr_url: String,
+        comments: Vec<crate::forge::ReviewComment>,
+        /// Ids among `comments` that were handed to an earlier round and came back with no
+        /// verdict. Named so the agent knows silence was noticed.
+        unanswered_before: Vec<String>,
+    },
+    /// The retry reason, verbatim — for a run the handoff gate sent back, the step that failed,
+    /// how many tries are left and the failing output, as `gate_outcome` composed them.
+    ///
+    /// One string rather than a reason and an output apart, because one string is what the
+    /// retry row stores and what `gate_outcome` writes: it already says which step failed and
+    /// where the output starts, so splitting it at render time would mean parsing back text
+    /// this crate wrote. The day the gate records its output on its own column, this grows a
+    /// field; until then a second field would be a second spelling of the same string.
+    Gate { output: String },
+}
+
+impl Feedback {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Feedback::Ci { .. } => "ci",
+            Feedback::Review { .. } => "review",
+            Feedback::Gate { .. } => "gate",
+        }
+    }
+}
+
+/// Whether `s` is shaped like a git commit: an abbreviated or full hex object name, and nothing
+/// else. The test an acceptance's detail has to pass before anything treats it as the commit it
+/// claims to be — `fixed`, `see above` and `commit abc1234` all fail it. Shape only; whether
+/// the commit exists, and is on the branch delivered, is git's to answer.
+pub fn looks_like_commit(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The agent's settlement of one review comment. Either a fix, named by the commit that
+/// carries it, or a refusal, named by its reason — never a bare acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewVerdict {
+    pub comment_id: String,
+    pub verdict: Verdict,
+    /// The resolving commit for `Accepted`; the reason for `Rejected`.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    #[serde(rename = "accepted")]
+    Accepted,
+    #[serde(rename = "rejected")]
+    Rejected,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Accepted => "accepted",
+            Verdict::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "accepted" => Some(Verdict::Accepted),
+            "rejected" => Some(Verdict::Rejected),
+            _ => None,
+        }
+    }
+}
+
 /// Directory name for an issue's workspace.
 ///
 /// Sanitises the identifier for display value, then appends a hash of the *dispatch id* so two

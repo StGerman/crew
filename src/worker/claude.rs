@@ -92,7 +92,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
-use crate::model::{ErrorClass, Issue, Outcome};
+use crate::model::{
+    ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict, looks_like_commit,
+};
 use crate::transcript::TranscriptWriter;
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
@@ -126,6 +128,11 @@ pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
 ];
 
 const OUTCOME_MARKER: &str = "SYMPHONY_OUTCOME:";
+/// `SYMPHONY_REVIEW: <comment-id>: accepted: <commit>` or `...: rejected: <reason>`, one per
+/// review comment the run was handed. The same kind of soft convention as the outcome marker,
+/// and for the same reason: the CLI has no structured channel for it. A comment the agent
+/// gives no line for simply stays outstanding — see the delivery section of `sched`.
+const REVIEW_MARKER: &str = "SYMPHONY_REVIEW:";
 
 /// Bounded by design: the last thing read from a crashing or malicious child should not become
 /// an unbounded log line or error message.
@@ -151,6 +158,7 @@ impl ClaudeWorker {
 struct Inner {
     progress: Progress,
     outcome: Option<Outcome>,
+    verdicts: Vec<ReviewVerdict>,
     /// Set only once the child has been reaped (`Child::wait` returned). `kill` must not
     /// return before this is true — the caller deletes the workspace next.
     reaped: bool,
@@ -179,6 +187,10 @@ impl RunHandle for ClaudeRun {
 
     fn finished(&self) -> Option<Outcome> {
         self.state.0.lock().unwrap().outcome.clone()
+    }
+
+    fn verdicts(&self) -> Vec<ReviewVerdict> {
+        self.state.0.lock().unwrap().verdicts.clone()
     }
 
     fn kill(&self, grace_ms: u64) -> KillResult {
@@ -225,13 +237,13 @@ impl Worker for ClaudeWorker {
         session: &Session,
         tools: Option<&ToolEndpoint>,
         mut transcript: Option<TranscriptWriter>,
-        brief: Option<&str>,
+        feedback: Option<&Feedback>,
     ) -> Arc<dyn RunHandle> {
         // `--resume` is passed with an explicit id, never bare: bare opens an interactive
         // picker, and there is no human here to answer it.
         let (prompt, flag) = match session {
-            Session::New(_) => (build_prompt(issue, tools, brief), "--session-id"),
-            Session::Resume(_) => (build_continuation_prompt(issue, tools, brief), "--resume"),
+            Session::New(_) => (build_prompt(issue, tools, feedback), "--session-id"),
+            Session::Resume(_) => (build_continuation_prompt(issue, tools, feedback), "--resume"),
         };
 
         let mut cmd = Command::new(&self.bin);
@@ -421,6 +433,9 @@ fn run_reader(
                 // confirmed on a real install: SIGTERM mid-run ends the stream with no `result`
                 // — so `tokens` stays `None` for those, which is the intended report.
                 g.progress.tokens = extract_usage(&value);
+                g.verdicts = extract_verdicts(
+                    value.get("result").and_then(|x| x.as_str()).unwrap_or_default(),
+                );
                 g.outcome = Some(interpret_result(&value));
                 drop(g);
                 break;
@@ -504,6 +519,34 @@ fn extract_marker(text: &str, kind: &str) -> Option<String> {
     })
 }
 
+/// Every well-formed `SYMPHONY_REVIEW: <id>: <accepted|rejected>: <detail>` line in the final
+/// text. Malformed lines are skipped rather than failing the run: the run's own outcome does not
+/// depend on this, and a comment left unsettled stays outstanding, which is the safe reading.
+///
+/// An acceptance is well-formed only when its detail is shaped like a commit. `accepted: fixed`
+/// is a bare acknowledgement wearing the accepted form, and recording it would post "resolved
+/// in fixed" to a reviewer; whether the commit named is actually on the branch is the
+/// scheduler's to check, with the worktree in hand, when the run ends.
+fn extract_verdicts(text: &str) -> Vec<ReviewVerdict> {
+    text.lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix(REVIEW_MARKER)?.trim();
+            let (id, rest) = rest.split_once(':')?;
+            let (kind, detail) = rest.trim().split_once(':')?;
+            let verdict = Verdict::parse(kind)?;
+            let id = id.trim();
+            let detail = detail.trim();
+            if id.is_empty() || detail.is_empty() {
+                return None;
+            }
+            if verdict == Verdict::Accepted && !looks_like_commit(detail) {
+                return None;
+            }
+            Some(ReviewVerdict { comment_id: id.to_string(), verdict, detail: detail.to_string() })
+        })
+        .collect()
+}
+
 /// Reads the totals off a `result` event's top-level `usage` block. Only that block: the
 /// per-event `message.usage` on `assistant` events is what this replaced, and `modelUsage` on
 /// the same `result` carries the same totals keyed by model, which would only matter if the
@@ -542,7 +585,7 @@ fn truncate(s: &str, n: usize) -> String {
 fn build_continuation_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
-    brief: Option<&str>,
+    feedback: Option<&Feedback>,
 ) -> String {
     let mut p = format!(
         "Continue working on {}. Your previous session on this issue ended before the work was \
@@ -557,12 +600,16 @@ fn build_continuation_prompt(
          SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
         issue.identifier
     );
-    p.push_str(&brief_help(brief));
+    p.push_str(&feedback_help(feedback));
     p.push_str(&tool_help(tools));
     p
 }
 
-fn build_prompt(issue: &Issue, tools: Option<&ToolEndpoint>, brief: Option<&str>) -> String {
+fn build_prompt(
+    issue: &Issue,
+    tools: Option<&ToolEndpoint>,
+    feedback: Option<&Feedback>,
+) -> String {
     let mut p = format!("You are working on issue {}: {}\n\n", issue.identifier, issue.title);
     if let Some(url) = &issue.url {
         p.push_str(&format!("Tracker URL: {url}\n\n"));
@@ -581,25 +628,78 @@ fn build_prompt(issue: &Issue, tools: Option<&ToolEndpoint>, brief: Option<&str>
          If you are stuck and need a human to unblock you, end your final message with:\n\
          SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
     );
-    p.push_str(&brief_help(brief));
+    p.push_str(&feedback_help(feedback));
     p.push_str(&tool_help(tools));
     p
 }
 
-/// What the orchestrator knows about why this attempt exists. The case that earns its place in
-/// the prompt is the handoff gate: an agent that said `Done` is being handed the output of the
-/// `cargo test` that disagreed, and without it the continuation would re-run the same suite to
-/// rediscover the same failure — or, worse, say `Done` again.
-fn brief_help(brief: Option<&str>) -> String {
-    match brief {
-        Some(b) if !b.trim().is_empty() => {
-            format!(
+/// What the orchestrator found wrong with the previous run's output, as work.
+///
+/// The handoff gate's word is handed over as the retry reason it composed — which step, how
+/// many tries are left, the failing output — because an agent that said `Done` and is not told
+/// why it is back would re-run the same suite to rediscover the same failure, or say `Done`
+/// again. A red CI is handed over as the failing check and its detail, with the instruction
+/// that the job is to make it green — not to explain it. Review comments are handed over one by
+/// one with their ids, and the run is asked for a verdict on each in a form this module can
+/// parse back: a fix names the commit that carries it, a refusal names its reason. Comments
+/// that came back unanswered from an earlier round are called out, so silence reads as noticed
+/// rather than accepted.
+fn feedback_help(feedback: Option<&Feedback>) -> String {
+    let Some(fb) = feedback else { return String::new() };
+    let mut s = String::new();
+    match fb {
+        Feedback::Gate { output } if output.trim().is_empty() => {}
+        Feedback::Gate { output } => {
+            s.push_str(&format!(
                 "\nFrom the orchestrator, on why this attempt was dispatched:\n{}\n",
-                b.trim_end()
-            )
+                output.trim_end()
+            ));
         }
-        _ => String::new(),
+        Feedback::Ci { pr_url, failures } => {
+            s.push_str(&format!(
+                "\nCI is red on the pull request for this work ({pr_url}). Your job this run is \
+                 to make it green: reproduce the failure locally, fix it, run the project's \
+                 own gate, and commit. Do not report done while the cause below is unfixed.\n"
+            ));
+            for f in failures {
+                s.push_str(&format!("\n### {}", f.name));
+                if let Some(u) = &f.url {
+                    s.push_str(&format!(" ({u})"));
+                }
+                s.push('\n');
+                if !f.detail.is_empty() {
+                    s.push_str(&f.detail);
+                    s.push('\n');
+                }
+            }
+        }
+        Feedback::Review { pr_url, comments, unanswered_before } => {
+            s.push_str(&format!(
+                "\nThe pull request for this work ({pr_url}) has review comments that need a \
+                 verdict each. For every comment below, either fix what it raises and commit, \
+                 or decide it should not change and say why. Do not merely acknowledge one. \
+                 Then end your final message with one line per comment, exactly:\n\
+                 SYMPHONY_REVIEW: <comment-id>: accepted: <commit sha that resolved it>\n\
+                 SYMPHONY_REVIEW: <comment-id>: rejected: <one-sentence reason>\n"
+            ));
+            if !unanswered_before.is_empty() {
+                s.push_str(&format!(
+                    "\nThese were handed to a previous run and came back without a verdict; \
+                     they are still open: {}\n",
+                    unanswered_before.join(", ")
+                ));
+            }
+            for c in comments {
+                let at = match (&c.path, c.line) {
+                    (Some(p), Some(l)) => format!("{p}:{l}"),
+                    (Some(p), None) => p.clone(),
+                    _ => "(general)".into(),
+                };
+                s.push_str(&format!("\n[{}] {} — {}\n{}\n", c.id, at, c.author, c.body.trim()));
+            }
+        }
     }
+    s
 }
 
 /// Names the broker's tools in the prompt.
@@ -761,6 +861,113 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn review_verdicts_are_parsed_off_the_final_text_and_a_malformed_line_leaves_its_comment_open()
+    {
+        let ws = tmp_workspace("verdicts");
+        let w = ClaudeWorker::new(fixture("review_verdicts.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+        let v = h.verdicts();
+        assert_eq!(v.len(), 2, "two well-formed lines, one malformed, one bare acceptance: {v:?}");
+        assert_eq!(v[0].comment_id, "4059939692");
+        assert_eq!(v[0].verdict, Verdict::Accepted);
+        assert_eq!(v[0].detail, "a1b2c3d", "an accepted verdict names the resolving commit");
+        assert_eq!(v[1].verdict, Verdict::Rejected);
+        assert!(v[1].detail.starts_with("the umask concern"), "a rejection names its reason");
+        assert!(
+            !v.iter().any(|x| x.comment_id == "4059939694"),
+            "a line with no verdict must leave its comment outstanding, not invent one"
+        );
+        assert!(
+            !v.iter().any(|x| x.comment_id == "4059939695"),
+            "an acceptance that names no commit is not an acceptance"
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// Finding 5 on #47. An acceptance needed only a non-empty detail, so `accepted: fixed`
+    /// was stored and posted as though it named the commit carrying the fix. The module's own
+    /// invariant is that acceptance records a commit and never a bare acknowledgement.
+    #[test]
+    fn an_acceptance_that_names_no_commit_leaves_its_comment_outstanding() {
+        let v = extract_verdicts(
+            "SYMPHONY_REVIEW: 1: accepted: fixed\n\
+             SYMPHONY_REVIEW: 2: accepted: a1b2c3d\n\
+             SYMPHONY_REVIEW: 3: accepted: see commit a1b2c3d\n\
+             SYMPHONY_REVIEW: 4: accepted: 0123456789abcdef0123456789abcdef01234567\n\
+             SYMPHONY_REVIEW: 5: rejected: fixed\n",
+        );
+        let ids: Vec<&str> = v.iter().map(|x| x.comment_id.as_str()).collect();
+        assert_eq!(ids, vec!["2", "4", "5"], "{v:?}");
+        assert!(v.iter().all(|x| x.verdict != Verdict::Accepted || looks_like_commit(&x.detail)));
+        // A rejection's detail is a reason, and "fixed" is a poor one but not a forged commit.
+        assert_eq!(v[2].verdict, Verdict::Rejected);
+    }
+
+    #[test]
+    fn a_run_handed_no_review_reports_no_verdicts() {
+        let ws = tmp_workspace("no-verdicts");
+        let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        wait_for_finish(&h);
+        assert!(h.verdicts().is_empty());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_red_ci_reaches_the_prompt_as_the_failing_check_and_its_detail() {
+        let fb = Feedback::Ci {
+            pr_url: "https://github.com/o/r/pull/9".into(),
+            failures: vec![crate::forge::CiFailure {
+                name: "fmt + clippy + test".into(),
+                url: Some("https://ci/run/1".into()),
+                detail: "error[E0308]: mismatched types\n --> src/x.rs:4:5".into(),
+            }],
+        };
+        for prompt in [
+            build_prompt(&issue(), None, Some(&fb)),
+            build_continuation_prompt(&issue(), None, Some(&fb)),
+        ] {
+            assert!(prompt.contains("CI is red"), "{prompt}");
+            assert!(prompt.contains("fmt + clippy + test"));
+            assert!(
+                prompt.contains("error[E0308]: mismatched types"),
+                "the cause must reach the agent"
+            );
+            assert!(prompt.contains("https://github.com/o/r/pull/9"));
+        }
+        assert!(!build_prompt(&issue(), None, None).contains("CI is red"));
+    }
+
+    #[test]
+    fn review_comments_reach_the_prompt_with_their_ids_and_the_verdict_convention() {
+        let fb = Feedback::Review {
+            pr_url: "https://github.com/o/r/pull/9".into(),
+            comments: vec![crate::forge::ReviewComment {
+                id: "4059939692".into(),
+                author: "Copilot".into(),
+                path: Some("src/config.rs".into()),
+                line: Some(79),
+                body: "This field is missing `#[serde(default)]`".into(),
+                url: None,
+            }],
+            unanswered_before: vec!["4059939600".into()],
+        };
+        let prompt = build_prompt(&issue(), None, Some(&fb));
+        assert!(prompt.contains("[4059939692] src/config.rs:79 — Copilot"), "{prompt}");
+        assert!(prompt.contains("missing `#[serde(default)]`"));
+        assert!(prompt.contains(REVIEW_MARKER), "the agent must be told the marker to answer with");
+        assert!(prompt.contains("accepted: <commit sha"), "an acceptance must name its commit");
+        assert!(prompt.contains("rejected: <one-sentence reason>"));
+        assert!(
+            prompt.contains("4059939600"),
+            "an earlier round's silence is named, not forgotten"
+        );
     }
 
     #[test]
