@@ -11,7 +11,10 @@
 //! it mutates the same `running` map as dispatch and splitting it would mean threading the
 //! whole scheduler through a free function for no readability gain.
 
+pub mod delivery;
 pub mod retry;
+
+pub use delivery::DeliveryView;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,7 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
-use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
+use crate::forge::{Forge, Publisher};
+use crate::model::{ErrorClass, Feedback, Issue, Outcome, Phase, session_id, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RunRecord, Store};
 use crate::tracker::{Tracker, TrackerError};
@@ -108,6 +112,9 @@ pub struct Row {
     /// The most recent run's transcript, so "show me what this issue did" is one path away
     /// from the dashboard rather than a layout someone has to know.
     pub transcript: Option<String>,
+    /// Where the branch is on its way to a mergeable pull request, once a run has reported
+    /// done with delivery on. `None` before that, and always for a deployment without a forge.
+    pub delivery: Option<DeliveryView>,
 }
 
 /// Immutable view published to observers. The TUI renders this and never touches the store,
@@ -150,6 +157,13 @@ pub struct Scheduler {
     /// the broker and the projector: a run with no record on disk, never a run that did not
     /// happen.
     transcripts: Option<Transcripts>,
+    /// The delivery pair (see [`delivery`]). Both `None` until `set_delivery`, and inert even
+    /// then unless `cfg.delivery.enabled` — the config decides, the wiring only enables.
+    forge: Option<Arc<dyn Forge>>,
+    publisher: Option<Arc<dyn Publisher>>,
+    /// When each open delivery was last polled, so the forge is asked at
+    /// `delivery.poll_interval_ms` rather than on every tick. Monotonic, like every interval.
+    delivery_polled: HashMap<String, Mono>,
     running: HashMap<String, Running>,
     /// Latest issue snapshot seen for each id, for display and routing checks.
     seen: HashMap<String, Issue>,
@@ -186,6 +200,9 @@ impl Scheduler {
             projector,
             broker: None,
             transcripts: None,
+            forge: None,
+            publisher: None,
+            delivery_polled: HashMap::new(),
             running: HashMap::new(),
             seen: HashMap::new(),
             no_progress: HashMap::new(),
@@ -241,6 +258,9 @@ impl Scheduler {
         self.observe_progress()?;
         self.detect_stalls()?;
         self.refresh_running()?;
+        // Reconciliation too: it reads the outside world about runs already over, and may
+        // queue a retry that the gate below then decides whether to dispatch.
+        self.advance_deliveries()?;
 
         if let Err(e) = self.cfg.preflight() {
             self.last_error = Some(format!("preflight: {e}"));
@@ -386,6 +406,9 @@ impl Scheduler {
                 self.no_progress.remove(issue_id);
                 self.store.release(self.clock.as_ref(), issue_id)?;
                 self.park_here(issue_id, r)?;
+                // After the park, so the issue is in the state delivery polls it in. Delivery
+                // is what turns this `Done` back into a `Continue` if CI or review disagree.
+                self.queue_delivery(issue_id, r.handle.verdicts())?;
             }
             Outcome::Blocked { why } => {
                 tracing::info!(issue_id, identifier = %r.issue.identifier, why, "run blocked; parking");
@@ -1007,6 +1030,21 @@ impl Scheduler {
             }
         });
 
+        // Taken, not read: whatever delivery queued for this issue reaches exactly this run.
+        // A feedback row that failed to parse is dropped with a warning rather than blocking
+        // the dispatch — the pull request still shows the failure, and the agent still has
+        // the issue.
+        let feedback: Option<Feedback> = self
+            .store
+            .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
+            .and_then(|j| match serde_json::from_str(&j) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(issue_id = %issue.id, error = %e, "unreadable delivery feedback dropped");
+                    None
+                }
+            });
+
         let handle = self.worker.spawn(
             issue,
             &prepared.path,
@@ -1014,7 +1052,7 @@ impl Scheduler {
             &session,
             broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
-            None,
+            feedback.as_ref(),
         );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
@@ -1031,6 +1069,7 @@ impl Scheduler {
             session = session.id(),
             resumed = session.is_resume(),
             tools = broker_session.is_some(),
+            feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
             "dispatched"
         );
@@ -1080,6 +1119,7 @@ impl Scheduler {
         }
         // For issues with no live run: the last transcript is what a post-mortem starts from.
         let transcripts = self.store.latest_transcripts()?;
+        let mut deliveries = self.delivery_views()?;
 
         let mut rows = Vec::new();
         for st in &states {
@@ -1115,6 +1155,7 @@ impl Scheduler {
                 transcript: run
                     .and_then(|r| r.transcript.as_ref().map(|p| p.display().to_string()))
                     .or_else(|| transcripts.get(&st.issue_id).cloned()),
+                delivery: deliveries.remove(&st.issue_id),
             });
         }
 

@@ -1108,6 +1108,8 @@ pub struct DeliveryRecord {
     /// Serialised `Vec<ReviewVerdict>` the last run reported, until they are applied to the
     /// pull request.
     pub pending_verdicts: Option<String>,
+    /// Serialised `Vec<String>` of the comment ids the most recent fix round was handed.
+    pub handed_comments: Option<String>,
     pub handoff_reason: Option<String>,
     pub updated_at: i64,
 }
@@ -1220,13 +1222,15 @@ impl Store {
         clock: &dyn Clock,
         issue_id: &str,
         feedback_json: &str,
+        handed_comments_json: Option<&str>,
     ) -> rusqlite::Result<(u32, u32)> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE delivery SET rounds_pr = rounds_pr + 1, rounds_issue = rounds_issue + 1,
-               pending_feedback = ?2, stage = 'redispatched', updated_at = ?3
+               pending_feedback = ?2, handed_comments = ?3, stage = 'redispatched',
+               updated_at = ?4
              WHERE issue_id = ?1",
-            params![issue_id, feedback_json, clock.wall().0],
+            params![issue_id, feedback_json, handed_comments_json, clock.wall().0],
         )?;
         conn.query_row(
             "SELECT rounds_pr, rounds_issue FROM delivery WHERE issue_id = ?1",
@@ -1258,6 +1262,18 @@ impl Store {
             )?;
         }
         Ok(fb)
+    }
+
+    /// Surface a problem on the issue's row without touching its failure streak or phase: a
+    /// delivery that stopped is something an operator must see, and not something the retry
+    /// machinery should act on — the work is done; what failed is the handoff.
+    pub fn note_error(&self, clock: &dyn Clock, issue_id: &str, msg: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET last_error = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, msg, clock.wall().0],
+        )?;
+        Ok(())
     }
 
     /// Settle one review comment. Insert-or-ignore: the first verdict stands, and a later run
@@ -1312,7 +1328,7 @@ impl Store {
 
 const DELIVERY_SELECT: &str = "SELECT issue_id, stage, pr_number, pr_url, base, head_sha,
     head_pushed_at, review_requested, review_error, rounds_pr, rounds_issue, pending_feedback,
-    pending_verdicts, handoff_reason, updated_at FROM delivery";
+    pending_verdicts, handed_comments, handoff_reason, updated_at FROM delivery";
 
 fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
     Ok(DeliveryRecord {
@@ -1329,8 +1345,9 @@ fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
         rounds_issue: r.get::<_, i64>(10)? as u32,
         pending_feedback: r.get(11)?,
         pending_verdicts: r.get(12)?,
-        handoff_reason: r.get(13)?,
-        updated_at: r.get(14)?,
+        handed_comments: r.get(13)?,
+        handoff_reason: r.get(14)?,
+        updated_at: r.get(15)?,
     })
 }
 
@@ -1351,8 +1368,8 @@ mod delivery_tests {
         let (s, c) = store_with("iss-1");
         s.begin_delivery(&c, "iss-1", None).unwrap();
         s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
-        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}").unwrap(), (1, 1));
-        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}").unwrap(), (2, 2));
+        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}", None).unwrap(), (1, 1));
+        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}", None).unwrap(), (2, 2));
 
         // The same pull request, pushed again: both counts stand.
         s.begin_delivery(&c, "iss-1", None).unwrap();
@@ -1371,7 +1388,7 @@ mod delivery_tests {
     fn feedback_is_handed_to_exactly_one_launch() {
         let (s, c) = store_with("iss-1");
         s.begin_delivery(&c, "iss-1", None).unwrap();
-        s.open_delivery_round(&c, "iss-1", "\"ci\"").unwrap();
+        s.open_delivery_round(&c, "iss-1", "\"ci\"", None).unwrap();
         assert_eq!(s.take_delivery_feedback(&c, "iss-1").unwrap().as_deref(), Some("\"ci\""));
         assert_eq!(s.take_delivery_feedback(&c, "iss-1").unwrap(), None);
     }

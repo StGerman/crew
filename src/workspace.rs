@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::forge::{ForgeError, Published, Publisher};
 use crate::model::worktree_key;
 
 #[derive(Debug, thiserror::Error)]
@@ -407,6 +408,84 @@ impl Workspace for GitWorktreeWorkspace {
             }
         }
         Ok(Removed { branch_deleted })
+    }
+}
+
+/// The git half of delivery, on the type that already owns every other git call.
+///
+/// `publish` pushes from the *worktree*, not from `repo`: the worktree's HEAD is the branch,
+/// and pushing from `repo` would mean naming a ref `repo` may have checked out under a
+/// different name. The commit list is taken over the remote's copy of `base` when the remote
+/// has one, because that is the base the pull request will actually be opened against; a
+/// local `base` that has fallen behind would list commits the remote already has.
+impl Publisher for GitWorktreeWorkspace {
+    fn publish(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        remote: &str,
+        base: &str,
+    ) -> Result<Published, ForgeError> {
+        self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
+        Self::git(worktree, &["push", "--set-upstream", remote, branch]).map_err(|e| {
+            // A rejected push will be rejected again; anything else is the network.
+            let text = e.to_string();
+            if text.contains("rejected") || text.contains("permission") || text.contains("denied") {
+                ForgeError::Permanent(text)
+            } else {
+                ForgeError::Transient(text)
+            }
+        })?;
+        let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
+            .map_err(|e| ForgeError::Transient(e.to_string()))?;
+
+        // Best-effort: a fetch that fails leaves the local `base`, which is right whenever the
+        // remote has nothing newer, and only over-lists commits otherwise.
+        let _ = Self::git(worktree, &["fetch", "--quiet", remote, base]);
+        let remote_base = format!("refs/remotes/{remote}/{base}");
+        let base_ref =
+            if Self::git(worktree, &["rev-parse", "--verify", "--quiet", &remote_base]).is_ok() {
+                remote_base
+            } else {
+                base.to_string()
+            };
+        let range = format!("{base_ref}..{branch}");
+        let log = Self::git(worktree, &["log", "--format=%s", &range])
+            .map_err(|e| ForgeError::Transient(e.to_string()))?;
+        let commits = log.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
+        Ok(Published { head_sha, commits })
+    }
+
+    fn stacked_on(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        base: &str,
+        candidates: &[String],
+    ) -> Result<Option<String>, ForgeError> {
+        // A candidate is "under" this branch when it is an ancestor of it and carries commits
+        // `base` does not — a branch already merged into `base` is not a stack, it is history.
+        let under: Vec<&String> = candidates
+            .iter()
+            .filter(|c| *c != branch)
+            .filter(|c| {
+                Self::git(
+                    worktree,
+                    &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{c}")],
+                )
+                .is_ok()
+            })
+            .filter(|c| Self::git(worktree, &["merge-base", "--is-ancestor", c, branch]).is_ok())
+            .filter(|c| Self::git(worktree, &["merge-base", "--is-ancestor", c, base]).is_err())
+            .collect();
+        // Of a stack of several, the pull request is based on the nearest: the one no other
+        // candidate under this branch descends from.
+        let nearest = under.iter().find(|c| {
+            !under.iter().any(|o| {
+                o != *c && Self::git(worktree, &["merge-base", "--is-ancestor", c, o]).is_ok()
+            })
+        });
+        Ok(nearest.map(|s| s.to_string()))
     }
 }
 

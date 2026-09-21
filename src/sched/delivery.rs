@@ -1,0 +1,587 @@
+//! Delivery: from a run's `Done` to a pull request an operator can merge.
+//!
+//! `Done` used to mean "the process exited". Every branch that reached `master` in the week
+//! this was written took the rest of the path by hand — rebase, gate, push, open the pull
+//! request, request review, read the comments, decide, fix, push again — and none of what that
+//! path found reached the agent that wrote the code (issue #32). This module walks the part of
+//! that path after the branch exists, and it stops at ready-to-merge: there is no merge here,
+//! and [`Forge`] has no method for one.
+//!
+//! ## Shape
+//!
+//! A `Done` verdict still releases the claim and parks the issue, exactly as before; delivery
+//! is then a row in the store advanced by [`Scheduler::advance_deliveries`] on the tick, after
+//! reconciliation and before the dispatch gate, at `delivery.poll_interval_ms`. Every step is
+//! idempotent — a push of a branch already pushed, an open of a pull request already open — so
+//! a transient forge failure costs a poll and nothing else, and a restart resumes from the row.
+//!
+//! When CI is red, or a review comment is outstanding, the issue is handed back to an agent by
+//! the *same* path a `Continue` takes: a retry row due now, a resumed session, and the failure
+//! in the prompt as [`Feedback`]. That is the literal form of "a red gate is a `Continue`, never
+//! a `Done`": the run said done, and the orchestrator said not yet.
+//!
+//! ## The runaway this creates, and its brake
+//!
+//! A reviewer that comments on every push, answered by an agent that pushes a fix, is a loop
+//! with no bound of its own — and each turn of it spends a reviewer's quota and an operator's
+//! attention as well as tokens. So every hand-back is a *round*, counted against the current
+//! pull request and against the issue's whole life, and the per-issue count never resets:
+//! not for a new run, not for a new pull request. When either bound is reached the pull request
+//! is handed to the operator with the outstanding items named, and nothing more is dispatched
+//! for it. The per-issue turn budget is a fourth brake on the same loop and stays in force.
+//!
+//! ## Verification is not optional
+//!
+//! A review request is followed by a read. GitHub answers a request for a bot reviewer with
+//! `200` and attaches nobody (GETT-174120), so the provider's own answer is not evidence; the
+//! pull request's outstanding requests and its posted reviews are. A request that verifiably
+//! attached nobody is a handoff with that reason, reported on the issue's row — never a quiet
+//! success that leaves a pull request nobody will look at.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use super::Scheduler;
+use crate::clock::Wall;
+use crate::forge::{CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec};
+use crate::model::{Feedback, ReviewVerdict, Verdict};
+use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
+
+/// What the published snapshot says about an issue's delivery. A view, so that observers get
+/// the stage and the pull request without a `Store` — rule 3, same as every other `Row` field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryView {
+    pub stage: String,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub base: Option<String>,
+    pub rounds_pr: u32,
+    pub rounds_issue: u32,
+    pub review_error: Option<String>,
+    pub handoff_reason: Option<String>,
+}
+
+impl From<&DeliveryRecord> for DeliveryView {
+    fn from(d: &DeliveryRecord) -> Self {
+        Self {
+            stage: d.stage.label().to_string(),
+            pr_number: d.pr_number,
+            pr_url: d.pr_url.clone(),
+            base: d.base.clone(),
+            rounds_pr: d.rounds_pr,
+            rounds_issue: d.rounds_issue,
+            review_error: d.review_error.clone(),
+            handoff_reason: d.handoff_reason.clone(),
+        }
+    }
+}
+
+/// One step's failure. Forge failures are classified and never stop the tick; store failures
+/// propagate like every other store failure in the scheduler.
+enum StepError {
+    Forge(ForgeError),
+    Other(anyhow::Error),
+}
+
+impl From<ForgeError> for StepError {
+    fn from(e: ForgeError) -> Self {
+        StepError::Forge(e)
+    }
+}
+
+impl From<rusqlite::Error> for StepError {
+    fn from(e: rusqlite::Error) -> Self {
+        StepError::Other(e.into())
+    }
+}
+
+impl From<serde_json::Error> for StepError {
+    fn from(e: serde_json::Error) -> Self {
+        StepError::Other(e.into())
+    }
+}
+
+impl Scheduler {
+    /// Attach the forge and the publisher. A setter, like the broker's: optional by nature,
+    /// and every caller without it — the scheduler's whole existing test suite — is correct
+    /// without it. `delivery.enabled` in the config is what turns the attached pair on.
+    pub fn set_delivery(
+        &mut self,
+        forge: Option<std::sync::Arc<dyn Forge>>,
+        publisher: Option<std::sync::Arc<dyn crate::forge::Publisher>>,
+    ) {
+        self.forge = forge;
+        self.publisher = publisher;
+    }
+
+    fn delivery_on(&self) -> bool {
+        self.cfg.delivery.enabled && self.forge.is_some() && self.publisher.is_some()
+    }
+
+    /// A run reported `Done`: queue its branch for delivery and try the first step at once.
+    ///
+    /// Called after the claim is released and the issue parked, so the issue is in exactly
+    /// the state `advance_deliveries` requires; the immediate step is what makes the pull
+    /// request appear at the moment the run ends rather than a poll interval later.
+    pub(super) fn queue_delivery(
+        &mut self,
+        issue_id: &str,
+        verdicts: Vec<ReviewVerdict>,
+    ) -> anyhow::Result<()> {
+        if !self.delivery_on() {
+            return Ok(());
+        }
+        let Some(st) = self.store.get(issue_id)? else { return Ok(()) };
+        if st.branch.is_none() {
+            // A plain-directory workspace, or a prepare that never named one. Not an error:
+            // there is no branch to push, so there is nothing to deliver.
+            tracing::info!(issue_id, "run done with no branch to deliver; leaving it parked");
+            return Ok(());
+        }
+        let json = if verdicts.is_empty() { None } else { Some(serde_json::to_string(&verdicts)?) };
+        self.store.begin_delivery(self.clock.as_ref(), issue_id, json.as_deref())?;
+        self.delivery_polled.insert(issue_id.to_string(), self.clock.mono());
+        self.advance_delivery(issue_id)
+    }
+
+    /// Poll every delivery that is waiting on the outside world.
+    ///
+    /// Skips issues that anything else owns — a live run, a claim, a retry timer — because a
+    /// push from under a running agent, or a hand-back racing a dispatch, is exactly the kind
+    /// of double-ownership the claim exists to rule out. Each delivery is polled at
+    /// `poll_interval_ms`, measured on the monotonic clock so a wall step cannot fire it early.
+    pub(super) fn advance_deliveries(&mut self) -> anyhow::Result<()> {
+        if !self.delivery_on() {
+            return Ok(());
+        }
+        let now = self.clock.mono();
+        let interval = self.cfg.delivery.poll_interval_ms;
+        for d in self.store.deliveries()? {
+            if !matches!(
+                d.stage,
+                DeliveryStage::Pending | DeliveryStage::Awaiting | DeliveryStage::Ready
+            ) {
+                continue;
+            }
+            if self.running.contains_key(&d.issue_id) {
+                continue;
+            }
+            if self.store.get(&d.issue_id)?.map(|s| s.phase) != Some(crate::model::Phase::Released)
+            {
+                continue;
+            }
+            let due = self
+                .delivery_polled
+                .get(&d.issue_id)
+                .is_none_or(|t| now.saturating_since(*t) >= interval);
+            if !due {
+                continue;
+            }
+            self.delivery_polled.insert(d.issue_id.clone(), now);
+            self.advance_delivery(&d.issue_id)?;
+        }
+        Ok(())
+    }
+
+    fn advance_delivery(&mut self, issue_id: &str) -> anyhow::Result<()> {
+        let (Some(d), Some(st)) = (self.store.delivery(issue_id)?, self.store.get(issue_id)?)
+        else {
+            return Ok(());
+        };
+        match self.step_delivery(issue_id, &st, &d) {
+            Ok(()) => Ok(()),
+            Err(StepError::Forge(e)) if e.retryable() => {
+                // The row stays where it is and the next poll tries the same step again;
+                // nothing here re-runs the agent over a network blip.
+                tracing::warn!(issue_id, error = %e, "delivery step failed; will retry next poll");
+                self.last_error = Some(format!("delivery {}: {e}", st.identifier));
+                Ok(())
+            }
+            Err(StepError::Forge(e)) => {
+                let reason = format!("delivery stopped: {e}");
+                tracing::error!(issue_id, error = %e, "delivery stopped; handing the branch to the operator");
+                self.hand_off(issue_id, &reason)?;
+                Ok(())
+            }
+            Err(StepError::Other(e)) => Err(e),
+        }
+    }
+
+    fn hand_off(&mut self, issue_id: &str, reason: &str) -> anyhow::Result<()> {
+        self.store.set_delivery_stage(
+            self.clock.as_ref(),
+            issue_id,
+            DeliveryStage::HandedOff,
+            Some(reason),
+        )?;
+        self.store.note_error(self.clock.as_ref(), issue_id, reason)?;
+        Ok(())
+    }
+
+    /// One pass over the delivery state machine, from whatever stage the row is in to the
+    /// furthest stage the outside world allows right now.
+    fn step_delivery(
+        &mut self,
+        issue_id: &str,
+        st: &IssueState,
+        d: &DeliveryRecord,
+    ) -> Result<(), StepError> {
+        let forge = self.forge.clone().expect("checked by delivery_on");
+        let publisher = self.publisher.clone().expect("checked by delivery_on");
+        let clock = self.clock.clone();
+        let branch = st
+            .branch
+            .clone()
+            .ok_or_else(|| ForgeError::Permanent("the issue has no branch".into()))?;
+
+        let mut d = d.clone();
+        if d.stage == DeliveryStage::Pending {
+            let worktree = self.workspace.path_for(issue_id, &st.identifier);
+            // Every other issue's branch is a candidate base: a pull request whose work sits
+            // on another issue's branch is based on that branch, so the two stay reviewable
+            // apart.
+            let candidates: Vec<String> = self
+                .store
+                .all()?
+                .into_iter()
+                .filter(|o| o.issue_id != issue_id)
+                .filter_map(|o| o.branch)
+                .collect();
+            let default_base = self.cfg.delivery.base.clone();
+            let base = publisher
+                .stacked_on(&worktree, &branch, &default_base, &candidates)?
+                .unwrap_or(default_base);
+            let published =
+                publisher.publish(&worktree, &branch, &self.cfg.delivery.remote, &base)?;
+            if published.commits.is_empty() {
+                tracing::info!(
+                    issue_id,
+                    branch,
+                    "branch carries nothing over its base; nothing to deliver"
+                );
+                self.store.set_delivery_stage(
+                    clock.as_ref(),
+                    issue_id,
+                    DeliveryStage::Closed,
+                    Some("no commits to deliver"),
+                )?;
+                return Ok(());
+            }
+
+            let spec = self.pr_spec(issue_id, st, &branch, &base, &published.commits)?;
+            let pr = match forge.open_pull_request(&spec) {
+                Err(ForgeError::NothingToDeliver(why)) => {
+                    tracing::info!(issue_id, why, "nothing to deliver");
+                    self.store.set_delivery_stage(
+                        clock.as_ref(),
+                        issue_id,
+                        DeliveryStage::Closed,
+                        Some(&why),
+                    )?;
+                    return Ok(());
+                }
+                other => other?,
+            };
+            let fresh = d.pr_number != Some(pr.number);
+            self.store.set_delivery_pr(
+                clock.as_ref(),
+                issue_id,
+                pr.number,
+                &pr.url,
+                &base,
+                &published.head_sha,
+            )?;
+            tracing::info!(
+                issue_id, identifier = %st.identifier, pr = pr.number, url = %pr.url, base, head = %published.head_sha,
+                fresh, "pull request {}", if fresh { "opened" } else { "updated" }
+            );
+
+            if let Some(json) = &d.pending_verdicts {
+                let verdicts: Vec<ReviewVerdict> = serde_json::from_str(json)?;
+                self.apply_verdicts(issue_id, &pr, &verdicts)?;
+            }
+            d = self.store.delivery(issue_id)?.ok_or_else(|| {
+                StepError::Other(anyhow::anyhow!("delivery row vanished mid-step"))
+            })?;
+        }
+
+        let number = d.pr_number.ok_or_else(|| ForgeError::Permanent("no pull request".into()))?;
+        let pr = forge.pull_request(number)?;
+        if pr.state != PrState::Open {
+            let how = if pr.state == PrState::Merged { "merged" } else { "closed" };
+            tracing::info!(
+                issue_id,
+                pr = number,
+                how,
+                "pull request is no longer open; delivery over"
+            );
+            self.store.set_delivery_stage(
+                clock.as_ref(),
+                issue_id,
+                DeliveryStage::Closed,
+                Some(how),
+            )?;
+            return Ok(());
+        }
+
+        if !d.review_requested && !self.cfg.delivery.reviewers.is_empty() {
+            for r in &self.cfg.delivery.reviewers {
+                forge.request_review(number, r)?;
+            }
+            // The read that makes the request mean something. Attached is either still
+            // requested, or already answered on this head.
+            let after = forge.pull_request(number)?;
+            let reviews = forge.reviews(number)?;
+            let missing: Vec<&str> = self
+                .cfg
+                .delivery
+                .reviewers
+                .iter()
+                .filter(|r| {
+                    !after.requested_reviewers.iter().any(|x| x == *r)
+                        && !reviews
+                            .iter()
+                            .any(|rv| rv.reviewer == **r && rv.commit_sha == after.head_sha)
+                })
+                .map(String::as_str)
+                .collect();
+            if missing.is_empty() {
+                tracing::info!(issue_id, pr = number, reviewers = ?self.cfg.delivery.reviewers, "review requested and verified attached");
+                self.store.set_review_requested(clock.as_ref(), issue_id, None)?;
+            } else {
+                let reason = format!(
+                    "review request accepted by the provider but attached nobody: {}",
+                    missing.join(", ")
+                );
+                tracing::error!(issue_id, pr = number, missing = ?missing, "review request did not attach; handing off");
+                self.store.set_review_requested(clock.as_ref(), issue_id, Some(&reason))?;
+                self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
+                return Ok(());
+            }
+        }
+
+        match forge.ci_status(&pr.head_sha)? {
+            CiStatus::Pending => {
+                let pushed = d.head_pushed_at.unwrap_or(clock.wall().0);
+                let waited = clock.wall().0.saturating_sub(pushed);
+                if waited as u64 > self.cfg.delivery.ci_timeout_ms {
+                    let reason = format!(
+                        "CI reported nothing for {} within {} ms",
+                        pr.head_sha, self.cfg.delivery.ci_timeout_ms
+                    );
+                    tracing::warn!(issue_id, pr = number, "{reason}; handing off");
+                    self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
+                } else {
+                    tracing::debug!(issue_id, pr = number, head = %pr.head_sha, "awaiting CI");
+                }
+                return Ok(());
+            }
+            CiStatus::Failure { failures } => {
+                let named: Vec<String> = failures.iter().map(|f| f.name.clone()).collect();
+                let fb = Feedback::Ci { pr_url: pr.url.clone(), failures };
+                return self.open_round(
+                    issue_id,
+                    &d,
+                    fb,
+                    None,
+                    &format!("CI red: {}", named.join(", ")),
+                );
+            }
+            CiStatus::Success => {}
+        }
+
+        let settled = self.store.verdicts_for(issue_id)?;
+        let open: Vec<_> = forge
+            .review_comments(number)?
+            .into_iter()
+            .filter(|c| !settled.contains_key(&c.id))
+            .collect();
+        if !open.is_empty() {
+            let handed_before: Vec<String> = d
+                .handed_comments
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default();
+            let unanswered_before: Vec<String> = open
+                .iter()
+                .filter(|c| handed_before.contains(&c.id))
+                .map(|c| c.id.clone())
+                .collect();
+            let ids: Vec<String> = open.iter().map(|c| c.id.clone()).collect();
+            let named: Vec<String> = open
+                .iter()
+                .map(|c| match &c.path {
+                    Some(p) => format!("{} ({p})", c.id),
+                    None => c.id.clone(),
+                })
+                .collect();
+            let fb = Feedback::Review { pr_url: pr.url.clone(), comments: open, unanswered_before };
+            return self.open_round(
+                issue_id,
+                &d,
+                fb,
+                Some(ids),
+                &format!("review comments outstanding: {}", named.join(", ")),
+            );
+        }
+
+        if d.stage != DeliveryStage::Ready {
+            tracing::info!(issue_id, pr = number, url = %pr.url, "ready to merge; the rest is the operator's");
+            self.store.set_delivery_stage(clock.as_ref(), issue_id, DeliveryStage::Ready, None)?;
+        }
+        Ok(())
+    }
+
+    /// Hand the issue back to an agent with `feedback`, or to the operator if the rounds are
+    /// spent. The bound is checked *before* charging so `max_rounds_per_pr = 3` means three
+    /// rounds, and `what` names the outstanding items in the handoff so the operator is told
+    /// what is left rather than only that something is.
+    fn open_round(
+        &mut self,
+        issue_id: &str,
+        d: &DeliveryRecord,
+        feedback: Feedback,
+        handed_comments: Option<Vec<String>>,
+        what: &str,
+    ) -> Result<(), StepError> {
+        let cfg = &self.cfg.delivery;
+        if d.rounds_pr >= cfg.max_rounds_per_pr || d.rounds_issue >= cfg.max_rounds_per_issue {
+            let reason = format!(
+                "fix rounds exhausted ({} on this pull request, {} on this issue); {what}",
+                d.rounds_pr, d.rounds_issue
+            );
+            tracing::warn!(issue_id, pr = ?d.pr_number, "{reason}; handing off");
+            self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
+            return Ok(());
+        }
+        let json = serde_json::to_string(&feedback)?;
+        let handed = handed_comments.map(|v| serde_json::to_string(&v)).transpose()?;
+        let (rp, ri) = self.store.open_delivery_round(
+            self.clock.as_ref(),
+            issue_id,
+            &json,
+            handed.as_deref(),
+        )?;
+        // The same path a `Continue` takes: unparked, a retry due now, the session resumed.
+        self.store.unpark(self.clock.as_ref(), issue_id)?;
+        self.store.schedule_retry(
+            self.clock.as_ref(),
+            issue_id,
+            Wall(self.clock.wall().0),
+            0,
+            &format!("delivery: {what}"),
+        )?;
+        tracing::info!(
+            issue_id, pr = ?d.pr_number, kind = feedback.label(), rounds_pr = rp, rounds_issue = ri,
+            "handing back to an agent: {what}"
+        );
+        Ok(())
+    }
+
+    /// Record each verdict and reply on its thread. The record is the durable part; the reply
+    /// is best-effort, because a thread that cannot be answered is still settled here and the
+    /// next round will not re-hand it.
+    fn apply_verdicts(
+        &mut self,
+        issue_id: &str,
+        pr: &PullRequest,
+        verdicts: &[ReviewVerdict],
+    ) -> Result<(), StepError> {
+        let forge = self.forge.clone().expect("checked by delivery_on");
+        for v in verdicts {
+            let fresh = self.store.record_verdict(
+                self.clock.as_ref(),
+                issue_id,
+                pr.number,
+                &v.comment_id,
+                v.verdict,
+                &v.detail,
+            )?;
+            if !fresh {
+                // Settled by an earlier round; the first verdict stands and is not re-argued.
+                continue;
+            }
+            let body = match v.verdict {
+                Verdict::Accepted => format!("**Accepted** — resolved in {}.", v.detail),
+                Verdict::Rejected => format!("**Rejected** — {}", v.detail),
+            };
+            tracing::info!(issue_id, pr = pr.number, comment = %v.comment_id, verdict = v.verdict.as_str(), detail = %v.detail, "review comment settled");
+            if let Err(e) = forge.reply(pr.number, &v.comment_id, &body) {
+                tracing::warn!(issue_id, comment = %v.comment_id, error = %e, "verdict recorded but the reply failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// The pull request's title and body, derived from the run record — never composed by the
+    /// agent. What a reviewer needs first is what the issue asked for and what the branch
+    /// actually contains; both are facts the orchestrator holds and the agent could only
+    /// restate.
+    fn pr_spec(
+        &self,
+        issue_id: &str,
+        st: &IssueState,
+        branch: &str,
+        base: &str,
+        commits: &[String],
+    ) -> Result<PullRequestSpec, StepError> {
+        let issue = self.seen.get(issue_id);
+        let title = match issue {
+            Some(i) if !i.title.is_empty() => format!("{}: {}", i.identifier, i.title),
+            _ => format!("{}: {}", st.identifier, branch),
+        };
+
+        let mut body = String::new();
+        match issue.and_then(|i| i.url.as_deref()) {
+            Some(url) => body.push_str(&format!("Closes {url}\n\n")),
+            None => body.push_str(&format!("Issue: {}\n\n", st.identifier)),
+        }
+        if base != self.cfg.delivery.base {
+            body.push_str(&format!(
+                "Stacked on `{base}`: this work sits on another issue's branch and is reviewable \
+                 apart from it. Merge that pull request first.\n\n"
+            ));
+        }
+        body.push_str("## Commits\n\n");
+        for c in commits {
+            body.push_str(&format!("- {c}\n"));
+        }
+
+        let runs = self.store.runs_for(issue_id)?;
+        let turns: u32 = runs.iter().map(|r| r.turns).sum();
+        let (input, output, uncounted) =
+            runs.iter().fold((0u64, 0u64, 0u32), |acc, r| match (r.in_tok, r.out_tok) {
+                (Some(i), Some(o)) => (acc.0 + i, acc.1 + o, acc.2),
+                _ if r.ended_at.is_some() => (acc.0, acc.1, acc.2 + 1),
+                _ => acc,
+            });
+        body.push_str(&format!(
+            "\n## Provenance\n\nOpened by symphony-cc from {} run{} of {} ({} turns, {} tokens in / {} \
+             out{}). The verdict on each review comment is recorded as a reply on its thread; \
+             merging is left to a human.\n",
+            runs.len(),
+            if runs.len() == 1 { "" } else { "s" },
+            st.identifier,
+            turns,
+            input,
+            output,
+            if uncounted > 0 { format!(", {uncounted} run(s) uncounted") } else { String::new() },
+        ));
+
+        Ok(PullRequestSpec { title, body, head: branch.to_string(), base: base.to_string() })
+    }
+
+    /// Delivery state for the snapshot, keyed by issue id. One query per tick, like run history.
+    pub(super) fn delivery_views(&self) -> anyhow::Result<HashMap<String, DeliveryView>> {
+        if self.forge.is_none() {
+            return Ok(HashMap::new());
+        }
+        Ok(self
+            .store
+            .deliveries()?
+            .iter()
+            .map(|d| (d.issue_id.clone(), DeliveryView::from(d)))
+            .collect())
+    }
+}

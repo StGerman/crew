@@ -192,6 +192,29 @@ pub fn issue(r: &Row) -> String {
     // so it survives the directory being cleaned up. A row rendered without it would leave an
     // operator guessing whether transcripts are off or the run simply never wrote one.
     field("transcript", r.transcript.clone().unwrap_or_else(|| NONE.into()));
+    // The pull request is the thing a finished run is *for*, so it is listed with its stage
+    // and the round counts — the numbers that say how close the loop is to handing off.
+    if let Some(d) = &r.delivery {
+        let pr = match (&d.pr_url, d.pr_number) {
+            (Some(url), _) => url.clone(),
+            (None, Some(n)) => format!("#{n}"),
+            (None, None) => NONE.into(),
+        };
+        field("pull request", pr);
+        field(
+            "delivery",
+            format!("{}  (rounds {} on pr, {} on issue)", d.stage, d.rounds_pr, d.rounds_issue),
+        );
+        if let Some(b) = &d.base {
+            field("base", b.clone());
+        }
+        if let Some(e) = &d.review_error {
+            field("review", e.clone());
+        }
+        if let Some(why) = &d.handoff_reason {
+            field("handed off", why.clone());
+        }
+    }
     if let Some(ws) = &r.workspace {
         field("workspace", ws.clone());
     }

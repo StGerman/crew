@@ -124,6 +124,9 @@ pub(super) const MIGRATIONS: &[&str] = &[
       rounds_issue      INTEGER NOT NULL DEFAULT 0,
       pending_feedback  TEXT,
       pending_verdicts  TEXT,
+      -- Comment ids handed to the most recent fix round, so the next one can name the threads
+      -- a run was told about and left unanswered, rather than presenting them as new.
+      handed_comments   TEXT,
       handoff_reason    TEXT,
       updated_at        INTEGER NOT NULL
     );
