@@ -184,6 +184,70 @@ impl ErrorClass {
     }
 }
 
+/// What delivery hands the next run of an issue, beyond the issue itself.
+///
+/// Structured rather than pre-rendered text, because the two sides have different jobs: the
+/// scheduler knows *what* went wrong (which check, which comments) and the worker knows how
+/// to ask its agent to act on it (the prompt wording, the verdict marker it will parse back).
+/// Keeping the marker in one module is what stops the two from drifting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Feedback {
+    /// CI went red on the pull request. The run is told to make it green.
+    Ci { pr_url: String, failures: Vec<crate::forge::CiFailure> },
+    /// Review comments are outstanding. The run is told to settle each one, with a verdict.
+    Review {
+        pr_url: String,
+        comments: Vec<crate::forge::ReviewComment>,
+        /// Ids among `comments` that were handed to an earlier round and came back with no
+        /// verdict. Named so the agent knows silence was noticed.
+        unanswered_before: Vec<String>,
+    },
+}
+
+impl Feedback {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Feedback::Ci { .. } => "ci",
+            Feedback::Review { .. } => "review",
+        }
+    }
+}
+
+/// The agent's settlement of one review comment. Either a fix, named by the commit that
+/// carries it, or a refusal, named by its reason — never a bare acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewVerdict {
+    pub comment_id: String,
+    pub verdict: Verdict,
+    /// The resolving commit for `Accepted`; the reason for `Rejected`.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    #[serde(rename = "accepted")]
+    Accepted,
+    #[serde(rename = "rejected")]
+    Rejected,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Accepted => "accepted",
+            Verdict::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "accepted" => Some(Verdict::Accepted),
+            "rejected" => Some(Verdict::Rejected),
+            _ => None,
+        }
+    }
+}
+
 /// Directory name for an issue's workspace.
 ///
 /// Sanitises the identifier for display value, then appends a hash of the *dispatch id* so two

@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Wall};
-use crate::model::{ErrorClass, Phase};
+use crate::model::{ErrorClass, Phase, Verdict};
 use crate::worker::TokenUsage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,5 +1030,358 @@ mod tests {
             assert_eq!(st.last_fail_class, Some(ErrorClass::Stall));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- delivery ------------------------------------------------------------------
+
+/// Where an issue's branch is on its way to a mergeable pull request.
+///
+/// The serde spelling is the store's `stage` column and what the snapshot publishes, one word
+/// per stage, for the same reason [`Phase`] is spelled once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryStage {
+    /// A run reported done; the push and the pull request have not happened yet, or the last
+    /// attempt at them failed transiently. Retried each poll.
+    #[serde(rename = "pending")]
+    Pending,
+    /// The pull request is open and the orchestrator is waiting on CI or on review.
+    #[serde(rename = "awaiting")]
+    Awaiting,
+    /// CI or review sent the issue back to an agent. Nothing is polled until that run ends.
+    #[serde(rename = "redispatched")]
+    Redispatched,
+    /// Green CI, review attached, no comment outstanding. The operator's to merge.
+    #[serde(rename = "ready")]
+    Ready,
+    /// The orchestrator stopped working it and says why in `handoff_reason`: a round bound
+    /// reached, a review request that attached nobody, a permanent forge error.
+    #[serde(rename = "handed_off")]
+    HandedOff,
+    /// Merged or closed outside the orchestrator. Nothing more to do.
+    #[serde(rename = "closed")]
+    Closed,
+}
+
+impl DeliveryStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            DeliveryStage::Pending => "pending",
+            DeliveryStage::Awaiting => "awaiting",
+            DeliveryStage::Redispatched => "redispatched",
+            DeliveryStage::Ready => "ready",
+            DeliveryStage::HandedOff => "handed_off",
+            DeliveryStage::Closed => "closed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => DeliveryStage::Pending,
+            "awaiting" => DeliveryStage::Awaiting,
+            "redispatched" => DeliveryStage::Redispatched,
+            "ready" => DeliveryStage::Ready,
+            "handed_off" => DeliveryStage::HandedOff,
+            "closed" => DeliveryStage::Closed,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryRecord {
+    pub issue_id: String,
+    pub stage: DeliveryStage,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub base: Option<String>,
+    pub head_sha: Option<String>,
+    pub head_pushed_at: Option<i64>,
+    pub review_requested: bool,
+    pub review_error: Option<String>,
+    /// Fix rounds against the current pull request. Reset when a new one is opened.
+    pub rounds_pr: u32,
+    /// Fix rounds over the issue's whole life. Never reset by the orchestrator.
+    pub rounds_issue: u32,
+    /// Serialised [`crate::model::Feedback`] for the next run, until that run is launched.
+    pub pending_feedback: Option<String>,
+    /// Serialised `Vec<ReviewVerdict>` the last run reported, until they are applied to the
+    /// pull request.
+    pub pending_verdicts: Option<String>,
+    pub handoff_reason: Option<String>,
+    pub updated_at: i64,
+}
+
+impl Store {
+    pub fn delivery(&self, issue_id: &str) -> rusqlite::Result<Option<DeliveryRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!("{DELIVERY_SELECT} WHERE issue_id = ?1"),
+            params![issue_id],
+            delivery_record,
+        )
+        .optional()
+    }
+
+    pub fn deliveries(&self) -> rusqlite::Result<Vec<DeliveryRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("{DELIVERY_SELECT} ORDER BY issue_id"))?;
+        let rows = stmt.query_map([], delivery_record)?;
+        rows.collect()
+    }
+
+    /// A run reported done: queue its branch for delivery, carrying whatever verdicts it gave.
+    ///
+    /// An upsert that leaves the pull request fields and the round counters alone, because the
+    /// second and later deliveries of an issue — after a CI or review round — are pushes to a
+    /// pull request that already exists, and the counters are exactly what must survive them.
+    pub fn begin_delivery(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        verdicts_json: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO delivery (issue_id, stage, pending_verdicts, updated_at)
+             VALUES (?1, 'pending', ?2, ?3)
+             ON CONFLICT(issue_id) DO UPDATE SET
+               stage = 'pending', pending_verdicts = ?2, pending_feedback = NULL,
+               handoff_reason = NULL, updated_at = ?3",
+            params![issue_id, verdicts_json, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
+    /// The push landed and the pull request is known. A *different* pull request number than
+    /// before resets the per-PR round count; the per-issue count is untouched either way.
+    pub fn set_delivery_pr(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        pr_number: u64,
+        pr_url: &str,
+        base: &str,
+        head_sha: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = clock.wall().0;
+        conn.execute(
+            "UPDATE delivery SET
+               rounds_pr = CASE WHEN pr_number IS ?2 THEN rounds_pr ELSE 0 END,
+               review_requested = CASE WHEN pr_number IS ?2 THEN review_requested ELSE 0 END,
+               review_error = CASE WHEN pr_number IS ?2 THEN review_error ELSE NULL END,
+               pr_number = ?2, pr_url = ?3, base = ?4, head_sha = ?5, head_pushed_at = ?6,
+               stage = 'awaiting', pending_verdicts = NULL, updated_at = ?6
+             WHERE issue_id = ?1",
+            params![issue_id, pr_number as i64, pr_url, base, head_sha, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_delivery_stage(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        stage: DeliveryStage,
+        handoff_reason: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET stage = ?2, handoff_reason = ?3, updated_at = ?4
+             WHERE issue_id = ?1",
+            params![issue_id, stage.label(), handoff_reason, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
+    /// `error` is the verification's finding when the provider accepted the request and
+    /// attached nobody; `None` records a request that verifiably took.
+    pub fn set_review_requested(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        error: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET review_requested = 1, review_error = ?2, updated_at = ?3
+             WHERE issue_id = ?1",
+            params![issue_id, error, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
+    /// Hand the issue back to an agent with `feedback_json`, charging one round against both
+    /// bounds. Returns the counts *after* charging, so the caller compares them to the limits
+    /// it holds — the store does not know the limits, and should not: they are config.
+    pub fn open_delivery_round(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        feedback_json: &str,
+    ) -> rusqlite::Result<(u32, u32)> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET rounds_pr = rounds_pr + 1, rounds_issue = rounds_issue + 1,
+               pending_feedback = ?2, stage = 'redispatched', updated_at = ?3
+             WHERE issue_id = ?1",
+            params![issue_id, feedback_json, clock.wall().0],
+        )?;
+        conn.query_row(
+            "SELECT rounds_pr, rounds_issue FROM delivery WHERE issue_id = ?1",
+            params![issue_id],
+            |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
+        )
+    }
+
+    /// Read the feedback queued for this issue's next run and clear it, in one step, so a run
+    /// that is launched is the one and only run told about it.
+    pub fn take_delivery_feedback(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let fb: Option<String> = conn
+            .query_row(
+                "SELECT pending_feedback FROM delivery WHERE issue_id = ?1",
+                params![issue_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if fb.is_some() {
+            conn.execute(
+                "UPDATE delivery SET pending_feedback = NULL, updated_at = ?2 WHERE issue_id = ?1",
+                params![issue_id, clock.wall().0],
+            )?;
+        }
+        Ok(fb)
+    }
+
+    /// Settle one review comment. Insert-or-ignore: the first verdict stands, and a later run
+    /// re-arguing a settled thread changes nothing here — that is the point of recording it.
+    pub fn record_verdict(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        pr_number: u64,
+        comment_id: &str,
+        verdict: Verdict,
+        detail: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO review_verdict
+               (issue_id, comment_id, pr_number, verdict, detail, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                issue_id,
+                comment_id,
+                pr_number as i64,
+                verdict.as_str(),
+                detail,
+                clock.wall().0
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Every settled comment for an issue: id → (verdict, detail).
+    pub fn verdicts_for(
+        &self,
+        issue_id: &str,
+    ) -> rusqlite::Result<std::collections::HashMap<String, (Verdict, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT comment_id, verdict, detail FROM review_verdict WHERE issue_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![issue_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    Verdict::parse(&r.get::<_, String>(1)?).unwrap_or(Verdict::Rejected),
+                    r.get::<_, String>(2)?,
+                ),
+            ))
+        })?;
+        rows.collect()
+    }
+}
+
+const DELIVERY_SELECT: &str = "SELECT issue_id, stage, pr_number, pr_url, base, head_sha,
+    head_pushed_at, review_requested, review_error, rounds_pr, rounds_issue, pending_feedback,
+    pending_verdicts, handoff_reason, updated_at FROM delivery";
+
+fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
+    Ok(DeliveryRecord {
+        issue_id: r.get(0)?,
+        stage: DeliveryStage::parse(&r.get::<_, String>(1)?).unwrap_or(DeliveryStage::Pending),
+        pr_number: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+        pr_url: r.get(3)?,
+        base: r.get(4)?,
+        head_sha: r.get(5)?,
+        head_pushed_at: r.get(6)?,
+        review_requested: r.get::<_, i64>(7)? != 0,
+        review_error: r.get(8)?,
+        rounds_pr: r.get::<_, i64>(9)? as u32,
+        rounds_issue: r.get::<_, i64>(10)? as u32,
+        pending_feedback: r.get(11)?,
+        pending_verdicts: r.get(12)?,
+        handoff_reason: r.get(13)?,
+        updated_at: r.get(14)?,
+    })
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use crate::clock::FakeClock;
+
+    fn store_with(issue: &str) -> (Store, FakeClock) {
+        let s = Store::open_in_memory().unwrap();
+        let c = FakeClock::new();
+        s.ensure(&c, issue, "MT-1", "MT-1-abc").unwrap();
+        (s, c)
+    }
+
+    #[test]
+    fn a_new_pull_request_resets_the_per_pr_round_count_but_never_the_per_issue_one() {
+        let (s, c) = store_with("iss-1");
+        s.begin_delivery(&c, "iss-1", None).unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "aaa").unwrap();
+        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}").unwrap(), (1, 1));
+        assert_eq!(s.open_delivery_round(&c, "iss-1", "{}").unwrap(), (2, 2));
+
+        // The same pull request, pushed again: both counts stand.
+        s.begin_delivery(&c, "iss-1", None).unwrap();
+        s.set_delivery_pr(&c, "iss-1", 7, "u", "master", "bbb").unwrap();
+        let d = s.delivery("iss-1").unwrap().unwrap();
+        assert_eq!((d.rounds_pr, d.rounds_issue), (2, 2));
+
+        // A different pull request: only the per-PR count starts over.
+        s.begin_delivery(&c, "iss-1", None).unwrap();
+        s.set_delivery_pr(&c, "iss-1", 8, "u", "master", "ccc").unwrap();
+        let d = s.delivery("iss-1").unwrap().unwrap();
+        assert_eq!((d.rounds_pr, d.rounds_issue), (0, 2), "the issue-wide bound must survive");
+    }
+
+    #[test]
+    fn feedback_is_handed_to_exactly_one_launch() {
+        let (s, c) = store_with("iss-1");
+        s.begin_delivery(&c, "iss-1", None).unwrap();
+        s.open_delivery_round(&c, "iss-1", "\"ci\"").unwrap();
+        assert_eq!(s.take_delivery_feedback(&c, "iss-1").unwrap().as_deref(), Some("\"ci\""));
+        assert_eq!(s.take_delivery_feedback(&c, "iss-1").unwrap(), None);
+    }
+
+    #[test]
+    fn the_first_verdict_on_a_comment_stands() {
+        let (s, c) = store_with("iss-1");
+        assert!(s.record_verdict(&c, "iss-1", 7, "c-1", Verdict::Rejected, "not a bug").unwrap());
+        assert!(!s.record_verdict(&c, "iss-1", 7, "c-1", Verdict::Accepted, "abc123").unwrap());
+        let v = s.verdicts_for("iss-1").unwrap();
+        assert_eq!(v["c-1"], (Verdict::Rejected, "not a bug".to_string()));
     }
 }

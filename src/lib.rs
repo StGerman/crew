@@ -9,6 +9,7 @@ pub mod api;
 pub mod broker;
 pub mod clock;
 pub mod config;
+pub mod forge;
 pub mod model;
 pub mod project;
 pub mod sched;
