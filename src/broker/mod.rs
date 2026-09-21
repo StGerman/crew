@@ -52,7 +52,9 @@
 //!
 //! MCP over HTTP, on loopback, one listener for the process, with a per-run bearer token in
 //! the URL path. See [`server`] for the wire details and why this is hand-rolled rather than
-//! built on `rmcp`.
+//! built on `rmcp`. The same transport code also serves the operator's [ops
+//! tools](crate::api::mcp), but on a listener of their own: those tools are scoped to the whole
+//! daemon, and the address a worker is handed must never be one that answers them.
 
 pub mod fake;
 pub mod server;
