@@ -427,15 +427,33 @@ impl Publisher for GitWorktreeWorkspace {
         base: &str,
     ) -> Result<Published, ForgeError> {
         self.guard(worktree).map_err(|e| ForgeError::Permanent(e.to_string()))?;
-        Self::git(worktree, &["push", "--set-upstream", remote, branch]).map_err(|e| {
-            // A rejected push will be rejected again; anything else is the network.
-            let text = e.to_string();
-            if text.contains("rejected") || text.contains("permission") || text.contains("denied") {
-                ForgeError::Permanent(text)
-            } else {
-                ForgeError::Transient(text)
-            }
-        })?;
+        // With a lease, not plain: the gate rebases an already-published branch onto a newer
+        // base before every re-delivery, and a rebase rewrites the history the remote holds, so
+        // a plain push is rejected non-fast-forward in exactly the round the base moved and
+        // delivery hands off instead of updating the pull request. Forcing is sanctioned
+        // because the branch is the orchestrator's own; the lease is what keeps that apart from
+        // forcing over somebody else's — it expects the remote ref to be what this repository
+        // last saw of it, and a remote that has moved since is refused, not overwritten.
+        Self::git(worktree, &["push", "--force-with-lease", "--set-upstream", remote, branch])
+            .map_err(|e| {
+                let text = e.to_string();
+                if text.contains("stale info") {
+                    // The lease failed: the remote branch carries something this repository
+                    // never pushed. A real conflict, and the one case forcing must not resolve.
+                    ForgeError::Permanent(format!(
+                        "{remote}/{branch} has moved since it was last fetched; refusing to \
+                         force over work this orchestrator did not push: {text}"
+                    ))
+                } else if text.contains("rejected")
+                    || text.contains("permission")
+                    || text.contains("denied")
+                {
+                    // Any other rejection will be rejected again; the rest is the network.
+                    ForgeError::Permanent(text)
+                } else {
+                    ForgeError::Transient(text)
+                }
+            })?;
         let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
             .map_err(|e| ForgeError::Transient(e.to_string()))?;
 
@@ -1040,6 +1058,68 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// Finding 6 on #47. The gate rebases a published branch before every re-delivery, so the
+    /// second push of a branch is routinely a history rewrite; a plain push refuses it and the
+    /// pull request never sees the fix. Forcing is right only because the branch is the
+    /// orchestrator's — the second half of this test is what keeps that from becoming forcing
+    /// over anyone's: a remote that moved under us is a refusal, with the reason, not a push.
+    #[test]
+    fn a_rebased_branch_is_pushed_over_its_own_history_but_never_over_someone_elses() {
+        let root = tmp_root("wt-publish-lease");
+        let (repo, bare) = repo_with_remote("wt-publish-lease");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "first change");
+        let first = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+
+        // The gate's rebase, in miniature: the same change under a rewritten commit.
+        git_out(&p.path, &["commit", "--amend", "-q", "-m", "first change, rebased"]).unwrap();
+        assert_ne!(head_of(&p.path), first.head_sha, "the history was rewritten");
+        let second = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(second.head_sha, head_of(&p.path));
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            second.head_sha,
+            "the remote must follow the orchestrator's own rewrite"
+        );
+        assert_eq!(second.commits, vec!["first change, rebased"]);
+
+        // Somebody else pushes to the branch from a clone this repository has never fetched.
+        let other = tmp_root("wt-publish-lease-other");
+        std::fs::remove_dir_all(&other).ok();
+        git_out(
+            &std::env::temp_dir(),
+            &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()],
+        )
+        .unwrap();
+        git_out(&other, &["config", "user.email", "test@example.com"]).unwrap();
+        git_out(&other, &["config", "user.name", "test"]).unwrap();
+        git_out(&other, &["checkout", "-q", &branch]).unwrap();
+        commit_in(&other, "theirs.txt", "a reviewer's own commit");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        let theirs = head_of(&other);
+
+        commit_in(&p.path, "b.txt", "second change");
+        let err = ws.publish(&p.path, &branch, "origin", "main").unwrap_err();
+        assert!(
+            matches!(err, ForgeError::Permanent(_)),
+            "a lease failure is a real conflict: {err}"
+        );
+        assert!(err.to_string().contains("did not push"), "and says whose work stopped it: {err}");
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            theirs,
+            "their commit must still be on the remote"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+        std::fs::remove_dir_all(&other).ok();
     }
 
     #[test]
