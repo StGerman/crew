@@ -1173,6 +1173,11 @@ impl Store {
 
     /// The push landed and the pull request is known. A *different* pull request number than
     /// before resets the per-PR round count; the per-issue count is untouched either way.
+    ///
+    /// `pending_verdicts` is deliberately left alone: the verdicts a run reported are applied
+    /// after this, one reply at a time, and each leaves the queue only once its reply has
+    /// landed — see [`Store::set_pending_verdicts`]. Clearing them here would drop the verdicts
+    /// of a run whose replies then failed, and the threads would come back round as new.
     pub fn set_delivery_pr(
         &self,
         clock: &dyn Clock,
@@ -1190,9 +1195,27 @@ impl Store {
                review_requested = CASE WHEN pr_number IS ?2 THEN review_requested ELSE 0 END,
                review_error = CASE WHEN pr_number IS ?2 THEN review_error ELSE NULL END,
                pr_number = ?2, pr_url = ?3, base = ?4, head_sha = ?5, head_pushed_at = ?6,
-               stage = 'awaiting', pending_verdicts = NULL, updated_at = ?6
+               stage = 'awaiting', updated_at = ?6
              WHERE issue_id = ?1",
             params![issue_id, pr_number as i64, pr_url, base, head_sha, now],
+        )?;
+        Ok(())
+    }
+
+    /// What is still waiting to be applied to the pull request: the verdicts whose replies have
+    /// not landed yet, or `None` once every one has. The queue is written back after each
+    /// pass rather than cleared at the start of it, so a reply that failed is retried on the
+    /// next poll instead of being forgotten.
+    pub fn set_pending_verdicts(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        verdicts_json: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET pending_verdicts = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, verdicts_json, clock.wall().0],
         )?;
         Ok(())
     }

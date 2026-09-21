@@ -69,6 +69,9 @@ struct Inner {
     /// what "exists on the remote" means to `stacked_on`.
     published: HashSet<String>,
     fail: Option<ForgeError>,
+    /// Makes `reply` alone fail: the network dropping exactly the write that carries a verdict
+    /// to its reviewer, while every read still answers.
+    fail_reply: Option<ForgeError>,
     ops: Vec<Op>,
     stacked_on: Option<String>,
 }
@@ -156,6 +159,11 @@ impl FakeForge {
     /// Make every call fail until cleared.
     pub fn fail_with(&self, e: Option<ForgeError>) {
         self.inner.lock().unwrap().fail = e;
+    }
+
+    /// Make only `reply` fail until cleared.
+    pub fn fail_reply_with(&self, e: Option<ForgeError>) {
+        self.inner.lock().unwrap().fail_reply = e;
     }
 
     /// A reviewer leaves a comment. Returns its id.
@@ -358,6 +366,9 @@ impl Forge for FakeForge {
     fn reply(&self, number: u64, comment_id: &str, body: &str) -> Result<(), ForgeError> {
         let mut g = self.inner.lock().unwrap();
         Self::gate(&g)?;
+        if let Some(e) = &g.fail_reply {
+            return Err(e.clone());
+        }
         g.ops.push(Op::Reply { number, comment_id: comment_id.into(), body: body.into() });
         Ok(())
     }

@@ -341,10 +341,6 @@ impl Scheduler {
                 fresh, "pull request {}", if fresh { "opened" } else { "updated" }
             );
 
-            if let Some(json) = &d.pending_verdicts {
-                let verdicts: Vec<ReviewVerdict> = serde_json::from_str(json)?;
-                self.apply_verdicts(issue_id, &opened, &verdicts)?;
-            }
             d = self.store.delivery(issue_id)?.ok_or_else(|| {
                 StepError::Other(anyhow::anyhow!("delivery row vanished mid-step"))
             })?;
@@ -355,6 +351,18 @@ impl Scheduler {
 
         let pr = pr.ok_or_else(|| ForgeError::Permanent("no pull request".into()))?;
         let number = pr.number;
+
+        // The last run's verdicts, before anything reads the threads: a verdict whose reply
+        // has not landed is not settled, and a thread not settled would otherwise be read as
+        // open below and handed straight back to an agent. A reply that fails leaves the step
+        // here — the poll retries it, and the threads are read only once every reply is in.
+        if let Some(json) = &d.pending_verdicts {
+            let verdicts: Vec<ReviewVerdict> = serde_json::from_str(json)?;
+            self.apply_verdicts(issue_id, &pr, &verdicts)?;
+            d = self.store.delivery(issue_id)?.ok_or_else(|| {
+                StepError::Other(anyhow::anyhow!("delivery row vanished mid-step"))
+            })?;
+        }
 
         if !d.review_requested && !self.cfg.delivery.reviewers.is_empty() {
             for r in &self.cfg.delivery.reviewers {
@@ -510,9 +518,16 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Record each verdict and reply on its thread. The record is the durable part; the reply
-    /// is best-effort, because a thread that cannot be answered is still settled here and the
-    /// next round will not re-hand it.
+    /// Reply on each verdict's thread, and record the verdict once the reply has landed.
+    ///
+    /// In that order, because the record is what excludes the thread from every later poll: a
+    /// verdict recorded before its reply landed would be hidden from the reviewer for good over
+    /// one failed request, while delivery went on to `Ready` as if they had been told. So a
+    /// reply that fails leaves its verdict in the queue and the thread unsettled, the rest of
+    /// the queue is still attempted, and the first failure is returned so the poll retries —
+    /// or, if it will not resolve, hands off with the verdicts still on the row for the
+    /// operator. The one write that can now happen twice is a reply whose record then failed
+    /// to commit, and a duplicate reply is the cheaper mistake.
     fn apply_verdicts(
         &mut self,
         issue_id: &str,
@@ -520,16 +535,11 @@ impl Scheduler {
         verdicts: &[ReviewVerdict],
     ) -> Result<(), StepError> {
         let forge = self.forge.clone().expect("checked by delivery_on");
+        let settled = self.store.verdicts_for(issue_id)?;
+        let mut unapplied: Vec<ReviewVerdict> = Vec::new();
+        let mut failure: Option<ForgeError> = None;
         for v in verdicts {
-            let fresh = self.store.record_verdict(
-                self.clock.as_ref(),
-                issue_id,
-                pr.number,
-                &v.comment_id,
-                v.verdict,
-                &v.detail,
-            )?;
-            if !fresh {
+            if settled.contains_key(&v.comment_id) {
                 // Settled by an earlier round; the first verdict stands and is not re-argued.
                 continue;
             }
@@ -537,12 +547,32 @@ impl Scheduler {
                 Verdict::Accepted => format!("**Accepted** — resolved in {}.", v.detail),
                 Verdict::Rejected => format!("**Rejected** — {}", v.detail),
             };
-            tracing::info!(issue_id, pr = pr.number, comment = %v.comment_id, verdict = v.verdict.as_str(), detail = %v.detail, "review comment settled");
-            if let Err(e) = forge.reply(pr.number, &v.comment_id, &body) {
-                tracing::warn!(issue_id, comment = %v.comment_id, error = %e, "verdict recorded but the reply failed");
+            match forge.reply(pr.number, &v.comment_id, &body) {
+                Ok(()) => {
+                    self.store.record_verdict(
+                        self.clock.as_ref(),
+                        issue_id,
+                        pr.number,
+                        &v.comment_id,
+                        v.verdict,
+                        &v.detail,
+                    )?;
+                    tracing::info!(issue_id, pr = pr.number, comment = %v.comment_id, verdict = v.verdict.as_str(), detail = %v.detail, "review comment settled");
+                }
+                Err(e) => {
+                    tracing::warn!(issue_id, comment = %v.comment_id, error = %e, "reply failed; the thread stays unsettled and the reply is retried");
+                    unapplied.push(v.clone());
+                    failure.get_or_insert(e);
+                }
             }
         }
-        Ok(())
+        let remaining =
+            if unapplied.is_empty() { None } else { Some(serde_json::to_string(&unapplied)?) };
+        self.store.set_pending_verdicts(self.clock.as_ref(), issue_id, remaining.as_deref())?;
+        match failure {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
 
     /// The pull request's title and body, derived from the run record — never composed by the

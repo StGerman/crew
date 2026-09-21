@@ -2101,6 +2101,62 @@ fn each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and
     assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
 }
 
+/// Finding 3 on #47. The verdict was recorded — durably settled, excluded from every later
+/// poll — and *then* the reply was attempted, with a failure merely logged. One transient error
+/// on that write hid the verdict from the reviewer for good while delivery advanced to `Ready`.
+/// The ordering is the bug: a verdict is settled by a reply that landed, and by nothing else.
+#[test]
+fn a_verdict_is_not_settled_by_a_reply_that_did_not_land() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c.clone(),
+        verdict: Verdict::Rejected,
+        detail: "the default is set two lines below".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+
+    // The run settles the comment; the network drops the reply that would say so.
+    forge.fail_reply_with(Some(ForgeError::Transient("connection reset".into())));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert!(
+        !h.sched.store().verdicts_for("iss-1").unwrap().contains_key(&c),
+        "a verdict whose reply did not land is not settled"
+    );
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.stage, symphony_cc::store::DeliveryStage::Ready, "and delivery cannot rest on it");
+    assert!(d.pending_verdicts.is_some(), "the verdict is still queued, not dropped: {d:?}");
+    assert!(
+        h.sched.snapshot().unwrap().last_error.as_deref().unwrap().contains("connection reset"),
+        "the failure is visible"
+    );
+    // Not handed back to an agent either: the thread is unsettled, but the run already spoke.
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "no round is opened over a failed reply");
+    assert_eq!(d.rounds_pr, 1);
+
+    // The network comes back: the same reply is retried, the verdict recorded, and only then
+    // does the pull request read as ready.
+    forge.fail_reply_with(None);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(forge.replies_to(pr, &c).len(), 1, "one reply, once it could land");
+    assert_eq!(h.sched.store().verdicts_for("iss-1").unwrap()[&c].0, Verdict::Rejected);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready);
+    assert!(d.pending_verdicts.is_none(), "the queue is empty once every reply has landed");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and it cost no agent run");
+}
+
 /// The new runaway, bounded. A reviewer that comments on every push, answered by an agent
 /// that pushes, would loop forever; every hand-back is a round and the two bounds hold across
 /// a restart and across a fresh pull request.
