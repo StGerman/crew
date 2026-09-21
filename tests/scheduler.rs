@@ -11,6 +11,8 @@ use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, FakeClock};
 use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
+use symphony_cc::gate::Verdict;
+use symphony_cc::gate::fake::{FakeGate, GateScript};
 use symphony_cc::model::{ErrorClass, Issue, Outcome, Phase};
 use symphony_cc::project::{NoopProjector, Projector, TasksProjector};
 use symphony_cc::sched::Scheduler;
@@ -636,6 +638,301 @@ fn the_per_issue_turn_budget_stops_an_endless_continuation() {
         "budget should have been reached, saw {}",
         st.cumulative_turns
     );
+}
+
+// ---- handoff gate -----------------------------------------------------------
+
+/// A harness with a fake gate attached, and the run scripted to finish `Done` after one second.
+fn gated_harness(tune: impl FnOnce(&mut Config)) -> (Harness, Arc<FakeGate>) {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], tune);
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    h.worker.set_default(Script::succeeds_in(1_000));
+    (h, gate)
+}
+
+/// Dispatch and let the agent finish, so the next tick is the one that starts the gate.
+fn dispatch_and_finish(h: &mut Harness) -> PathBuf {
+    h.sched.tick().unwrap();
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    ws
+}
+
+/// The guard for issue #21 at the scheduler: a `Done` is not applied until the gate has run in
+/// the run's own worktree, and the claim is held for the whole of that. Skip the gate and the
+/// fake records no start; release early and the phase reads `Released` while the gate is still
+/// running, which is the window in which a second agent could be dispatched onto the worktree.
+#[test]
+fn a_done_verdict_is_gated_in_its_own_worktree_before_the_claim_is_released() {
+    let (mut h, gate) = gated_harness(|_| {});
+    let ws = dispatch_and_finish(&mut h);
+
+    assert_eq!(h.sched.running_count(), 0, "the agent is finished");
+    assert_eq!(h.sched.gating_count(), 1, "and the gate must have taken over from it");
+    assert_eq!(gate.starts_for("iss-1"), vec![ws.clone()], "gated where the agent worked");
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Running, "the claim is held until the gate has spoken");
+    assert!(st.parked_state.is_none(), "and the issue is not yet parked");
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert!(
+        row.last_event.as_deref().is_some_and(|e| e.starts_with("gate:")),
+        "an operator must be able to see the gate running, got {:?}",
+        row.last_event
+    );
+    assert_eq!(row.workspace.as_deref(), Some(ws.to_str().unwrap()), "on which worktree");
+
+    // Ticks while the gate runs must not touch the issue.
+    h.clock.advance_ms(500);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1);
+    assert_eq!(h.sched.running_count(), 0, "nothing may be dispatched onto a gating worktree");
+
+    h.clock.advance_ms(500);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 0);
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"), "a passed gate is a real Done");
+    assert_eq!(st.attempt, 0, "and not a failure of any kind");
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].outcome.as_deref(), Some("done"));
+    assert_eq!(runs[0].turns, 3, "the run's own counters survive the wait");
+}
+
+#[test]
+fn a_branch_with_nothing_to_hand_off_passes_straight_through() {
+    let (mut h, gate) = gated_harness(|_| {});
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::NoCommits));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"));
+    assert!(h.sched.store().all_retries().unwrap().is_empty());
+}
+
+/// A conflict is a human's problem, not a failure to retry and not something to bury in a log
+/// line: the issue parks `Blocked`, the reason names the paths, and nothing is re-dispatched.
+#[test]
+fn a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths() {
+    let (mut h, gate) = gated_harness(|c| c.gate.base = Some("master".into()));
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::Conflict {
+        paths: vec!["src/sched/mod.rs".into(), "CLAUDE.md".into()],
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released, "blocked releases the claim");
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"), "and parks, like any Blocked");
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "a conflict is not retried");
+    assert!(!st.is_quarantined(), "and is not a failure");
+    let note = st.last_error.expect("the reason must reach the dashboard");
+    assert!(note.contains("master"), "which base: {note}");
+    assert!(note.contains("src/sched/mod.rs") && note.contains("CLAUDE.md"), "which files: {note}");
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs[0].outcome.as_deref(), Some("blocked"), "the run row says what happened");
+
+    for _ in 0..5 {
+        h.clock.advance_ms(60_000);
+        h.sched.tick().unwrap();
+        assert_eq!(h.sched.running_count() + h.sched.gating_count(), 0, "blocked stays parked");
+    }
+}
+
+/// A failing command is the agent's problem: the verdict is `Continue`, and the continuation
+/// is handed the output — otherwise it would re-run the suite to rediscover the same failure,
+/// or say `Done` again.
+#[test]
+fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
+    let (mut h, gate) = gated_harness(|_| {});
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::Failed {
+        step: "cargo test".into(),
+        output: "test a_thing ... FAILED\nassertion `left == right` failed".into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::RetryQueued, "a gate failure is a continuation");
+    assert_eq!(st.attempt, 0, "not a failure: the agent did what it was asked");
+    let retries = h.sched.store().all_retries().unwrap();
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].due_at - h.clock.wall().0, 5_000, "the continuation delay applies");
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs[0].outcome.as_deref(), Some("continue"), "the row records the gate's word");
+
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "the continuation is dispatched");
+    let sessions = h.worker.sessions_for("iss-1");
+    assert!(matches!(sessions[1], Session::Resume(_)), "into the same conversation");
+    let briefs = h.worker.briefs_for("iss-1");
+    assert_eq!(briefs[0], None, "a first dispatch has nothing to explain");
+    let brief = briefs[1].as_deref().expect("the continuation must be told why it exists");
+    assert!(brief.contains("cargo test"), "which step: {brief}");
+    assert!(brief.contains("a_thing ... FAILED"), "and what it said: {brief}");
+    assert!(brief.contains("1 of 3"), "and how many tries are left: {brief}");
+}
+
+/// The gate cannot be a runaway of its own: an agent that cannot make the suite pass gets
+/// `max_failures` consecutive tries and is then handed to a human, well inside the turn budget.
+#[test]
+fn repeated_gate_failures_escalate_to_blocked_rather_than_looping() {
+    let (mut h, gate) = gated_harness(|c| c.gate.max_failures = 2);
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(Verdict::Failed {
+        step: "cargo clippy".into(),
+        output: "error: unused variable".into(),
+    }));
+
+    // First failure: a continuation.
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::RetryQueued);
+
+    // The continuation runs, says Done again, and fails the gate again.
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released, "the second failure blocks");
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "no third try");
+    assert!(!st.is_quarantined(), "blocked, not quarantined: the agent did nothing wrong");
+    let note = st.last_error.expect("the escalation must say why");
+    assert!(note.contains("2 time(s)") && note.contains("cargo clippy"), "{note}");
+    assert_eq!(gate.starts_for("iss-1").len(), 2, "exactly max_failures gates were run");
+
+    for _ in 0..5 {
+        h.clock.advance_ms(60_000);
+        h.sched.tick().unwrap();
+        assert_eq!(h.sched.running_count() + h.sched.gating_count(), 0);
+    }
+}
+
+/// A pass resets the streak: two failures separated by a pass are not an escalation.
+#[test]
+fn a_passing_gate_resets_the_failure_streak() {
+    let (mut h, gate) = gated_harness(|c| {
+        c.gate.max_failures = 2;
+        c.tracker.active_states = vec!["in progress".into(), "in review".into()];
+    });
+    let failing = GateScript::passes_in(1_000)
+        .with_verdict(Verdict::Failed { step: "cargo test".into(), output: "boom".into() });
+
+    gate.set_default(failing.clone());
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // failure 1 → continue
+
+    gate.set_default(GateScript::passes_in(1_000));
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap(); // continuation dispatched
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // done → gate
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // pass → parked
+    assert_eq!(
+        h.sched.store().get("iss-1").unwrap().unwrap().parked_state.as_deref(),
+        Some("in progress")
+    );
+
+    // A human moves the ticket; the next run fails its gate once. That is failure 1 again.
+    gate.set_default(failing);
+    h.tracker.set_state("iss-1", "In Review");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(
+        st.phase,
+        Phase::RetryQueued,
+        "one failure after a pass is a continuation, not a block"
+    );
+}
+
+/// A gate that hangs — a wedged `cargo test` — is bounded by the timeout, and the timeout is
+/// a failure the agent hears about, not a silent kill.
+#[test]
+fn a_gate_that_hangs_is_killed_at_the_timeout_and_counts_as_a_failure() {
+    let (mut h, gate) = gated_harness(|c| c.gate.timeout_ms = 10_000);
+    gate.set_default(GateScript::hangs());
+    dispatch_and_finish(&mut h);
+
+    h.clock.advance_ms(10_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "at the limit, not past it");
+
+    h.clock.advance_ms(1);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 0, "past it, the gate is stopped");
+    let retries = h.sched.store().all_retries().unwrap();
+    assert_eq!(retries.len(), 1, "and the run continues");
+    let reason = retries[0].reason.clone().unwrap_or_default();
+    assert!(reason.contains("still running after 10000 ms"), "the agent is told why: {reason}");
+}
+
+/// The same rule as for a running agent: a ticket that closes takes the worktree with it, but
+/// only once whatever is running in that worktree is confirmed stopped.
+#[test]
+fn a_ticket_closed_while_its_gate_runs_stops_the_gate_and_reclaims_the_worktree() {
+    let (mut h, gate) = gated_harness(|_| {});
+    gate.set_default(GateScript::hangs());
+    let ws = dispatch_and_finish(&mut h);
+    assert_eq!(h.sched.gating_count(), 1);
+
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.sched.gating_count(), 0, "the gate is stopped");
+    assert!(!ws.exists(), "and the worktree reclaimed");
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs[0].outcome.as_deref(), Some("killed"), "the open run row is closed");
+}
+
+#[test]
+fn shutdown_stops_a_gate_in_flight_and_releases_its_claim() {
+    let (mut h, gate) = gated_harness(|_| {});
+    gate.set_default(GateScript::hangs());
+    let ws = dispatch_and_finish(&mut h);
+
+    h.sched.shutdown().unwrap();
+
+    assert_eq!(h.sched.gating_count(), 0);
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Released);
+    assert!(ws.exists(), "the worktree is kept for the next start, like a stopped run's");
+}
+
+/// The scheduler with no gate attached is the scheduler as it was: `Done` is applied as
+/// reported. Every earlier test in this file runs that way, so this only pins the fact.
+#[test]
+fn without_a_gate_a_done_verdict_is_applied_as_the_agent_reported_it() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(Script::succeeds_in(1_000));
+    dispatch_and_finish(&mut h);
+    assert_eq!(h.sched.gating_count(), 0);
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::Released);
 }
 
 // ---- failures ---------------------------------------------------------------

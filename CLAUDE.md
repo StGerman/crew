@@ -22,7 +22,7 @@ the published snapshot with a `status` client in front of it.
 ## Commands
 
 ```bash
-cargo test                                 # 166 unit + 53 integration
+cargo test                                 # 178 unit + 63 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -131,6 +131,15 @@ exactly what would make it delete the workspace of an issue about to be dispatch
 runs on its own cadence (`agent.parked_sweep_interval_ms`, default 5 min) rather than every
 tick, because parked issues are not urgent and each sweep is one `by_ids` read per issue still
 parked.
+
+`harvest_gates` is where a `Done` becomes a verdict. With a handoff gate attached (see below), a
+run whose agent reports `Done` leaves `running` for a `gating` map instead of being released: its
+claim stays held, its run row stays open, and the gate — rebase onto the base, then the configured
+commands, in the run's own worktree — runs on a thread the scheduler polls. This step turns the
+gate's answer into `Done`, `Blocked` or `Continue` and hands it to the same `apply_outcome` an
+agent's verdict goes through, which is what makes a gate-sent continuation subject to the same
+turn budget and the same escalating delay. It sits with the rest of reconciliation, ahead of
+`preflight`, because a claim held mid-rebase must not stay held behind a config typo.
 
 `recover()` is startup reconciliation, and it runs ahead of the gate for the same reason: a
 claim stranded by the last process must not stay stranded behind a config typo. It lives inside
@@ -317,6 +326,31 @@ Scheduler` safety net (for a panic or an early `?` return that skips the explici
 terminate every run still in `self.running` before letting the process end. If you add another
 place `main.rs` can exit, check that this still runs.
 
+**A `Done` is a claim until the handoff gate agrees** ([src/gate/](src/gate/)). Issue #21: two
+branches dispatched off the same base each passed `cargo test` alone, and their combination did
+not compile — three defects that existed only in the merge, which neither agent could have seen.
+Nothing rebased a finished branch onto the current base, and nothing re-ran the checks after. So
+`Gate` is the seam between an agent saying `Done` and a human being handed the branch: `GitGate`
+resolves `gate.base` in `workspace.repo` (not in the worktree, whose HEAD is the run's own
+branch), skips a branch with no commits beyond it, rebases, and on a clean rebase execs each
+`gate.commands` argv directly in the worktree — no shell, for the same reason the worker has
+none, and this one inherits the operator's environment because it is the operator's own suite
+with no agent involved. The verdict is deliberately three-way and the split is the point: a
+**conflict** is a human's problem, so the rebase is aborted (the branch goes back to exactly what
+the agent committed, which is what keeps `remove`'s merged check on its side) and the issue parks
+`Blocked` naming the paths; a **failing command** is the agent's, so the verdict is `Continue` and
+the output rides into the next spawn as the `brief` parameter on `Worker::spawn`, where the real
+worker puts it in the prompt; and `gate.max_failures` **consecutive** failures escalate to
+`Blocked`, because a gate that can be failed forever is the continuation runaway wearing a new
+name. A `Blocked` reason now also lands in the store's `last_error`, so the dashboard shows why
+an issue is parked instead of only the log. Setting no gate is a decision, not a degrade — unlike
+the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
+agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
+empty command list, which makes the default a rebase and nothing more) and the scheduler tests
+attach `FakeGate` explicitly. `symphony.github.toml` sets the three commands from **Commands**
+above; the fake worker never commits, so under `symphony.toml` every gate finds nothing to hand
+off.
+
 The ops API ([src/api/mod.rs](src/api/mod.rs)) is the second observer of that same published
 snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v1/refresh`,
 `POST /api/v1/unquarantine/:identifier`. `Api` holds a `watch::Receiver` and a command sender
@@ -369,8 +403,9 @@ Each of these closes a defect found in the original spec. The later rows came in
 dogfooding this orchestrator against its own backlog: the first review, the operator surface
 built over the same state, issue #1's acceptance criterion made executable, the first live
 dispatch and the review that followed it, the client put in front of that operator surface,
-making a finished run diagnosable, a closed ticket whose worktree outlived it, and an
-orchestrator that ran inside its own worktree.
+making a finished run diagnosable, a closed ticket whose worktree outlived it, an
+orchestrator that ran inside its own worktree, and two branches that were each green
+alone and broken together.
 
 Every row has a test that fails without its mechanism. Several of those tests only fail in the
 exact scenario they were written for, so a regression here can pass a casual `cargo test`
@@ -403,6 +438,9 @@ reading — check that the named test is still meaningful, not just still green.
 | Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
 | A parked run's worktree is reclaimed once its ticket closes | `sweep_parked` re-reads parked ids on a bounded cadence, unparks what it cleans, and clears the published branch when cleanup deleted the ref | `a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart`, `sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks`, `a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes` |
 | One orchestrator cannot nest its worktrees inside another's | `GitWorktreeWorkspace::new` refuses a `repo` or `root` inside a linked worktree of the repository; `remove` prunes registrations beneath the path it deletes, then `branch -d`s their branches with the merged check intact | `an_orchestrator_cannot_be_started_inside_another_runs_worktree`, `removing_a_worktree_reclaims_the_worktrees_nested_inside_it_from_shared_metadata` |
+| A branch is not handed off ungated against the base it will merge into | a `Done` moves the run into `gating` with its claim held; `GitGate` rebases first and runs the commands on the rebased tree | `a_done_verdict_is_gated_in_its_own_worktree_before_the_claim_is_released`, `the_branch_is_rebased_onto_the_base_before_the_gate_runs_on_the_rebased_tree` |
+| A rebase conflict is a human's problem, not a silent failure | the rebase is aborted and the issue parks `Blocked` naming the paths, in `last_error` | `a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths`, `a_conflicting_rebase_is_aborted_and_names_the_conflicted_paths` |
+| The gate cannot become a runaway | a failing command is a `Continue` that carries its output, bounded by `gate.max_failures` consecutive failures → `Blocked`, and by `gate.timeout_ms` per gate | `a_failing_gate_continues_the_run_with_the_failing_output_in_hand`, `repeated_gate_failures_escalate_to_blocked_rather_than_looping`, `a_gate_that_hangs_is_killed_at_the_timeout_and_counts_as_a_failure` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the
@@ -410,7 +448,10 @@ per-issue cap as redundant. It is not — re-read the continuation loop before t
 
 Three of these — the verdict, the per-issue turn budget and `parked_state` — are independent
 brakes on the same runaway. Removing any one of them looks safe because the other two still
-hold. They cover different paths; keep all three.
+hold. They cover different paths; keep all three. The gate's `max_failures` is a fourth, for the
+route the gate opened: a gate-sent `Continue` goes through the turn budget too, but at forty
+turns a session the budget is a slow brake, and a suite an agent cannot make pass would spend
+all of it rediscovering that.
 
 ## Conventions
 
@@ -432,7 +473,8 @@ The backlog is GitHub Issues on this repository, labelled `agent` — which is e
 Every seam symphony-cc needs to dispatch against its own backlog now has a real
 implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`
 (`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`), the tool broker
-(`[broker]`, on by default) and run transcripts (`[transcripts]`, likewise). The broker is on by default where the worker is not, because the
+(`[broker]`, on by default), run transcripts (`[transcripts]`, likewise) and the handoff gate
+(`[gate]`, on by default with `symphony.github.toml` naming the three commit-gate commands). The broker is on by default where the worker is not, because the
 two switches mean opposite things: `worker.kind` decides whether an agent runs at all, while
 the broker only decides whether an agent that is already running has a *scoped, logged* way to
 do what it could otherwise do ambiently. Turning it off removes the audit trail, not the

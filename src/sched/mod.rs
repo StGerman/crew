@@ -2,10 +2,16 @@
 //!
 //! Tick order is deliberate. Reconciliation runs *first and unconditionally*, so a broken
 //! config stops new dispatch without also stranding the runs already in flight. The one piece
-//! of reconciliation that sits *behind* the gate is the parked-issue sweep, because it deletes
-//! workspaces on the strength of `is_terminal`, and an overlapping active/terminal config —
-//! one of the things the gate rejects — is exactly what would make it delete the workspace of
-//! an issue about to be dispatched.
+//! of reconciliation that sits *behind* the config gate is the parked-issue sweep, because it
+//! deletes workspaces on the strength of `is_terminal`, and an overlapping active/terminal
+//! config — one of the things preflight rejects — is exactly what would make it delete the
+//! workspace of an issue about to be dispatched.
+//!
+//! Two things are called a gate here and they are unrelated: `Config::preflight` gates
+//! *dispatch*, and the handoff gate ([`crate::gate`]) gates a `Done` verdict. `harvest_gates`
+//! is the second one's reconciliation step and runs with the rest of reconciliation, ahead of
+//! preflight, because a run whose branch is mid-rebase must reach a verdict even under a config
+//! typo — otherwise its claim is held for as long as the typo stands.
 //!
 //! Deviation from the plan: reconciliation lives here rather than in its own module, because
 //! it mutates the same `running` map as dispatch and splitting it would mean threading the
