@@ -27,6 +27,7 @@ use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
 use symphony_cc::config::Config;
+use symphony_cc::gate::{Gate, GitGate};
 use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use symphony_cc::sched::{Scheduler, Snapshot};
 use symphony_cc::store::Store;
@@ -235,10 +236,27 @@ async fn main() -> anyhow::Result<()> {
         api_cfg.bind = addr;
     }
 
+    // The handoff gate runs in the run's worktree against `repo`'s base, so it is built over
+    // the same repository the worktrees come from. Not a degrade like the broker: with no gate
+    // a `Done` is handed to a human exactly as the agent left it, which is issue #21.
+    let gate: Option<Arc<dyn Gate>> = if cfg.gate.enabled {
+        let repo = repo.canonicalize().with_context(|| format!("resolving {}", repo.display()))?;
+        tracing::info!(
+            base = cfg.gate.base.as_deref().unwrap_or("HEAD"),
+            commands = cfg.gate.commands.len(),
+            "handoff gate on: done runs are rebased and re-gated before release"
+        );
+        Some(Arc::new(GitGate::new(repo, cfg.gate.base.clone(), cfg.gate.commands.clone())))
+    } else {
+        tracing::warn!("handoff gate off: done runs are released as the agent left them");
+        None
+    };
+
     let mut sched =
         Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
     sched.set_broker(broker);
     sched.set_transcripts(transcripts);
+    sched.set_gate(gate);
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
     let (act_tx, mut act_rx) = mpsc::unbounded_channel::<UiAction>();

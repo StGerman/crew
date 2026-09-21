@@ -62,6 +62,15 @@ fn d_max_bytes_per_run() -> u64 {
 fn d_keep_runs() -> usize {
     100
 }
+fn d_gate_enabled() -> bool {
+    true
+}
+fn d_gate_max_failures() -> u32 {
+    3
+}
+fn d_gate_timeout() -> u64 {
+    1_800_000
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -81,6 +90,52 @@ pub struct Config {
     pub api: ApiConfig,
     #[serde(default)]
     pub transcripts: TranscriptsConfig,
+    #[serde(default)]
+    pub gate: GateConfig,
+}
+
+/// The handoff gate (see [`crate::gate`]): rebase a `Done` run's branch onto `base`, then run
+/// `commands` in its worktree, before the verdict is believed.
+///
+/// On by default with no commands, which makes the default a rebase and nothing else: the
+/// rebase is what turns "green against the base it forked from" into "green against the base it
+/// will merge into", and it costs nothing on a branch with no commits. The commands are the
+/// repository's own bar and cannot be guessed here — a Rust crate wants `cargo test`, a
+/// checked-in script wants itself — so they are the operator's to name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateConfig {
+    #[serde(default = "d_gate_enabled")]
+    pub enabled: bool,
+    /// The ref a finished branch is rebased onto, resolved in `workspace.repo`. Unset means that
+    /// repository's current HEAD — the same commit worktrees are branched from, only now.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Each command is an argv, exec'd directly in the worktree with no shell: `["cargo",
+    /// "test"]`, not `"cargo test"`. The first to exit non-zero ends the gate, and its output
+    /// goes back to the agent. Empty means the rebase alone is the gate.
+    #[serde(default)]
+    pub commands: Vec<Vec<String>>,
+    /// Consecutive gate failures before the issue parks `Blocked` instead of continuing. This
+    /// is what keeps the gate from becoming a runaway of its own — an agent that cannot make
+    /// the suite pass would otherwise be re-dispatched until the turn budget ran out.
+    #[serde(default = "d_gate_max_failures")]
+    pub max_failures: u32,
+    /// How long one gate may run before it is killed and counted as a failure. Sized for a
+    /// cold `cargo test`, not for a fake. `0` disables the timeout.
+    #[serde(default = "d_gate_timeout")]
+    pub timeout_ms: u64,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: d_gate_enabled(),
+            base: None,
+            commands: Vec::new(),
+            max_failures: d_gate_max_failures(),
+            timeout_ms: d_gate_timeout(),
+        }
+    }
 }
 
 /// The ops HTTP surface ([`crate::api`]).
@@ -393,6 +448,21 @@ impl Config {
                     .into(),
             ));
         }
+        // A zero here would not mean "never escalate", it would block on the first failure and
+        // read as the gate being broken; an empty argv would fail every gate at spawn time.
+        if self.gate.enabled {
+            if self.gate.max_failures == 0 {
+                return Err(ConfigError::Invalid(
+                    "gate.max_failures must be > 0; use gate.enabled = false to skip the gate"
+                        .into(),
+                ));
+            }
+            if let Some(i) = self.gate.commands.iter().position(|c| c.is_empty()) {
+                return Err(ConfigError::Invalid(format!(
+                    "gate.commands[{i}] is empty; each command is an argv like [\"cargo\", \"test\"]"
+                )));
+            }
+        }
         // Overlap makes startup cleanup delete a workspace for an issue about to be dispatched.
         let overlap: Vec<_> = self
             .tracker
@@ -458,9 +528,26 @@ mod tests {
             broker: Default::default(),
             api: Default::default(),
             transcripts: Default::default(),
+            gate: Default::default(),
         };
         c.normalize();
         c
+    }
+
+    #[test]
+    fn a_gate_that_could_never_escalate_or_never_start_is_rejected() {
+        let mut c = base();
+        c.gate.max_failures = 0;
+        assert!(c.preflight().is_err());
+        c.gate.max_failures = 3;
+        c.gate.commands = vec![vec!["cargo".into(), "test".into()], vec![]];
+        assert!(c.preflight().is_err(), "an empty argv cannot be exec'd");
+        c.gate.commands.pop();
+        assert!(c.preflight().is_ok());
+        // Turning the gate off is the supported way to skip it.
+        c.gate.enabled = false;
+        c.gate.max_failures = 0;
+        assert!(c.preflight().is_ok());
     }
 
     #[test]

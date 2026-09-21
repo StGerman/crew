@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
+use crate::gate::{Gate, GateHandle, Verdict};
 use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RunRecord, Store};
@@ -72,6 +73,16 @@ struct Running {
     /// removes the entry, so every path revokes the token and deletes the config file without
     /// having to remember to.
     _broker: Option<BrokerSession>,
+}
+
+/// A run whose agent has said `Done` and whose branch is being rebased and re-gated before that
+/// verdict is believed. It has left `running` — the agent process is gone, and with it the
+/// broker session — but its claim is still held, so nothing can dispatch onto the worktree the
+/// gate is working in. See [`crate::gate`].
+struct Gating {
+    run: Running,
+    handle: Arc<dyn GateHandle>,
+    started: Mono,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -150,7 +161,18 @@ pub struct Scheduler {
     /// the broker and the projector: a run with no record on disk, never a run that did not
     /// happen.
     transcripts: Option<Transcripts>,
+    /// `None` when the operator turned the gate off. Unlike the broker and the transcripts this
+    /// is not a degrade: with no gate a `Done` verdict is applied as the agent reported it,
+    /// which is the exact handoff issue #21 is about, so `main.rs` sets one whenever
+    /// `gate.enabled` is true and the tests say so explicitly when they want it.
+    gate: Option<Arc<dyn Gate>>,
     running: HashMap<String, Running>,
+    /// Runs between the agent's `Done` and the verdict the gate turns it into. Disjoint from
+    /// `running`; an issue is in at most one of the two.
+    gating: HashMap<String, Gating>,
+    /// Consecutive gate failures, per issue. Reset by a pass, and by any verdict that ends the
+    /// issue's current line of work.
+    gate_failures: HashMap<String, u32>,
     /// Latest issue snapshot seen for each id, for display and routing checks.
     seen: HashMap<String, Issue>,
     /// Consecutive `Continue` verdicts with no tracker state change, per issue.
@@ -186,7 +208,10 @@ impl Scheduler {
             projector,
             broker: None,
             transcripts: None,
+            gate: None,
             running: HashMap::new(),
+            gating: HashMap::new(),
+            gate_failures: HashMap::new(),
             seen: HashMap::new(),
             no_progress: HashMap::new(),
             recovered: false,
@@ -214,8 +239,20 @@ impl Scheduler {
         self.transcripts = transcripts;
     }
 
+    /// Attach a handoff gate. A setter like the others so every caller that predates it is
+    /// still correct — but note the asymmetry in [`Scheduler::gate`]'s doc: leaving it unset is
+    /// a decision, not a degrade.
+    pub fn set_gate(&mut self, gate: Option<Arc<dyn Gate>>) {
+        self.gate = gate;
+    }
+
     pub fn running_count(&self) -> usize {
         self.running.len()
+    }
+
+    /// Runs whose agent has finished and whose branch is being rebased and re-gated.
+    pub fn gating_count(&self) -> usize {
+        self.gating.len()
     }
 
     pub fn store(&self) -> &Store {
@@ -239,6 +276,7 @@ impl Scheduler {
         // Unconditional: in-flight runs are reconciled even when config is broken.
         self.harvest_finished()?;
         self.observe_progress()?;
+        self.harvest_gates()?;
         self.detect_stalls()?;
         self.refresh_running()?;
 
@@ -289,7 +327,9 @@ impl Scheduler {
             .store
             .claimed()?
             .into_iter()
-            .filter(|s| !self.running.contains_key(&s.issue_id))
+            .filter(|s| {
+                !self.running.contains_key(&s.issue_id) && !self.gating.contains_key(&s.issue_id)
+            })
             .collect();
         if stale.is_empty() {
             return Ok(());
@@ -355,7 +395,27 @@ impl Scheduler {
             .collect();
 
         for (issue_id, outcome) in done {
-            let r = self.running.remove(&issue_id).expect("just listed");
+            let mut r = self.running.remove(&issue_id).expect("just listed");
+
+            // `Done` is a claim, not a verdict, while there is a gate to check it against. The
+            // run row stays open and the store claim stays held; what ends here is the agent's
+            // authority — the broker session is dropped now rather than when the gate finishes,
+            // because the agent that could have used it is gone.
+            if outcome == Outcome::Done
+                && let Some(gate) = &self.gate
+            {
+                r._broker = None;
+                let handle = gate.start(&r.issue, &r.workspace);
+                let now = self.clock.mono();
+                tracing::info!(
+                    issue_id, identifier = %r.issue.identifier,
+                    workspace = %r.workspace.display(),
+                    "run reports done; rebasing and gating before believing it"
+                );
+                self.gating.insert(issue_id, Gating { run: r, handle, started: now });
+                continue;
+            }
+
             let p = r.handle.progress();
             self.store.finish_run(
                 self.clock.as_ref(),
@@ -384,12 +444,17 @@ impl Scheduler {
             Outcome::Done => {
                 tracing::info!(issue_id, identifier = %r.issue.identifier, "run completed: done");
                 self.no_progress.remove(issue_id);
+                self.gate_failures.remove(issue_id);
                 self.store.release(self.clock.as_ref(), issue_id)?;
                 self.park_here(issue_id, r)?;
             }
             Outcome::Blocked { why } => {
                 tracing::info!(issue_id, identifier = %r.issue.identifier, why, "run blocked; parking");
                 self.no_progress.remove(issue_id);
+                self.gate_failures.remove(issue_id);
+                // The one verdict that ends with a human needing to act, so the reason has to
+                // reach the dashboard and not just the log.
+                self.store.set_note(self.clock.as_ref(), issue_id, &why)?;
                 self.store.release(self.clock.as_ref(), issue_id)?;
                 self.park_here(issue_id, r)?;
             }
@@ -524,6 +589,136 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Turn finished gates into verdicts, and kill the ones that have run past the timeout.
+    ///
+    /// The gate never applies `Done` on its own authority: every verdict goes back through
+    /// `apply_outcome`, so a gate-sent `Continue` is subject to the same turn budget, the same
+    /// escalating delay and the same no-progress streak as one the agent asked for. That is
+    /// what keeps this from being a fourth path around the brakes the continuation loop has.
+    fn harvest_gates(&mut self) -> anyhow::Result<()> {
+        let timeout = self.cfg.gate.timeout_ms;
+        let now = self.clock.mono();
+
+        let mut ready: Vec<(String, Verdict)> = Vec::new();
+        for (id, g) in &self.gating {
+            if let Some(v) = g.handle.finished() {
+                ready.push((id.clone(), v));
+            } else if timeout > 0 && now.saturating_since(g.started) > timeout {
+                // Killed here, not in `terminate`: the issue is not leaving the scheduler's
+                // hands, it is getting a verdict — a failure the agent is told about.
+                let step = g.handle.step();
+                let killed = g.handle.kill(KILL_GRACE_MS);
+                tracing::warn!(issue_id = %id, step, ?killed, timeout_ms = timeout, "gate timed out");
+                ready.push((
+                    id.clone(),
+                    Verdict::Failed {
+                        step,
+                        output: format!(
+                            "the gate was still running after {timeout} ms and was stopped"
+                        ),
+                    },
+                ));
+            }
+        }
+
+        for (issue_id, verdict) in ready {
+            let g = self.gating.remove(&issue_id).expect("just listed");
+            let outcome = self.gate_outcome(&issue_id, &g.run, verdict);
+            // The run row closes with the verdict the gate produced, not the one the agent
+            // claimed: an operator reading `continue` on a run whose agent said done is reading
+            // the fact that matters.
+            let p = g.run.handle.progress();
+            self.store.finish_run(
+                self.clock.as_ref(),
+                &g.run.run_id,
+                outcome.label(),
+                p.turns,
+                p.tokens,
+            )?;
+            self.store.add_turns(&issue_id, p.turns)?;
+            self.apply_outcome(&issue_id, &g.run, outcome)?;
+        }
+        Ok(())
+    }
+
+    /// What the scheduler makes of a gate's verdict.
+    ///
+    /// A conflict is a human's problem and a failing command is the agent's, but the agent only
+    /// gets `max_failures` consecutive tries: without that bound a suite the agent cannot make
+    /// pass would be re-dispatched until the turn budget ran out, which is the runaway the
+    /// verdict-plus-budget design exists to prevent, arriving by a new route.
+    fn gate_outcome(&mut self, issue_id: &str, r: &Running, verdict: Verdict) -> Outcome {
+        let identifier = r.issue.identifier.as_str();
+        match verdict {
+            Verdict::NoCommits => {
+                tracing::info!(
+                    issue_id,
+                    identifier,
+                    "branch holds no commits; nothing to hand off"
+                );
+                Outcome::Done
+            }
+            Verdict::Passed { rebased } => {
+                tracing::info!(issue_id, identifier, rebased, "gate passed on the rebased branch");
+                Outcome::Done
+            }
+            Verdict::Conflict { paths } => {
+                let base = self.cfg.gate.base.as_deref().unwrap_or("the repository HEAD");
+                tracing::warn!(
+                    issue_id,
+                    identifier,
+                    ?paths,
+                    "rebase conflicts; blocking for a human"
+                );
+                Outcome::Blocked {
+                    why: format!(
+                        "rebase onto {base} conflicts in {} file(s): {}",
+                        paths.len(),
+                        paths.join(", ")
+                    ),
+                }
+            }
+            Verdict::Failed { step, output } => {
+                let n = {
+                    let e = self.gate_failures.entry(issue_id.to_string()).or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                let max = self.cfg.gate.max_failures;
+                if n >= max {
+                    tracing::warn!(
+                        issue_id,
+                        identifier,
+                        step,
+                        failures = n,
+                        "gate failed repeatedly; blocking"
+                    );
+                    Outcome::Blocked {
+                        why: format!(
+                            "the handoff gate failed {n} time(s) in a row; last at `{step}`:\n{output}"
+                        ),
+                    }
+                } else {
+                    tracing::info!(
+                        issue_id,
+                        identifier,
+                        step,
+                        failures = n,
+                        max,
+                        "gate failed; continuing"
+                    );
+                    Outcome::Continue {
+                        why: format!(
+                            "the handoff gate failed at `{step}` (failure {n} of {max}); the branch \
+                             has been rebased onto the base, so fix this on top of it and finish \
+                             again. Output:\n{output}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     fn detect_stalls(&mut self) -> anyhow::Result<()> {
         let limit = self.cfg.agent.stall_timeout_ms;
         if limit == 0 {
@@ -561,7 +756,9 @@ impl Scheduler {
     }
 
     fn refresh_running(&mut self) -> anyhow::Result<()> {
-        let ids: Vec<String> = self.running.keys().cloned().collect();
+        // A gating issue still holds its claim, so a ticket that closes mid-gate has to be seen
+        // here too, or its worktree would be reclaimed only by the parked sweep, long after.
+        let ids: Vec<String> = self.running.keys().chain(self.gating.keys()).cloned().collect();
         if ids.is_empty() {
             return Ok(());
         }
@@ -590,6 +787,8 @@ impl Scheduler {
             } else if self.cfg.is_active(&key) && self.routable(&issue) {
                 if let Some(r) = self.running.get_mut(&issue.id) {
                     r.issue = issue;
+                } else if let Some(g) = self.gating.get_mut(&issue.id) {
+                    g.run.issue = issue;
                 }
             } else {
                 tracing::info!(
@@ -658,7 +857,9 @@ impl Scheduler {
             .store
             .parked()?
             .into_iter()
-            .filter(|s| !self.running.contains_key(&s.issue_id))
+            .filter(|s| {
+                !self.running.contains_key(&s.issue_id) && !self.gating.contains_key(&s.issue_id)
+            })
             .collect();
         if parked.is_empty() {
             return Ok(());
@@ -721,11 +922,20 @@ impl Scheduler {
     /// constraint between the two, which deletes a directory out from under a process that may
     /// still be writing to it.
     fn terminate(&mut self, issue_id: &str, cleanup: bool) -> anyhow::Result<()> {
-        let Some(r) = self.running.remove(issue_id) else {
+        let r = if let Some(r) = self.running.remove(issue_id) {
+            let outcome = r.handle.kill(KILL_GRACE_MS);
+            tracing::debug!(issue_id, ?outcome, "worker stopped");
+            r
+        } else if let Some(g) = self.gating.remove(issue_id) {
+            // The agent is already gone; what is running is the gate, and it is stopped under
+            // the same rule — confirmed dead before the worktree it runs in may be touched.
+            let outcome = g.handle.kill(KILL_GRACE_MS);
+            tracing::debug!(issue_id, ?outcome, "gate stopped");
+            self.gate_failures.remove(issue_id);
+            g.run
+        } else {
             return Ok(());
         };
-        let outcome = r.handle.kill(KILL_GRACE_MS);
-        tracing::debug!(issue_id, ?outcome, "worker stopped");
 
         // `p.tokens` is `None` here in every case but one: a run that had already reported its
         // result when the tracker moved the ticket, so the kill found nothing left to stop.
@@ -823,7 +1033,10 @@ impl Scheduler {
 
             let issue = issue.clone();
             self.store.clear_retry(&issue.id)?;
-            self.launch(&issue, entry.attempt)?;
+            // The retry reason is the one thing the orchestrator knows about this attempt that
+            // the agent cannot see from inside the worktree — for a gate-sent continuation, the
+            // output of the suite that disagreed with its `Done`.
+            self.launch(&issue, entry.attempt, entry.reason.as_deref())?;
         }
         Ok(())
     }
@@ -899,7 +1112,7 @@ impl Scheduler {
                 None => {}
             }
 
-            self.launch(&issue, 0)?;
+            self.launch(&issue, 0, None)?;
         }
         Ok(())
     }
@@ -909,7 +1122,7 @@ impl Scheduler {
     /// The claim commits before the worker exists. The spec spawns first and records the claim
     /// afterwards, leaving a window in which a fast-exiting worker reports against state that
     /// has not been written yet.
-    fn launch(&mut self, issue: &Issue, attempt: u32) -> anyhow::Result<()> {
+    fn launch(&mut self, issue: &Issue, attempt: u32, brief: Option<&str>) -> anyhow::Result<()> {
         self.store.ensure(
             self.clock.as_ref(),
             &issue.id,
@@ -1014,6 +1227,7 @@ impl Scheduler {
             &session,
             broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
+            brief,
         );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
@@ -1082,9 +1296,16 @@ impl Scheduler {
 
         let mut rows = Vec::new();
         for st in &states {
-            let run = self.running.get(&st.issue_id);
+            // A gating issue reads as its run does — same workspace, same age, same turns —
+            // with the gate's current step where the agent's last event would be. The claim is
+            // still held and the worktree is still busy, which is what an operator needs to see.
+            let gate = self.gating.get(&st.issue_id);
+            let run = self.running.get(&st.issue_id).or(gate.map(|g| &g.run));
             let issue = self.seen.get(&st.issue_id);
-            let progress = run.map(|r| r.handle.progress()).unwrap_or_default();
+            let mut progress = run.map(|r| r.handle.progress()).unwrap_or_default();
+            if let Some(g) = gate {
+                progress.last_event = Some(format!("gate: {}", g.handle.step()));
+            }
 
             let runs = history.remove(&st.issue_id).unwrap_or_default();
 
@@ -1203,7 +1424,7 @@ impl Scheduler {
     }
 
     fn terminate_all_running(&mut self) -> anyhow::Result<()> {
-        let ids: Vec<String> = self.running.keys().cloned().collect();
+        let ids: Vec<String> = self.running.keys().chain(self.gating.keys()).cloned().collect();
         for id in ids {
             tracing::info!(issue_id = %id, "stopping in-flight run for shutdown");
             self.terminate(&id, false)?;
@@ -1219,7 +1440,7 @@ impl Drop for Scheduler {
     /// `Result`, so a failure here is logged, not surfaced; the `is_empty` guard keeps this
     /// silent on the expected path, where `shutdown()` already emptied `running`.
     fn drop(&mut self) {
-        if self.running.is_empty() {
+        if self.running.is_empty() && self.gating.is_empty() {
             return;
         }
         tracing::warn!("scheduler dropped with runs still in flight; terminating them now");

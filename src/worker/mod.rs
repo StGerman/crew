@@ -140,6 +140,12 @@ pub trait Worker: Send + Sync {
     /// file could not be opened, and carries the same degrade-never-fail contract as `tools`.
     /// An implementation writes to it and never reads it back — where it points is already
     /// known to the scheduler, which is what records the path.
+    ///
+    /// `brief` is what the orchestrator knows about why this attempt exists that the agent
+    /// cannot see from inside its worktree: the retry reason, and for a run the handoff gate
+    /// sent back, the gate's failing output. `None` on a first dispatch. It reaches the agent
+    /// through the prompt and nothing else, so a worker that ignores it is degraded, not wrong.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         &self,
         issue: &Issue,
@@ -148,5 +154,6 @@ pub trait Worker: Send + Sync {
         session: &Session,
         tools: Option<&ToolEndpoint>,
         transcript: Option<TranscriptWriter>,
+        brief: Option<&str>,
     ) -> Arc<dyn RunHandle>;
 }

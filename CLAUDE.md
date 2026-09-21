@@ -116,7 +116,7 @@ no sleeps and nothing to flake — time only moves when a test moves it.
 ```
 recover()                                        ← first tick only
                  ↓
-harvest_finished → observe_progress → detect_stalls → refresh_running   ← unconditional
+harvest_finished → observe_progress → harvest_gates → detect_stalls → refresh_running
                  ↓
             cfg.preflight()                          ← gate: on failure, return here
                  ↓

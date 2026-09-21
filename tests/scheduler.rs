@@ -101,6 +101,7 @@ fn harness_full(
         broker: Default::default(),
         api: Default::default(),
         transcripts: Default::default(),
+        gate: Default::default(),
     };
     tune(&mut cfg);
     cfg.preflight().expect("test config must be valid");

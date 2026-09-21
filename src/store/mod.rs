@@ -436,6 +436,22 @@ impl Store {
         Ok(())
     }
 
+    /// Record why an issue parked `Blocked`, in the same column a failure would use.
+    ///
+    /// `Blocked` is not a failure — `attempt` and the quarantine streak are left alone — but it
+    /// is the one verdict that ends with a human needing to act, and until this the reason went
+    /// to the log and nowhere an operator reading the dashboard could see it. A rebase conflict
+    /// naming its paths is the case that made that cost real.
+    pub fn set_note(&self, clock: &dyn Clock, issue_id: &str, note: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET last_error = ?2, last_error_class = NULL, updated_at = ?3
+             WHERE issue_id = ?1",
+            params![issue_id, note, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
     pub fn add_turns(&self, issue_id: &str, turns: u32) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

@@ -58,3 +58,14 @@ bind = "127.0.0.1:8787"
 enabled = true
 max_bytes_per_run = 8388608
 keep_runs = 100
+
+# The handoff gate (src/gate/). A run that reports done is not released until its branch has
+# been rebased onto `base` and every command here has passed in its worktree — a gate run
+# against the base a branch forked from answers a question nobody asked. The fake worker never
+# commits, so against this config the gate finds nothing to hand off and passes straight
+# through; the commands are left empty for the same reason.
+[gate]
+enabled = true
+max_failures = 3
+timeout_ms = 1800000
+commands = []
