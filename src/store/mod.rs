@@ -515,9 +515,6 @@ impl Store {
         Ok(())
     }
 
-    /// `tokens` is `None` for a run that ended without reporting a total — killed, crashed, or
-    /// cut off by the turn budget. It is stored as NULL, never as zero: a zero would read as a
-    /// free run in every sum, and a run that was killed mid-stream is not free, it is uncounted.
     /// One run by id — the "show me what run X did" lookup.
     pub fn run(&self, run_id: &str) -> rusqlite::Result<Option<RunRecord>> {
         let conn = self.conn.lock().unwrap();
@@ -560,6 +557,9 @@ impl Store {
         rows.collect()
     }
 
+    /// `tokens` is `None` for a run that ended without reporting a total — killed, crashed, or
+    /// cut off by the turn budget. It is stored as NULL, never as zero: a zero would read as a
+    /// free run in every sum, and a run that was killed mid-stream is not free, it is uncounted.
     pub fn finish_run(
         &self,
         clock: &dyn Clock,

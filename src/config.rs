@@ -75,6 +75,7 @@ pub struct Config {
     pub broker: BrokerConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    #[serde(default)]
     pub transcripts: TranscriptsConfig,
 }
 

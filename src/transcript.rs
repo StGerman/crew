@@ -48,6 +48,10 @@ impl Transcripts {
     /// transcripts, never to fail startup.
     pub fn new(root: &Path, max_bytes_per_run: u64, keep_runs: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(root)?;
+        // A transcript is the agent's raw tool inputs and results, so it can hold anything the
+        // run touched. Fail closed: if the mode cannot be tightened, the caller's cue is to run
+        // without transcripts, not to write them where any local user can read them.
+        restrict(root, 0o700)?;
         Ok(Self { root: root.to_path_buf(), max_bytes_per_run, keep_runs })
     }
 
@@ -83,9 +87,27 @@ impl Transcripts {
         // Append rather than truncate: `path_for` makes a collision impossible, so the only way
         // an existing file is hit is a genuine re-open of the same run, where discarding what
         // was already recorded would be the wrong half to keep.
-        match OpenOptions::new().create(true).append(true).open(&path) {
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        // Set at creation rather than after: a chmod that follows the open leaves a window in
+        // which the file exists at the umask's mode with content already in it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
             Ok(file) => {
-                Some(TranscriptWriter { path, file: Some(file), remaining: self.max_bytes_per_run })
+                // The marker's bytes are reserved up front, not spent when truncation happens:
+                // charging them at the end is what let the file finish larger than its own cap.
+                // Its length is fixed here because it reports the configured cap, not what was
+                // left over.
+                let marker = format!(
+                    "{{\"type\":\"{TRUNCATION_MARKER}\",\"limit_bytes\":{}}}\n",
+                    self.max_bytes_per_run
+                );
+                let remaining = self.max_bytes_per_run.saturating_sub(marker.len() as u64);
+                Some(TranscriptWriter { path, file: Some(file), remaining, marker })
             }
             Err(e) => {
                 tracing::warn!(
@@ -132,6 +154,8 @@ impl Transcripts {
 /// One run's transcript file. Writes are unbuffered and capped; see the module doc for why.
 pub struct TranscriptWriter {
     path: PathBuf,
+    /// The truncation line, built at open so its cost can be reserved from `remaining`.
+    marker: String,
     /// Dropped once the byte cap is spent, which is what stops further writes.
     file: Option<File>,
     remaining: u64,
@@ -144,7 +168,9 @@ impl TranscriptWriter {
 
     /// Append one line. Silent on every failure — a run must not die because its log did.
     pub fn write_line(&mut self, line: &str) {
-        let Some(file) = self.file.as_mut() else { return };
+        if self.file.is_none() {
+            return;
+        }
 
         let cost = line.len() as u64 + 1;
         if cost > self.remaining {
@@ -152,11 +178,10 @@ impl TranscriptWriter {
             // and what it did first; how it *ended* is already in the store's run row, so the
             // cheap policy loses less than it looks like. The cap is a backstop against a
             // pathological run, not a path a 20-turn session is expected to reach.
-            let marker = format!(
-                "{{\"type\":\"{TRUNCATION_MARKER}\",\"limit_bytes\":{}}}\n",
-                self.remaining
-            );
-            let _ = file.write_all(marker.as_bytes());
+            let marker = std::mem::take(&mut self.marker);
+            if let Some(file) = self.file.as_mut() {
+                let _ = file.write_all(marker.as_bytes());
+            }
             self.file = None;
             tracing::warn!(
                 path = %self.path.display(),
@@ -165,12 +190,24 @@ impl TranscriptWriter {
             return;
         }
 
+        let Some(file) = self.file.as_mut() else { return };
         if file.write_all(line.as_bytes()).and_then(|()| file.write_all(b"\n")).is_err() {
             self.file = None;
             return;
         }
         self.remaining -= cost;
     }
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -206,10 +243,33 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Transcripts carry the agent's raw tool inputs and results, so a default umask that
+    /// leaves them group- or world-readable is a disclosure, not an inconvenience.
+    #[cfg(unix)]
+    #[test]
+    fn a_transcript_is_readable_only_by_the_operator_who_ran_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmp("modes");
+        let t = Transcripts::new(&root, 1 << 20, 10).unwrap();
+        let mut w = t.open("private").unwrap();
+        w.write_line("{\"secret\":\"in the tool result\"}");
+        let path = w.path().to_path_buf();
+        drop(w);
+
+        let dir_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "the transcript root must not be readable by other users");
+        assert_eq!(file_mode, 0o600, "a transcript must not be readable by other users");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_run_that_never_stops_talking_cannot_grow_past_its_cap() {
         let root = tmp("cap");
-        let t = Transcripts::new(&root, 64, 10).unwrap();
+        const CAP: u64 = 256;
+        let t = Transcripts::new(&root, CAP, 10).unwrap();
 
         let mut w = t.open("noisy").unwrap();
         let path = w.path().to_path_buf();
@@ -219,7 +279,12 @@ mod tests {
         drop(w);
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.len() < 200, "cap was not enforced: {} bytes", text.len());
+        assert!(
+            text.len() as u64 <= CAP,
+            "the cap is a hard bound, marker included: {} bytes for a {CAP}-byte cap",
+            text.len()
+        );
+        assert!(text.contains("xxx"), "the head of the run must survive truncation");
         assert!(
             text.contains(TRUNCATION_MARKER),
             "a truncated transcript must say so rather than just ending"
@@ -259,7 +324,9 @@ mod tests {
     /// Set a file's mtime `secs` seconds into the past, so ordering does not depend on the test
     /// being slow enough for the filesystem clock to tick between writes.
     fn filetime_backdate(path: &Path, secs: u64) {
-        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        // A fixed point, not the host clock: only relative ordering matters here, and
+        // `clock.rs` owns every real `SystemTime::now` in this crate.
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 - secs);
         let f = File::options().write(true).open(path).unwrap();
         f.set_modified(when).unwrap();
     }

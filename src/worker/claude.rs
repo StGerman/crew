@@ -361,17 +361,18 @@ fn run_reader(
     let mut saw_valid_line = false;
 
     for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        let line = line.trim();
+        let Ok(raw) = line else { break };
+        // Before the parse and before the trim: a line this module cannot read is exactly the
+        // one someone will want to look at later, and so is the whitespace it arrived with.
+        if let Some(t) = transcript.as_mut() {
+            t.write_line(&raw);
+        }
+
+        let line = raw.trim();
         if line.is_empty() {
             continue;
         }
         saw_any_line = true;
-        // Before the parse, not after: a line this module cannot read is exactly the one
-        // someone will want to look at later.
-        if let Some(t) = transcript.as_mut() {
-            t.write_line(line);
-        }
 
         let value: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
