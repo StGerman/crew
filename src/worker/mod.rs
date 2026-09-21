@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Issue, Outcome};
+use crate::transcript::TranscriptWriter;
 
 /// Where this run's host-side tool broker is, when there is one.
 ///
@@ -133,6 +134,12 @@ pub trait Worker: Send + Sync {
     /// `tools` is `None` when the broker is unavailable. That is a degrade, not an error: the
     /// run proceeds without tracker tools rather than failing, so a broker that cannot bind
     /// costs the agent a capability and nothing else.
+    ///
+    /// `transcript` is owned rather than borrowed because the implementation that matters hands
+    /// it to a reader thread that outlives this call; `None` means transcripts are off or the
+    /// file could not be opened, and carries the same degrade-never-fail contract as `tools`.
+    /// An implementation writes to it and never reads it back — where it points is already
+    /// known to the scheduler, which is what records the path.
     fn spawn(
         &self,
         issue: &Issue,
@@ -140,5 +147,6 @@ pub trait Worker: Send + Sync {
         attempt: u32,
         session: &Session,
         tools: Option<&ToolEndpoint>,
+        transcript: Option<TranscriptWriter>,
     ) -> Arc<dyn RunHandle>;
 }

@@ -73,6 +73,16 @@
 //! producing a `result` event all fall through to `Failed { class: AgentCrash }`: absent an
 //! explicit verdict, nothing here infers `Continue` from a clean exit, which is the exact
 //! spec defect this whole project exists to not have.
+//!
+//! ## The transcript
+//!
+//! [`run_reader`] parses four things out of the stream and drops the rest. Everything it drops
+//! — `system`, `rate_limit_event`, every tool call the agent made — is what a post-mortem
+//! actually wants, so the same loop copies each line verbatim to this run's
+//! [`TranscriptWriter`] *before* deciding whether the parser has a use for it. Lines that fail
+//! to parse are written too: a stream the parser choked on is the single most interesting one
+//! to still have afterwards. See [`crate::transcript`] for the retention bounds and for why the
+//! file does not live in the worktree.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -83,6 +93,7 @@ use std::time::Duration;
 
 use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
 use crate::model::{ErrorClass, Issue, Outcome};
+use crate::transcript::TranscriptWriter;
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
 /// any tracker credential and any API key. An operator on API-key auth adds `ANTHROPIC_API_KEY`
@@ -210,9 +221,10 @@ impl Worker for ClaudeWorker {
         &self,
         issue: &Issue,
         workspace: &Path,
-        _attempt: u32,
+        attempt: u32,
         session: &Session,
         tools: Option<&ToolEndpoint>,
+        mut transcript: Option<TranscriptWriter>,
     ) -> Arc<dyn RunHandle> {
         // `--resume` is passed with an explicit id, never bare: bare opens an interactive
         // picker, and there is no human here to answer it.
@@ -244,6 +256,25 @@ impl Worker for ClaudeWorker {
             cmd.args([std::ffi::OsStr::new("--mcp-config"), t.config_path.as_os_str()]);
         }
 
+        // A header, so the file explains itself without a second lookup into the store. These
+        // are the dispatch facts that vary per attempt; the prompt itself is omitted because it
+        // is derived from the issue and would otherwise dominate the transcript of a short run.
+        if let Some(t) = transcript.as_mut() {
+            t.write_line(
+                &serde_json::json!({
+                    "type": "symphony_run_start",
+                    "issue": issue.identifier,
+                    "issue_id": issue.id,
+                    "attempt": attempt,
+                    "session": session.id(),
+                    "resumed": session.is_resume(),
+                    "workspace": workspace.display().to_string(),
+                    "tools": tools.is_some(),
+                })
+                .to_string(),
+            );
+        }
+
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // A new process group, rooted at this child, so `kill` can signal every descendant
@@ -258,6 +289,19 @@ impl Worker for ClaudeWorker {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                // The one failure that never reaches `run_reader`, so it has to say so here —
+                // a transcript that stops after the header looks like a hung agent rather than
+                // a binary that was never there.
+                if let Some(t) = transcript.as_mut() {
+                    t.write_line(
+                        &serde_json::json!({
+                            "type": "symphony_run_end",
+                            "exit": "spawn failed",
+                            "stderr": e.to_string(),
+                        })
+                        .to_string(),
+                    );
+                }
                 let state: SharedState = Arc::new((
                     Mutex::new(Inner {
                         outcome: Some(Outcome::Failed {
@@ -288,17 +332,19 @@ impl Worker for ClaudeWorker {
 
         {
             let state = Arc::clone(&state);
-            std::thread::spawn(move || run_reader(child, stdout, stderr, state, pid, max_turns));
+            std::thread::spawn(move || {
+                run_reader(child, stdout, stderr, state, pid, max_turns, transcript)
+            });
         }
 
         Arc::new(ClaudeRun { state, pid, sent_term: AtomicBool::new(false) })
     }
 }
 
-/// Runs on its own thread for the life of one attempt. Reads stdout, updates shared progress
-/// and outcome as events arrive, drains stderr on a second thread so a chatty child cannot
-/// deadlock on a full pipe, then reaps the process and fills in a verdict if the stream never
-/// gave one.
+/// Runs on its own thread for the life of one attempt. Reads stdout, copies every line to the
+/// transcript, updates shared progress and outcome as events arrive, drains stderr on a second
+/// thread so a chatty child cannot deadlock on a full pipe, then reaps the process and fills in
+/// a verdict if the stream never gave one.
 fn run_reader(
     mut child: Child,
     stdout: ChildStdout,
@@ -306,6 +352,7 @@ fn run_reader(
     state: SharedState,
     pid: i32,
     max_turns_per_session: u32,
+    mut transcript: Option<TranscriptWriter>,
 ) {
     let stderr_thread = std::thread::spawn(move || drain_capped(stderr));
 
@@ -314,8 +361,14 @@ fn run_reader(
     let mut saw_valid_line = false;
 
     for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        let line = line.trim();
+        let Ok(raw) = line else { break };
+        // Before the parse and before the trim: a line this module cannot read is exactly the
+        // one someone will want to look at later, and so is the whitespace it arrived with.
+        if let Some(t) = transcript.as_mut() {
+            t.write_line(&raw);
+        }
+
+        let line = raw.trim();
         if line.is_empty() {
             continue;
         }
@@ -377,6 +430,26 @@ fn run_reader(
 
     let status = child.wait();
     let stderr_tail = stderr_thread.join().unwrap_or_default();
+
+    // Two things the stream itself never carries, appended in its own shape so a reader can
+    // parse the whole file uniformly: how the process actually exited, and whatever it said on
+    // stderr — which on a crash is usually the only explanation there is, and which until now
+    // reached nothing but a log line that had already scrolled away.
+    if let Some(t) = transcript.as_mut() {
+        let exit = match &status {
+            Ok(s) => s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            Err(e) => format!("wait failed: {e}"),
+        };
+        t.write_line(
+            &serde_json::json!({
+                "type": "symphony_run_end",
+                "exit": exit,
+                "turns": turns,
+                "stderr": stderr_tail,
+            })
+            .to_string(),
+        );
+    }
 
     let mut g = state.0.lock().unwrap();
     if g.outcome.is_none() {
@@ -605,7 +678,7 @@ mod tests {
         // The two disagree on purpose, so this test can only pass by reading the right one.
         let ws = tmp_workspace("done");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let p = h.progress();
@@ -627,7 +700,7 @@ mod tests {
         // long tool call reads as silent.
         let ws = tmp_workspace("events");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -643,7 +716,7 @@ mod tests {
         // number; the number would be wrong by the turn count, so the honest report is none.
         let ws = tmp_workspace("no-total");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -657,7 +730,7 @@ mod tests {
     fn a_symphony_outcome_continue_marker_is_parsed_from_the_final_text() {
         let ws = tmp_workspace("continue");
         let w = ClaudeWorker::new(fixture("explicit_continue.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -671,7 +744,7 @@ mod tests {
     fn a_crash_with_no_result_event_fails_rather_than_hanging_or_inferring_done() {
         let ws = tmp_workspace("crash");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         let outcome = wait_for_finish(&h);
         assert!(
@@ -686,7 +759,7 @@ mod tests {
     fn a_partial_trailing_line_is_skipped_not_fatal_to_the_supervisor() {
         let ws = tmp_workspace("partial");
         let w = ClaudeWorker::new(fixture("partial_trailing_line.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         // The point under test is that a malformed final line does not panic or hang the
         // reader thread — it still reaches a verdict (Failed, since no result event arrived).
@@ -700,7 +773,7 @@ mod tests {
     fn killing_a_process_that_ignores_sigterm_forces_it_and_it_is_actually_gone() {
         let ws = tmp_workspace("silence");
         let w = ClaudeWorker::new(fixture("silence.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         // Give the script time to install its SIGTERM trap and write its own pid before we
         // try to kill it.
@@ -736,7 +809,7 @@ mod tests {
         ] {
             let ws = tmp_workspace(flag.trim_start_matches('-'));
             let w = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
-            let h = w.spawn(&issue(), &ws, 0, &session, None);
+            let h = w.spawn(&issue(), &ws, 0, &session, None, None);
             wait_for_finish(&h);
 
             let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
@@ -764,7 +837,7 @@ mod tests {
         }
 
         let w = ClaudeWorker::new(fixture("dump_env.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
         wait_for_finish(&h);
 
         let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
@@ -784,7 +857,7 @@ mod tests {
         // first and report Continue rather than waiting for (or trusting) the CLI's own exit.
         let ws = tmp_workspace("budget");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 1);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -798,14 +871,91 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_run_leaves_a_readable_transcript_of_everything_the_parser_dropped() {
+        let ws = tmp_workspace("transcript");
+        let root = ws.join("transcripts");
+        let t = crate::transcript::Transcripts::new(&root, 1 << 20, 10).unwrap();
+        let log = t.open("run-1").unwrap();
+        let path = log.path().to_path_buf();
+
+        let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 2, &fresh_session(), None, Some(log));
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+
+        // The reader thread owns the writer, so the file is only certainly complete once the
+        // run is reaped — which `wait_for_finish` plus the run-end line below establishes.
+        let text = std::fs::read_to_string(&path).expect("the transcript must be readable");
+
+        // Everything the parser has no use for, which is the whole point.
+        assert!(text.contains(r#""subtype":"init""#), "system event missing");
+        assert!(text.contains("cargo test"), "tool call missing");
+        assert!(text.contains("114 passed"), "tool result missing");
+        assert!(text.contains("rate_limit_event"), "rate limit event missing");
+        assert!(
+            text.contains("this line is not JSON at all"),
+            "an unparseable line is the one most worth still having"
+        );
+        // And the two facts the stream never carries at all.
+        assert!(text.contains("symphony_run_start"), "dispatch header missing");
+        assert!(text.contains(r#""attempt":2"#), "the header must name the attempt");
+        assert!(text.contains("symphony_run_end"), "exit status missing");
+
+        // Every line but the deliberately broken one must still parse, so a reader can treat
+        // the file as JSONL rather than guessing.
+        for line in text.lines().filter(|l| l.starts_with('{')) {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("transcript line is not JSON: {line} ({e})"));
+        }
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_run_with_no_transcript_behaves_exactly_as_it_did_before() {
+        // The degrade path: transcripts off, or a file that could not be opened. It must cost
+        // the record and nothing else.
+        let ws = tmp_workspace("no-transcript");
+        let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
+
+        assert_eq!(wait_for_finish(&h), Outcome::Done);
+        assert_eq!(h.progress().turns, 2);
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
     fn a_missing_binary_reports_agent_not_found_immediately() {
         let ws = tmp_workspace("missing-bin");
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None);
 
         let outcome = wait_for_finish(&h);
         assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }));
         assert_eq!(h.kill(100), KillResult::AlreadyDone);
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn a_run_that_never_started_still_says_so_in_its_transcript() {
+        // `run_reader` never gets a thread on this path, so without an explicit line here the
+        // transcript would stop after the header and read as a hung agent.
+        let ws = tmp_workspace("spawn-fail");
+        let t = crate::transcript::Transcripts::new(&ws.join("transcripts"), 1 << 20, 10).unwrap();
+        let log = t.open("run-1").unwrap();
+        let path = log.path().to_path_buf();
+
+        let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, Some(log));
+        assert!(matches!(
+            wait_for_finish(&h),
+            Outcome::Failed { class: ErrorClass::AgentNotFound, .. }
+        ));
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("symphony_run_start"));
+        assert!(text.contains("spawn failed"), "got: {text}");
 
         std::fs::remove_dir_all(&ws).ok();
     }

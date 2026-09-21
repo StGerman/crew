@@ -22,7 +22,7 @@ the published snapshot with a `status` client in front of it.
 ## Commands
 
 ```bash
-cargo test                                 # 152 unit + 41 integration
+cargo test                                 # 164 unit + 48 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -54,6 +54,12 @@ that might write state you do not want kept. `SYMPHONY_TASKS_ROOT=/tmp/tasks` do
 for the `~/.claude/tasks` projection, so a smoke run's demo issues (`iss-001`, `MT-601`, ...)
 don't land in your real Claude Code task list. `RUST_LOG=symphony_cc=debug` raises the log
 level; logs always go to stderr, because under `--tui` the alternate screen owns stdout.
+
+Every run's raw event stream lands under `<workspace.root>/.transcripts/`, one `.jsonl` per
+run, and the `dispatched` log line names the file. That is the first thing to reach for when
+asked what a run actually did — `jq -c 'select(.type=="assistant")' <file>` for the turns,
+`grep symphony_run_end` for how it exited. Tune or switch it off under `[transcripts]`; the
+bounds there are what make it safe to leave on.
 
 Headless runs now create real `git worktree`s under `workspace.root` (default
 `.symphony/workspaces`, gitignored) against `workspace.repo` (default `.`) and real files
@@ -226,6 +232,23 @@ real install produces no `result` at all — reports `None`, stored as NULL, and
 dashboard's `(+N uncounted)` tally rather than as a zero or an estimate. Schema v3 dropped the
 totals recorded before this; they were unrelated to the real cost, not a rough version of it.
 
+**Every run leaves a transcript** ([src/transcript.rs](src/transcript.rs)). The reader copies
+each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it
+— so the `system`, `rate_limit_event` and tool-call lines it drops, and the lines it could not
+parse at all, are still there afterwards — then appends how the process exited and what it said
+on stderr. The path is on the run row (`Store::run`, `runs_for`) and in the dispatch log line
+and the TUI detail pane, so "show me what run X did" needs no knowledge of the layout. Three
+things there are load-bearing and each looks removable: writes are **unbuffered, one per line**,
+because a block-buffered transcript reproduces the exact defect that caused the wrong diagnosis
+this exists to prevent; the root sits **beside** the worktrees rather than inside one, because a
+worktree is a git checkout the agent commits from *and* is deleted when its ticket goes
+terminal, which is the moment the transcript becomes worth reading; and `prune` is handed the
+paths of runs still in `running`, because a **stalled** run stops writing by definition, so its
+file ages past the newest `keep_runs` while the process behind it is still alive — pruning it
+would lose the transcript of the run most likely to need one and leave the writer on an
+orphaned inode. Best-effort like the projector: a transcript that cannot be opened costs a
+post-mortem, never a dispatch.
+
 `Tracker` stays a read kernel; the *write* half lives on a separate trait,
 `TrackerWrites` ([src/broker/writes.rs](src/broker/writes.rs)), whose only caller is the broker
 ([src/broker/](src/broker/)). `GithubTracker` implements both over one credential that never
@@ -317,13 +340,14 @@ tried, where that address came from, and the way out.
 
 ## Invariants
 
-Each of these closes a defect found in the original spec — bar the last nine, which came from
-dogfooding this orchestrator against its own backlog: two from the first review, two from putting
-an operator surface on top of the same state, one from issue #1's acceptance criterion made
-executable, one from the first live dispatch, one from the review of that one, and two from
-putting a client in front of that operator surface — and each has
-a test that fails without it. Several only fail in
-the exact scenario they were written for, so a regression here can pass a casual `cargo test`
+Each of these closes a defect found in the original spec. The later rows came instead from
+dogfooding this orchestrator against its own backlog: the first review, the operator surface
+built over the same state, issue #1's acceptance criterion made executable, the first live
+dispatch and the review that followed it, the client put in front of that operator surface, and
+making a finished run diagnosable.
+
+Every row has a test that fails without its mechanism. Several of those tests only fail in the
+exact scenario they were written for, so a regression here can pass a casual `cargo test`
 reading — check the named test is still meaningful, not just still green.
 
 | Invariant | Mechanism | Guard test |
@@ -349,6 +373,7 @@ reading — check the named test is still meaningful, not just still green.
 | "No daemon" is never confused with "daemon said no" | `StatusError` splits a refused connection from a refused request, and names the address and its source in both | `a_closed_port_reads_as_no_daemon_rather_than_a_refused_request` |
 | The branch an operator is sent to is the one git checked out | `Workspace::branch_for` is the same naming function `prepare` uses, not a second spelling of it | `the_branch_the_snapshot_publishes_is_the_one_prepare_checks_out` |
 | The published branch never names a ref that is gone or was never this run's | `Store::set_branch` persists what `prepare` returned and is cleared exactly when `Removed::branch_deleted` says cleanup deleted it — never recomputed from `identifier`, which `Store::ensure` can rename after dispatch | `the_published_branch_is_the_one_prepare_recorded_not_one_recomputed_from_the_current_identifier` |
+| Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the
@@ -377,8 +402,8 @@ The backlog is GitHub Issues on this repository, labelled `agent` — which is e
 
 Every seam symphony-cc needs to dispatch against its own backlog now has a real
 implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`
-(`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`), and the tool broker
-(`[broker]`, on by default). The broker is on by default where the worker is not, because the
+(`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`), the tool broker
+(`[broker]`, on by default) and run transcripts (`[transcripts]`, likewise). The broker is on by default where the worker is not, because the
 two switches mean opposite things: `worker.kind` decides whether an agent runs at all, while
 the broker only decides whether an agent that is already running has a *scoped, logged* way to
 do what it could otherwise do ambiently. Turning it off removes the audit trail, not the

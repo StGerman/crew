@@ -33,6 +33,7 @@ use symphony_cc::store::Store;
 use symphony_cc::tracker::Tracker;
 use symphony_cc::tracker::fake::FakeTracker;
 use symphony_cc::tracker::github::{GithubTracker, UreqHttp};
+use symphony_cc::transcript::Transcripts;
 use symphony_cc::tui::{Ui, UiAction};
 use symphony_cc::worker::Worker;
 use symphony_cc::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
@@ -181,6 +182,26 @@ async fn main() -> anyhow::Result<()> {
         (Arc::new(FakeTracker::demo()), Arc::new(FakeWrites::new()))
     };
 
+    // Best-effort, like the projector: a root that cannot be created costs post-mortems, not
+    // dispatch. Defaults beside the worktrees rather than inside one — see `TranscriptsConfig`.
+    let transcripts = if cfg.transcripts.enabled {
+        let root = cfg.transcripts.root_in(&ws_root);
+        match Transcripts::new(&root, cfg.transcripts.max_bytes_per_run, cfg.transcripts.keep_runs)
+        {
+            Ok(t) => {
+                tracing::info!(root = %root.display(), keep = cfg.transcripts.keep_runs, "recording run transcripts");
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!(root = %root.display(), error = %e, "transcript root unavailable; runs will leave no record on disk");
+                None
+            }
+        }
+    } else {
+        tracing::info!("transcripts disabled by config; runs will leave no record on disk");
+        None
+    };
+
     let broker = if cfg.broker.enabled {
         start_broker(&cfg, writes, clock.clone())
     } else {
@@ -217,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
     let mut sched =
         Scheduler::new(cfg, clock.clone(), store, tracker, worker, workspace, projector);
     sched.set_broker(broker);
+    sched.set_transcripts(transcripts);
 
     let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
     let (act_tx, mut act_rx) = mpsc::unbounded_channel::<UiAction>();

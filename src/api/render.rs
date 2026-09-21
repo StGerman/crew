@@ -187,6 +187,11 @@ pub fn issue(r: &Row) -> String {
     // The branch outlives the worktree, so it is listed even when the directory is gone —
     // that is the state a reviewer most often finds an issue in.
     field("branch", r.branch.clone().unwrap_or_else(|| NONE.into()));
+    // Listed for the same reason as the branch, and with the same always-present shape: the
+    // transcript is what a post-mortem reads, and it is written beside the worktrees precisely
+    // so it survives the directory being cleaned up. A row rendered without it would leave an
+    // operator guessing whether transcripts are off or the run simply never wrote one.
+    field("transcript", r.transcript.clone().unwrap_or_else(|| NONE.into()));
     if let Some(ws) = &r.workspace {
         field("workspace", ws.clone());
     }
@@ -319,6 +324,27 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use crate::worker::TokenUsage;
+
+    /// The whole point of a transcript is that it is readable after the run is over, so the
+    /// surface an operator actually types has to name it — a path that only reaches `--json`
+    /// is the `jq` recipe the status client exists to replace.
+    #[test]
+    fn the_detail_view_names_the_transcript_of_a_finished_run() {
+        let mut r = row("MT-7", Phase::Released);
+        r.transcript = Some("/tmp/.transcripts/MT-7-1770000000000-abc.jsonl".into());
+        let out = issue(&r);
+        assert!(
+            out.contains("/tmp/.transcripts/MT-7-1770000000000-abc.jsonl"),
+            "the detail view must name the transcript path:\n{out}"
+        );
+
+        let mut none = row("MT-8", Phase::Released);
+        none.transcript = None;
+        assert!(
+            issue(&none).contains("transcript"),
+            "a run without a transcript still says so, rather than omitting the field"
+        );
+    }
 
     fn row(identifier: &str, phase: Phase) -> Row {
         Row {
@@ -471,6 +497,7 @@ mod tests {
                     turns: 3,
                     in_tok: None,
                     out_tok: None,
+                    transcript: None,
                 },
                 RunRecord {
                     run_id: "run-1".into(),
@@ -482,6 +509,7 @@ mod tests {
                     turns: 6,
                     in_tok: Some(9_000),
                     out_tok: Some(1_500),
+                    transcript: None,
                 },
             ],
             ..row("MT-7", Phase::Released)
@@ -524,6 +552,7 @@ mod tests {
                     turns: 12,
                     in_tok: None,
                     out_tok: None,
+                    transcript: None,
                 },
                 RunRecord {
                     run_id: "run-8".into(),
@@ -535,6 +564,7 @@ mod tests {
                     turns: 20,
                     in_tok: Some(130_400),
                     out_tok: Some(5_110),
+                    transcript: None,
                 },
             ],
             ..row("MT-1", Phase::Running)

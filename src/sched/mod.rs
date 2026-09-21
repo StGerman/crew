@@ -22,6 +22,7 @@ use crate::model::{ErrorClass, Issue, Outcome, Phase, session_id, worktree_key};
 use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RunRecord, Store};
 use crate::tracker::{Tracker, TrackerError};
+use crate::transcript::Transcripts;
 use crate::worker::{Progress, RunHandle, Session, TokenUsage, Worker};
 use crate::workspace::Workspace;
 
@@ -55,6 +56,9 @@ struct Running {
     handle: Arc<dyn RunHandle>,
     started: Mono,
     workspace: PathBuf,
+    /// Where this run's raw stream is being written, if anywhere. Kept here so retention can
+    /// be told which files belong to a live run — see [`Transcripts::prune`].
+    transcript: Option<PathBuf>,
     last_progress: Progress,
     last_progress_at: Mono,
     /// Tracker state when this run began, to tell real progress from spinning.
@@ -97,6 +101,9 @@ pub struct Row {
     pub branch: Option<String>,
     /// This issue's most recent runs, newest first, at most [`RUNS_PER_ISSUE`].
     pub runs: Vec<RunRecord>,
+    /// The most recent run's transcript, so "show me what this issue did" is one path away
+    /// from the dashboard rather than a layout someone has to know.
+    pub transcript: Option<String>,
 }
 
 /// Immutable view published to observers. The TUI renders this and never touches the store,
@@ -135,6 +142,10 @@ pub struct Scheduler {
     /// `None` when the broker could not start, or the operator turned it off. Dispatch carries
     /// on either way — an agent without tracker tools is a degrade, not a failure.
     broker: Option<Arc<Broker>>,
+    /// `None` when transcripts are off or their root could not be created. Same contract as
+    /// the broker and the projector: a run with no record on disk, never a run that did not
+    /// happen.
+    transcripts: Option<Transcripts>,
     running: HashMap<String, Running>,
     /// Latest issue snapshot seen for each id, for display and routing checks.
     seen: HashMap<String, Issue>,
@@ -166,6 +177,7 @@ impl Scheduler {
             workspace,
             projector,
             broker: None,
+            transcripts: None,
             running: HashMap::new(),
             seen: HashMap::new(),
             no_progress: HashMap::new(),
@@ -185,6 +197,12 @@ impl Scheduler {
 
     pub fn broker(&self) -> Option<&Arc<Broker>> {
         self.broker.as_ref()
+    }
+
+    /// Attach a transcript root. A setter for the same reason `set_broker` is one: optional by
+    /// nature, and every caller that does not set it is correct without it.
+    pub fn set_transcripts(&mut self, transcripts: Option<Transcripts>) {
+        self.transcripts = transcripts;
     }
 
     pub fn running_count(&self) -> usize {
@@ -816,7 +834,19 @@ impl Scheduler {
                 Session::New(id)
             }
         };
-        self.store.start_run(self.clock.as_ref(), &run_id, &issue.id, session.id())?;
+        // Opened before the process exists, like the claim and the session name, and for a
+        // reason specific to this one: a run that dies in its first second is exactly the run
+        // someone will want the bytes from, so the file and the record of where it went both
+        // have to predate the thing that might die.
+        let transcript = self.transcripts.as_ref().and_then(|t| t.open(&run_id));
+        let transcript_path = transcript.as_ref().map(|t| t.path().to_path_buf());
+        self.store.start_run(
+            self.clock.as_ref(),
+            &run_id,
+            &issue.id,
+            session.id(),
+            transcript_path.as_deref(),
+        )?;
 
         // Opened before the worker exists, for the same reason the claim and the session name
         // are: the token has to be inside the config file the child reads at startup, so it
@@ -840,6 +870,7 @@ impl Scheduler {
             attempt,
             &session,
             broker_session.as_ref().map(|s| s.endpoint()),
+            transcript,
         );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
@@ -856,6 +887,7 @@ impl Scheduler {
             session = session.id(),
             resumed = session.is_resume(),
             tools = broker_session.is_some(),
+            transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
             "dispatched"
         );
 
@@ -868,11 +900,21 @@ impl Scheduler {
                 handle,
                 started: now,
                 workspace: prepared.path,
+                transcript: transcript_path,
                 last_progress: Progress::default(),
                 last_progress_at: now,
                 _broker: broker_session,
             },
         );
+
+        // After the insert, so the run just dispatched is among the protected paths. Retention
+        // runs at dispatch rather than on a timer because that is the only moment a new file
+        // appears, and a timer would be a second thing to reason about on the tick.
+        if let Some(t) = &self.transcripts {
+            let live: Vec<PathBuf> =
+                self.running.values().filter_map(|r| r.transcript.clone()).collect();
+            t.prune(&live);
+        }
         Ok(())
     }
 
@@ -892,6 +934,8 @@ impl Scheduler {
         for run in self.store.recent_runs(RUNS_PER_ISSUE)? {
             history.entry(run.issue_id.clone()).or_default().push(run);
         }
+        // For issues with no live run: the last transcript is what a post-mortem starts from.
+        let transcripts = self.store.latest_transcripts()?;
 
         let mut rows = Vec::new();
         for st in &states {
@@ -924,6 +968,9 @@ impl Scheduler {
                 // ref cleanup later deleted still exists.
                 branch: st.branch.clone(),
                 runs,
+                transcript: run
+                    .and_then(|r| r.transcript.as_ref().map(|p| p.display().to_string()))
+                    .or_else(|| transcripts.get(&st.issue_id).cloned()),
             });
         }
 

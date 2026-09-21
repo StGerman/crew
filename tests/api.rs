@@ -83,6 +83,7 @@ impl Harness {
             agent: AgentConfig::default(),
             worker: Default::default(),
             api: Default::default(),
+            transcripts: Default::default(),
         };
 
         let clock = Arc::new(FakeClock::new());

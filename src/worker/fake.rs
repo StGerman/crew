@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
 use crate::clock::{Clock, Mono};
 use crate::model::{ErrorClass, Issue, Outcome};
+use crate::transcript::TranscriptWriter;
 
 #[derive(Debug, Clone)]
 pub struct Script {
@@ -113,6 +114,7 @@ impl Worker for FakeWorker {
         _attempt: u32,
         session: &Session,
         tools: Option<&ToolEndpoint>,
+        transcript: Option<TranscriptWriter>,
     ) -> Arc<dyn RunHandle> {
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
         self.endpoints.lock().unwrap().entry(issue.id.clone()).or_default().push(tools.cloned());
@@ -124,6 +126,50 @@ impl Worker for FakeWorker {
             .get(&issue.id)
             .cloned()
             .unwrap_or_else(|| self.default_script.lock().unwrap().clone());
+
+        // The fake honours the transcript contract at a coarser grain: it has no reader thread
+        // to stream from, so it writes the whole scripted run up front. That is enough to keep
+        // the seam exercised by the scheduler's own tests, which is the point — a transcript
+        // only the real worker ever produces is a transcript the scheduler can silently stop
+        // wiring up.
+        if let Some(mut t) = transcript {
+            t.write_line(
+                &serde_json::json!({
+                    "type": "symphony_run_start",
+                    "issue": issue.identifier,
+                    "issue_id": issue.id,
+                    "session": session.id(),
+                    "resumed": session.is_resume(),
+                    "tools": tools.is_some(),
+                })
+                .to_string(),
+            );
+            for turn in 1..=script.turns {
+                t.write_line(
+                    &serde_json::json!({
+                        "type": "assistant",
+                        "message": {
+                            "content": [{"type": "text", "text": format!("fake turn {turn}")}],
+                        },
+                    })
+                    .to_string(),
+                );
+            }
+            t.write_line(
+                &serde_json::json!({
+                    "type": "symphony_run_end",
+                    "scripted_outcome": script.outcome.label(),
+                    // Totals arrive once, on the terminal event, the way the real CLI reports
+                    // them — a fixture that put them on every turn would model the very
+                    // double-count the nullable columns exist to undo.
+                    "usage": {
+                        "input_tokens": script.tokens.input,
+                        "output_tokens": script.tokens.output,
+                    },
+                })
+                .to_string(),
+            );
+        }
 
         Arc::new(FakeRun {
             clock: Arc::clone(&self.clock),
@@ -240,7 +286,7 @@ mod tests {
     fn a_run_finishes_only_once_the_clock_reaches_its_duration() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
 
         assert!(h.finished().is_none());
         c.advance_ms(3_999);
@@ -253,7 +299,7 @@ mod tests {
     fn progress_accumulates_turns_as_time_passes_and_totals_appear_only_at_completion() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
 
         let p0 = h.progress();
         c.advance_ms(3_999);
@@ -271,7 +317,7 @@ mod tests {
         // total, and the fake must not hand the scheduler one the real thing never would.
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
 
         c.advance_ms(2_000);
         assert_eq!(h.kill(1_000), KillResult::Stopped);
@@ -284,7 +330,7 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
 
         c.advance_ms(1_000);
         let frozen = h.progress();
@@ -298,7 +344,7 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
 
         c.advance_ms(5_000);
         assert_eq!(h.kill(1_000), KillResult::Forced);
@@ -309,7 +355,7 @@ mod tests {
     fn killing_an_already_finished_run_is_a_no_op() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None);
+        let h = w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None);
         c.advance_ms(4_000);
         assert_eq!(h.kill(1_000), KillResult::AlreadyDone);
         assert_eq!(h.finished(), Some(Outcome::Done), "verdict must not be rewritten");

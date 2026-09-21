@@ -46,3 +46,11 @@ max_calls_per_issue = 100
 [api]
 enabled = false
 bind = "127.0.0.1:8787"
+
+# Per-run transcripts of the agent's raw event stream (src/transcript.rs). Defaults to
+# `.transcripts` under the workspace root — beside the worktrees, never inside one, because a
+# worktree is deleted when its ticket goes terminal.
+[transcripts]
+enabled = true
+max_bytes_per_run = 8388608
+keep_runs = 100

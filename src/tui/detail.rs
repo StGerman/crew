@@ -57,6 +57,9 @@ pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
     if let Some(ws) = &r.workspace {
         lines.push(field("workspace", ws.clone()));
     }
+    if let Some(t) = &r.transcript {
+        lines.push(field("transcript", t.clone()));
+    }
     if let Some(url) = &r.url {
         lines.push(field("url", url.clone()));
     }
