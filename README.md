@@ -1,12 +1,13 @@
-# crew
+# crewd
 
 **Point it at your backlog. It works the tickets and hands you pull requests.**
 
-crew is a daemon that polls an issue tracker, opens a git worktree per issue, runs a coding
+crewd is a daemon that polls an issue tracker, opens a git worktree per issue, runs a coding
 agent in it, and reconciles what comes back. You review pull requests. Nothing it does merges.
 
-> The crate and binary are still named `symphony-cc`; the repository is `crew` and the rename
-> is tracked in [#45](https://github.com/StGerman/crew/issues/45).
+> The crate and binary are still named `symphony-cc`. Renaming them to `crewd` (the daemon)
+> and `crewctl` (the client) is tracked in
+> [#45](https://github.com/StGerman/crewd/issues/45); the repository has been renamed already.
 
 ## Why this exists
 
@@ -14,7 +15,7 @@ Running one coding agent is easy. Running several, unattended, against a real ba
 it falls apart — and it falls apart in specific, repeatable ways:
 
 - **An agent that says "done" is not done.** Two branches cut from the same base can each pass
-  the test suite alone and fail together. crew rebases a finished branch onto the current base
+  the test suite alone and fail together. crewd rebases a finished branch onto the current base
   and re-runs your checks *before* it believes the verdict. A failure goes back to the agent
   with the output in hand.
 - **A loop with no brake spends your whole budget.** Continuation, retry, review round-trips
@@ -40,8 +41,8 @@ is not going to grow one.
 You need Rust, `git`, and the [Claude Code CLI](https://claude.com/claude-code) logged in.
 
 ```bash
-git clone https://github.com/StGerman/crew.git
-cd crew
+git clone https://github.com/StGerman/crewd.git
+cd crewd
 cargo build
 cargo run -- --tui
 ```
@@ -73,14 +74,14 @@ GitHub App gives the daemon its own identity, so its writes are distinguishable 
 it can hold `contents: write` while being denied merge entirely.
 
 This is **not wired up yet** — the config keys land with
-[#64](https://github.com/StGerman/crew/issues/64), and a one-click `init` that registers the
-App for you is [#65](https://github.com/StGerman/crew/issues/65). `GITHUB_TOKEN` is the
+[#64](https://github.com/StGerman/crewd/issues/64), and a one-click `init` that registers the
+App for you is [#65](https://github.com/StGerman/crewd/issues/65). `GITHUB_TOKEN` is the
 supported path today and will stay supported.
 
 Two findings from setting one up by hand, since they shape how dispatch works: an App's
 `[bot]` account **cannot be an issue assignee** outside GitHub's partner agent program, and a
 separate marker account does not help because a collaborator on a personal repository cannot be
-given read-only access. That is why the issues crew picks up are marked by a **label** rather
+given read-only access. That is why the issues crewd picks up are marked by a **label** rather
 than by assignment.
 
 ### Requirements, in full
@@ -96,8 +97,8 @@ than by assignment.
 ## Contributing
 
 **Work is picked up from GitHub Issues on this repository, labelled `agent`** — not from a plan
-file. That is the same mechanism described above, pointed at itself: crew's own backlog is
-worked by crew.
+file. That is the same mechanism described above, pointed at itself: crewd's own backlog is
+worked by crewd.
 
 Because of that, most development here is done by an agent rather than by a person at a
 keyboard, and the documentation is split to match:

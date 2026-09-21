@@ -21,8 +21,10 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-The crate and binary are `symphony-cc` and the repository is `crew`; the rename to `crewd` and
-`crewctl` is #45 and has not happened. Use the name the code uses.
+The repository is `crewd`, but the crate and binary are still `symphony-cc`: the rename to
+`crewd` and `crewctl` is #45 and has not happened. So are `SYMPHONY_DB`, `.symphony/`,
+`symphony.toml`, `SYMPHONY_OUTCOME` and `mcp__symphony__*`. Use the name the code uses, not the
+one the repository has.
 
 Slices 1–6 are complete and green: a deterministic core with a fake behind every external
 seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
