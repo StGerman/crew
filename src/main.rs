@@ -9,13 +9,20 @@
 //! surfaces reach it the same way — a message on a channel, never a handle. The dashboard's
 //! messages are fire-and-forget; the API's carry a `oneshot` to answer on, because an HTTP
 //! client is owed a response and a keypress is not.
+//!
+//! `status` is the third surface and the odd one out: it is a *client* of a daemon in another
+//! process, so it returns before any of the setup below. It opens no store, prepares no
+//! worktree and needs no tracker credential — an operator asking what is running must not be
+//! able to disturb what is running, and a second process touching `symphony.db` while the
+//! daemon holds it would be exactly that.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
-use symphony_cc::api::{Api, Command};
+use clap::{Parser, Subcommand};
+use symphony_cc::api::client::{Client, endpoint};
+use symphony_cc::api::{Api, Command, render};
 use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
@@ -36,8 +43,9 @@ use tokio::sync::{mpsc, watch};
 #[derive(Parser, Debug)]
 #[command(name = "symphony-cc", about = "Tracker-driven orchestrator for coding agents")]
 struct Args {
-    /// Path to the TOML config.
-    #[arg(short, long, default_value = "symphony.toml")]
+    /// Path to the TOML config. Global, so `status` can read `[api] bind` out of the same
+    /// file the daemon was started with, written on either side of the subcommand.
+    #[arg(short, long, default_value = "symphony.toml", global = true)]
     config: PathBuf,
 
     /// Show the terminal dashboard. Without it the service runs headless and logs.
@@ -49,9 +57,30 @@ struct Args {
     max_ticks: Option<u64>,
 
     /// Serve the ops HTTP API on this address, overriding `[api]` in the config. A
-    /// non-loopback address still needs `api.allow_public`.
-    #[arg(long, value_name = "ADDR")]
+    /// non-loopback address still needs `api.allow_public`. Under `status`, the address to
+    /// query instead of the one to serve.
+    #[arg(long, value_name = "ADDR", global = true)]
     api: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Print what a running daemon is doing, read from its ops API.
+    Status(StatusArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct StatusArgs {
+    /// One issue in full, by dispatch id or tracker identifier. Omit for every issue.
+    #[arg(value_name = "ISSUE")]
+    issue: Option<String>,
+
+    /// Print the API's JSON verbatim. For a script; the rendered form is for a person.
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -66,6 +95,12 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "symphony_cc=info".into()),
         )
         .init();
+
+    // Before the config is even loaded: `status` is a client, and a daemon-side preflight
+    // failure is not its business to report.
+    if let Some(Cmd::Status(status)) = &args.command {
+        std::process::exit(run_status(&args, status));
+    }
 
     let cfg = Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
@@ -286,6 +321,41 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.join();
     }
     Ok(())
+}
+
+/// `symphony-cc status`: ask a running daemon what it is doing, and say so plainly.
+///
+/// Returns a process exit code rather than a `Result`, because the two failures an operator
+/// cares about are not the same event. "No daemon is listening" is the answer to a question a
+/// script may legitimately be asking; rendering it through `anyhow` would bury a message
+/// written to be read in a `Error:` chain written to be debugged.
+///
+/// `1` for anything that stopped this from printing a snapshot. The message on stderr is what
+/// distinguishes the cases; see `StatusError`.
+fn run_status(args: &Args, status: &StatusArgs) -> i32 {
+    let client = Client::new(endpoint(args.api.as_deref(), &args.config));
+    let addr = client.endpoint().addr.clone();
+
+    let rendered = match (&status.issue, status.json) {
+        (None, false) => client.snapshot().map(|s| render::snapshot(&s, &addr)),
+        (Some(key), false) => client.issue(key).map(|r| render::issue(&r)),
+        (None, true) => client.raw("/api/v1/snapshot"),
+        (Some(key), true) => client.raw(&format!("/api/v1/issues/{key}")),
+    };
+
+    match rendered {
+        Ok(text) => {
+            print!("{}", text);
+            if !text.ends_with('\n') {
+                println!();
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 /// Bind the broker's loopback listener and start serving.

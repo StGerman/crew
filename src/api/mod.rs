@@ -44,6 +44,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
+pub mod client;
+pub mod render;
+
 use crate::config::ApiConfig;
 use crate::sched::{Row, Snapshot};
 
