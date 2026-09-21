@@ -17,12 +17,13 @@ Slices 1–6 are complete and green: a deterministic core with a fake behind eve
 seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
 Issues tracker, then a real `claude -p` worker, then a host-side MCP tool broker that lets the
 agent write to its own ticket without ever holding the credential, and an HTTP ops API over
-the published snapshot with a `status` client in front of it.
+the published snapshot with a `status` client in front of it for a person and an MCP server in
+front of it for the agent supervising the daemon.
 
 ## Commands
 
 ```bash
-cargo test                                 # 209 unit + 76 integration
+cargo test                                 # 220 unit + 85 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -36,6 +37,9 @@ cargo run -- --max-ticks 20                # headless smoke run, then exit
 cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
 cargo run -- status                        # what a running daemon is doing, read over that API
 cargo run -- status MT-649                 # one issue in full: phase, attempt, turns, cost, branch
+cargo run -- --mcp 127.0.0.1:8788          # the same four routes as MCP tools, for a supervising agent
+claude mcp add --scope local --transport http symphony_ops http://127.0.0.1:8788/ops
+                                           # ...and how that agent gets them. Local scope, never user
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
@@ -410,6 +414,43 @@ and so the likelier reading) versus a daemon that answered and refused. Collapsi
 what has somebody restart a daemon that was never down, so each message names the address
 tried, where that address came from, and the way out.
 
+The ops MCP server ([src/api/mcp.rs](src/api/mcp.rs)) is the same four routes for an *agent*
+supervising the daemon — the one driving a dogfooding session, a watchdog later — which the
+`status` client left on the wrong side of the gap it closed: an agent had to spawn the CLI and
+parse a rendering built to read well to a person. One tool per route (`snapshot`, `issue`,
+`refresh`, `unquarantine`) and nothing else; each runs the *same* `Api` method the HTTP router
+runs and frames the same `Response` as a tool result, a status of 400 or more becoming
+`isError: true`. So it holds an `Api` and no `Store`, and it cannot express an authority the
+HTTP API lacks — new authority is a separate decision from new transport, and this module has
+nowhere to put one. `api.mcp_enabled` or `--mcp <addr>`, off by default, loopback unless
+`api.allow_public`, through the same `resolve_bind` the HTTP API uses. The transport is the
+broker's hand-rolled server made generic over `McpService` rather than copied or replaced with
+`rmcp`; `src/broker/server.rs`'s module doc records what that cost.
+
+That transport spends a thread per connection, and this is the first listener on it whose
+address an operator chooses — `allow_public` can put it on a routable interface, where a client
+that connects and then says nothing would hold a thread for free. `broker::server::Limits` is
+the HTTP API's `READ_TIMEOUT` arriving here: a deadline on a request that has begun and never
+ends, deliberately *split* from the idle wait between requests so keep-alive still works (the
+real client depends on it), and a cap on connections in flight, because a client that
+reconnects rather than dribbles pays nothing for a deadline. The broker's own listener gets
+both for free and keeps a separate count, so a flood at the public address cannot starve a
+dispatched run of its tools.
+
+**This server must never reach a dispatched agent**, and that is the thing to hold when
+touching any of this. The broker gives a worker authority scoped to one issue; this is scoped
+to the whole daemon, and a worker that could call `unquarantine` could clear its own quarantine
+and re-dispatch itself, defeating the verdict, `max_turns_per_issue` and `parked_state`
+together. What enforces it is wiring, not a check on the tool: the ops server binds **its own
+listener** (never the broker's — a shared one routed by prefix would put these tools at the
+exact `host:port` every worker is handed), answers only at `/ops`, and is never passed to
+`Broker`, whose `open` writes the only `--mcp-config` a worker receives.
+`a_dispatched_worker_is_not_handed_the_ops_tools` reads that file from a real session and
+connects to what it names. What wiring cannot enforce is the operator's own `claude` config:
+the worker runs without `--strict-mcp-config` on purpose, so it inherits *user-scope* MCP
+servers. Register this one in the supervising agent's **local or project scope, never user
+scope**, or every worker inherits it and the wiring is bypassed by configuration.
+
 
 **Delivery** ([src/sched/delivery.rs](src/sched/delivery.rs), behind the `Forge` and
 `Publisher` traits in [src/forge/](src/forge/)) is what happens after a run reports `Done`,
@@ -456,8 +497,9 @@ dogfooding this orchestrator against its own backlog: the first review, the oper
 built over the same state, issue #1's acceptance criterion made executable, the first live
 dispatch and the review that followed it, the client put in front of that operator surface,
 making a finished run diagnosable, a closed ticket whose worktree outlived it, an
-orchestrator that ran inside its own worktree, and two branches that were each green
-alone and broken together.
+orchestrator that ran inside its own worktree, the agent supervising the daemon getting
+the same surface as data, and two branches that were each green alone and broken
+together.
 
 Every row has a test that fails without its mechanism. Several of those tests only fail in the
 exact scenario they were written for, so a regression here can pass a casual `cargo test`
@@ -488,11 +530,20 @@ reading — check that the named test is still meaningful, not just still green.
 | The branch an operator is sent to is the one git checked out | `Workspace::branch_for` is the same naming function `prepare` uses, not a second spelling of it | `the_branch_the_snapshot_publishes_is_the_one_prepare_checks_out` |
 | The published branch never names a ref that is gone or was never this run's | `Store::set_branch` persists what `prepare` returned and is cleared exactly when `Removed::branch_deleted` says cleanup deleted it — never recomputed from `identifier`, which `Store::ensure` can rename after dispatch | `the_published_branch_is_the_one_prepare_recorded_not_one_recomputed_from_the_current_identifier` |
 | Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
+| The ops tools never reach a dispatched worker | the ops MCP server has its own listener and its own path, and is never passed to `Broker`, whose `open` writes the only `--mcp-config` a worker is handed | `a_dispatched_worker_is_not_handed_the_ops_tools` |
+| An operator's question cannot disturb the daemon it asks about | `OpsMcp` holds an `Api` — a `watch::Receiver` and a `Command` sender, no `Store` — and a read sends no `Command` at all | `an_ops_read_cannot_disturb_the_daemon_it_asks_about` |
+| A wedged or hostile client cannot exhaust the MCP transport | `broker::server::Limits`: a deadline on a request that has started, split from the idle wait so keep-alive survives, plus a per-listener cap on connections in flight, released by RAII | `a_client_that_never_finishes_its_request_cannot_hold_a_connection_thread`, `a_flood_of_connections_is_refused_rather_than_served_without_bound` |
 | A parked run's worktree is reclaimed once its ticket closes | `sweep_parked` re-reads parked ids on a bounded cadence, unparks what it cleans, and clears the published branch when cleanup deleted the ref | `a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart`, `sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks`, `a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes` |
 | One orchestrator cannot nest its worktrees inside another's | `GitWorktreeWorkspace::new` refuses a `repo` or `root` inside a linked worktree of the repository; `remove` prunes registrations beneath the path it deletes, then `branch -d`s their branches with the merged check intact | `an_orchestrator_cannot_be_started_inside_another_runs_worktree`, `removing_a_worktree_reclaims_the_worktrees_nested_inside_it_from_shared_metadata` |
 | A branch is not handed off ungated against the base it will merge into | a `Done` moves the run into `gating` with its claim held; `GitGate` rebases first and runs the commands on the rebased tree | `a_done_verdict_is_gated_in_its_own_worktree_before_the_claim_is_released`, `the_branch_is_rebased_onto_the_base_before_the_gate_runs_on_the_rebased_tree` |
 | A rebase conflict is a human's problem, not a silent failure | the rebase is aborted and the issue parks `Blocked` naming the paths, in `last_error` | `a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths`, `a_conflicting_rebase_is_aborted_and_names_the_conflicted_paths` |
 | The gate cannot become a runaway | a failing command is a `Continue` that carries its output, bounded by `gate.max_failures` consecutive failures → `Blocked`, and by `gate.timeout_ms` per gate | `a_failing_gate_continues_the_run_with_the_failing_output_in_hand`, `repeated_gate_failures_escalate_to_blocked_rather_than_looping`, `a_gate_that_hangs_is_killed_at_the_timeout_and_counts_as_a_failure` |
+| A gate cannot outrun the concurrency limit | `global_slots` and `state_slots` count `gating` as well as `running`, because a gate is a build on this host and the claim is held across it | `a_gating_run_still_holds_its_concurrency_slot_so_gates_cannot_accumulate` |
+| A gate cannot hide how far its run got | the turn count is checkpointed as the entry leaves `running`, since `observe_progress` walks only that map while the run row stays open for the whole gate | `a_run_entering_the_gate_checkpoints_its_turn_count_before_it_leaves_running` |
+| A gate command that can never start is refused at startup | `preflight` rejects a blank program name as well as an empty argv, so a typo costs one error instead of every run of the issue | `a_gate_that_could_never_escalate_or_never_start_is_rejected` |
+| The gate's own git subprocesses are killable | every `git` the gate runs goes through `spawn_tracked`, so `pgid` is set for the rebase and not only for a configured command | `killing_a_gate_during_the_rebase_step_stops_the_git_subprocess_instead_of_leaving_it_running` |
+| A gate that cannot start reports rather than panics | a supervising thread the OS refuses becomes `Verdict::Failed`, which is what `Gate::start` promises; a panic here would strand the claim until the next startup | `a_gate_whose_supervising_thread_cannot_be_spawned_reports_failed_instead_of_panicking` |
+| A brief describes the tree the agent will find | `Verdict::Failed` carries `on_base`, false for every step before the rebase and for a rebase that was aborted | `a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_rebased` |
 | A red gate cannot rest on `Done` | delivery reads CI after every push and hands a failure back through the retry path with the failure in the prompt | `a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_run_does_not_rest_on_done` |
 | A review request that attached nobody is not a success | the request is followed by a read of `requested_reviewers` and `reviews`; a missing login hands off with the reason | `a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reported_as_a_failure` |
 | A settled review comment is not re-argued | verdicts are recorded by comment id, first one stands, and open threads are computed against that table | `each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and_is_not_re_argued` |

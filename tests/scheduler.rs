@@ -661,6 +661,60 @@ fn dispatch_and_finish(h: &mut Harness) -> PathBuf {
     ws
 }
 
+/// A gate is work on this machine, so it must occupy the slot its run occupied. Counting only
+/// `running` frees the slot the instant the agent exits, and a fast worker in front of a slow
+/// gate then starts another agent while the last one's suite is still compiling — `cargo test`
+/// processes accumulate with nothing bounding them, and `max_concurrent` stops describing what
+/// the host is actually running.
+#[test]
+fn a_gating_run_still_holds_its_concurrency_slot_so_gates_cannot_accumulate() {
+    let issues = vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(1))];
+    let mut h = harness(issues, |c| c.agent.max_concurrent = 1);
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    h.worker.set_default(Script::succeeds_in(1_000));
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "one slot, one agent");
+
+    // The same tick that moves the finished run into the gate also reaches `dispatch_new`.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1, "the gate has taken the run over");
+    assert_eq!(h.sched.running_count(), 0, "and the second issue must not have taken the slot");
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "still held, tick after tick");
+
+    // Once the gate is done the slot is genuinely free, or this would be a deadlock rather
+    // than a bound.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 0, "gate finished");
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "the freed slot is reused");
+}
+
+/// `observe_progress` only walks `running`, and the run row stays open for the whole gate — the
+/// long part of the run. Without a checkpoint taken as the entry leaves `running`, a hard kill
+/// during a gate has `recover()` close the row on the previous tick's figure, undercounting the
+/// attempt and charging the per-issue turn budget less than the agent actually spent.
+#[test]
+fn a_run_entering_the_gate_checkpoints_its_turn_count_before_it_leaves_running() {
+    let (mut h, _gate) = gated_harness(|_| {});
+    dispatch_and_finish(&mut h);
+    assert_eq!(h.sched.gating_count(), 1, "the gate has taken over");
+
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].ended_at.is_none(), "the run row is still open for the gate");
+    assert_eq!(
+        runs[0].turns, 3,
+        "the durable count must be what the agent finished on, not the last tick that saw it \
+         in `running`"
+    );
+}
+
 /// The guard for issue #21 at the scheduler: a `Done` is not applied until the gate has run in
 /// the run's own worktree, and the claim is held for the whole of that. Skip the gate and the
 /// fake records no start; release early and the phase reads `Released` while the gate is still
@@ -756,6 +810,7 @@ fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
     gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "cargo test".into(),
         output: "test a_thing ... FAILED\nassertion `left == right` failed".into(),
+        on_base: true,
     }));
     dispatch_and_finish(&mut h);
     h.clock.advance_ms(1_000);
@@ -785,6 +840,42 @@ fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
     assert!(output.contains("1 of 3"), "and how many tries are left: {output}");
 }
 
+/// The brief must describe the tree the agent will actually find. A base that will not
+/// resolve, and a rebase refused and therefore aborted, both leave the branch exactly where the
+/// agent left it — so a brief that says "the branch has been rebased, fix this on top of it"
+/// sends it looking for a state that does not exist. An agent that cannot reconcile the
+/// instruction with what it sees reports `Done` again unchanged, and the gate fails it again,
+/// which spends the `max_failures` allowance on a sentence rather than on the work.
+#[test]
+fn a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_rebased() {
+    let (mut h, gate) = gated_harness(|_| {});
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
+        step: "resolve base release-1.2".into(),
+        output: "cannot resolve rebase base `release-1.2`".into(),
+        on_base: false,
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+
+    // Delivery folded the gate's brief into `Feedback::Gate`; the fact under test is the same.
+    let brief = match &h.worker.feedback_for("iss-1")[1] {
+        Some(Feedback::Gate { output }) => output.clone(),
+        other => panic!("the continuation must be told why it exists, got {other:?}"),
+    };
+    assert!(
+        !brief.contains("has been rebased"),
+        "nothing was rebased, so the brief must not claim it was: {brief}"
+    );
+    assert!(
+        brief.contains("where you left it"),
+        "and must say where the work actually is: {brief}"
+    );
+    assert!(brief.contains("resolve base release-1.2"), "which step failed: {brief}");
+}
+
 /// The gate cannot be a runaway of its own: an agent that cannot make the suite pass gets
 /// `max_failures` consecutive tries and is then handed to a human, well inside the turn budget.
 #[test]
@@ -793,6 +884,7 @@ fn repeated_gate_failures_escalate_to_blocked_rather_than_looping() {
     gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "cargo clippy".into(),
         output: "error: unused variable".into(),
+        on_base: true,
     }));
 
     // First failure: a continuation.
@@ -833,8 +925,11 @@ fn a_passing_gate_resets_the_failure_streak() {
         c.gate.max_failures = 2;
         c.tracker.active_states = vec!["in progress".into(), "in review".into()];
     });
-    let failing = GateScript::passes_in(1_000)
-        .with_verdict(GateVerdict::Failed { step: "cargo test".into(), output: "boom".into() });
+    let failing = GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
+        step: "cargo test".into(),
+        output: "boom".into(),
+        on_base: true,
+    });
 
     gate.set_default(failing.clone());
     dispatch_and_finish(&mut h);
@@ -2266,6 +2361,7 @@ fn a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes
     gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "cargo test".into(),
         output: "test a_thing ... FAILED".into(),
+        on_base: true,
     }));
 
     // The agent finishes; the gate takes over; nothing has been pushed.

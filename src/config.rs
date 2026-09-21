@@ -40,6 +40,14 @@ pub const DEFAULT_API_BIND: &str = "127.0.0.1:8787";
 fn d_api_bind() -> String {
     DEFAULT_API_BIND.to_string()
 }
+/// Where the ops MCP server ([`crate::api::mcp`]) listens unless told otherwise. A different
+/// port from [`DEFAULT_API_BIND`] because it is a different listener by design — see that
+/// module on why the two operator surfaces, and the broker, never share one.
+pub const DEFAULT_MCP_BIND: &str = "127.0.0.1:8788";
+
+fn d_mcp_bind() -> String {
+    DEFAULT_MCP_BIND.to_string()
+}
 
 fn d_parked_sweep() -> u64 {
     300_000
@@ -237,14 +245,32 @@ pub struct ApiConfig {
     pub bind: String,
     /// Permit a non-loopback bind — a deliberate decision to expose the write endpoints to
     /// whatever can reach that interface, which is why it is a separate flag rather than an
-    /// inference from the address.
+    /// inference from the address. Governs `bind` and `mcp_bind` alike: they carry the same
+    /// two write actions.
     #[serde(default)]
     pub allow_public: bool,
+    /// The same four routes as MCP tools, for a supervising agent ([`crate::api::mcp`]). Off
+    /// by default like `enabled`, and independent of it: a daemon watched by a person needs the
+    /// HTTP API and a daemon watched by an agent needs this, and neither should have to carry
+    /// the other. **Never reachable by a dispatched worker** — see that module's doc for what
+    /// enforces it and for the one operator-side rule that has to hold.
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// `host:port` for the MCP server. Its own listener, never the HTTP API's and never the
+    /// broker's.
+    #[serde(default = "d_mcp_bind")]
+    pub mcp_bind: String,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
-        Self { enabled: false, bind: d_api_bind(), allow_public: false }
+        Self {
+            enabled: false,
+            bind: d_api_bind(),
+            allow_public: false,
+            mcp_enabled: false,
+            mcp_bind: d_mcp_bind(),
+        }
     }
 }
 
@@ -536,9 +562,21 @@ impl Config {
                         .into(),
                 ));
             }
-            if let Some(i) = self.gate.commands.iter().position(|c| c.is_empty()) {
+            // A blank program name is rejected here for the same reason an empty argv is, and it
+            // is the easier one to write by accident: `[[""]]` is a non-empty command whose
+            // program cannot be spawned, so it survives preflight and then fails every single
+            // run. Each failure is a `Continue` that sends the agent back to work on a
+            // configuration error it cannot see or fix, until `max_failures` blocks the issue.
+            // Startup is the only place this is cheap to say.
+            if let Some(i) = self
+                .gate
+                .commands
+                .iter()
+                .position(|c| c.first().is_none_or(|p| p.trim().is_empty()))
+            {
                 return Err(ConfigError::Invalid(format!(
-                    "gate.commands[{i}] is empty; each command is an argv like [\"cargo\", \"test\"]"
+                    "gate.commands[{i}] has no program to run; each command is an argv like \
+                     [\"cargo\", \"test\"]"
                 )));
             }
         }
@@ -641,7 +679,14 @@ mod tests {
         c.gate.max_failures = 3;
         c.gate.commands = vec![vec!["cargo".into(), "test".into()], vec![]];
         assert!(c.preflight().is_err(), "an empty argv cannot be exec'd");
-        c.gate.commands.pop();
+        // A command with a blank program is the same defect wearing a non-empty argv, and it is
+        // the one an operator writes by accident. Caught here it costs a startup error; missed,
+        // it costs every run of every issue until `max_failures` blocks each one.
+        c.gate.commands = vec![vec![String::new()]];
+        assert!(c.preflight().is_err(), "a blank program name cannot be exec'd either");
+        c.gate.commands = vec![vec!["   ".into(), "test".into()]];
+        assert!(c.preflight().is_err(), "nor can a program name that is only whitespace");
+        c.gate.commands = vec![vec!["cargo".into(), "test".into()]];
         assert!(c.preflight().is_ok());
         // Turning the gate off is the supported way to skip it.
         c.gate.enabled = false;

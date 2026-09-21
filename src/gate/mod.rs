@@ -52,7 +52,24 @@ pub enum Verdict {
     /// was refused (a dirty tree, most likely), or a command could not be started at all.
     /// `step` names which, and `output` is what it said — bounded, tail-first, because a
     /// failing `cargo test` puts its summary at the end.
-    Failed { step: String, output: String },
+    Failed {
+        step: String,
+        output: String,
+        /// Whether the branch is sitting on the base by the time this failed.
+        ///
+        /// False for every step that runs before the rebase — resolving the base, counting
+        /// commits — and for a rebase that was refused and therefore aborted. True only once
+        /// the rebase has completed, which is the case where a command failed *on the rebased
+        /// tree*. The scheduler needs the distinction because it tells the agent where its work
+        /// now sits: saying "the branch has been rebased, fix this on top of it" when nothing
+        /// was rebased describes a tree the agent will not find, and an agent that cannot
+        /// reconcile the instruction with what it sees tends to report `Done` again unchanged.
+        ///
+        /// Distinct from [`Verdict::Passed`]'s `rebased`, which answers a different question —
+        /// whether the rebase *moved* anything. A branch already on the base is `rebased:
+        /// false` there and `on_base: true` here.
+        on_base: bool,
+    },
 }
 
 /// A gate in flight. Dropping the handle does not stop the work — call [`GateHandle::kill`].
