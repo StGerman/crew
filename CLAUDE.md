@@ -68,6 +68,14 @@ projection failure degrades the run, it does not stop it — but they are real d
 state, not a simulation, so use the env overrides above when you just want to watch the
 scheduler and don't want the side effects.
 
+One thing the overrides do not cover: running the daemon from *inside* a worktree — which is
+what a dispatched agent's cwd is. `GitWorktreeWorkspace::new` refuses that at startup, because
+`workspace.repo = "."` there is a linked worktree and the worktrees a run would create register
+in the top-level checkout's shared `.git`, where the orchestrator owning it never recorded them
+(#29). The error names the way out: point `workspace.repo` at a throwaway clone and
+`workspace.root` beside it. Setting `SYMPHONY_DB` alone does not help — the litter was never
+in the store.
+
 ```bash
 GITHUB_TOKEN=$(gh auth token) cargo run -- --config symphony.github.toml --max-ticks 3
 ```
@@ -178,7 +186,18 @@ behind: `remove` deletes the worktree but only deletes the branch when git's own
 says it carries nothing `repo`'s HEAD does not already have, and `prepare` attaches to an
 existing branch that does carry commits rather than `-B`-resetting it. Cleanup is triggered by
 a ticket reaching a terminal state, and closing a ticket is not a decision to throw away the
-work done under it. `Prepared.branch` reports that name upwards so it reaches the dispatch log, and
+work done under it. That same merged check is what makes nesting expensive: an orchestrator
+started inside another run's worktree (the agent for #24 did, to exercise the API) creates
+worktrees whose branches sit on the *parent's* commit and so are never merged into `master`,
+and `branch -d` keeps every one of them. `new` therefore refuses when `repo` or `root`
+resolves inside a linked worktree of the repository — refused rather than redirected to the
+top-level root, because redirecting would still leave registrations and branches the owning
+orchestrator does not know about — and `remove` reconciles what earlier binaries left: it
+collects the worktrees registered beneath the path before `worktree remove --force` deletes
+their directories, prunes the stale registrations (first — `-d` refuses a branch a registered
+worktree still pins), then gives each nested branch the same `-d` the parent's own gets. A
+nested branch carrying commits is kept and named in a `warn` log line, with what to run once
+its parent is merged; the merged check is not weakened for litter. `Prepared.branch` reports that name upwards so it reaches the dispatch log, and
 `Workspace::branch_for` — pure naming, like `path_for` — answers the same question for the
 snapshot. Naming rather than probing is what lets a *finished* run still report its branch,
 which is when a reviewer wants it; asking git per row per tick would put a subprocess on the
@@ -350,7 +369,8 @@ Each of these closes a defect found in the original spec. The later rows came in
 dogfooding this orchestrator against its own backlog: the first review, the operator surface
 built over the same state, issue #1's acceptance criterion made executable, the first live
 dispatch and the review that followed it, the client put in front of that operator surface,
-making a finished run diagnosable, and a closed ticket whose worktree outlived it.
+making a finished run diagnosable, a closed ticket whose worktree outlived it, and an
+orchestrator that ran inside its own worktree.
 
 Every row has a test that fails without its mechanism. Several of those tests only fail in the
 exact scenario they were written for, so a regression here can pass a casual `cargo test`
@@ -381,6 +401,7 @@ reading — check that the named test is still meaningful, not just still green.
 | The published branch never names a ref that is gone or was never this run's | `Store::set_branch` persists what `prepare` returned and is cleared exactly when `Removed::branch_deleted` says cleanup deleted it — never recomputed from `identifier`, which `Store::ensure` can rename after dispatch | `the_published_branch_is_the_one_prepare_recorded_not_one_recomputed_from_the_current_identifier` |
 | Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
 | A parked run's worktree is reclaimed once its ticket closes | `sweep_parked` re-reads parked ids on a bounded cadence, unparks what it cleans, and clears the published branch when cleanup deleted the ref | `a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart`, `sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks`, `a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes` |
+| One orchestrator cannot nest its worktrees inside another's | `GitWorktreeWorkspace::new` refuses a `repo` or `root` inside a linked worktree of the repository; `remove` prunes registrations beneath the path it deletes, then `branch -d`s their branches with the merged check intact | `an_orchestrator_cannot_be_started_inside_another_runs_worktree`, `removing_a_worktree_reclaims_the_worktrees_nested_inside_it_from_shared_metadata` |
 
 The three broker rows are one property in three places, and the middle one is the easy one to
 lose: a reviewer who sees `max_calls_per_run` will read it as the bound and delete the
