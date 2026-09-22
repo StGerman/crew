@@ -669,6 +669,22 @@ fn a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupt
     let first_sessions: Vec<_> =
         ["iss-1", "iss-2"].iter().map(|id| h.worker.sessions_for(id)[0].clone()).collect();
 
+    // Both issues arrive at the limit with history behind them. Without this the assertions
+    // below start and end at zero, so a scheduler that used the ordinary `release()` — which
+    // sets `attempt = 0, consecutive_fail = 0` — would satisfy them exactly as well as one that
+    // preserved the claim. The invariant is that the counters are *untouched*, and only a
+    // nonzero starting value can tell "untouched" apart from "reset".
+    for id in ["iss-1", "iss-2"] {
+        for _ in 0..2 {
+            h.sched
+                .store()
+                .record_failure(h.clock.as_ref(), id, ErrorClass::AgentCrash, "earlier", 99)
+                .unwrap();
+        }
+        let st = h.sched.store().get(id).unwrap().unwrap();
+        assert_eq!((st.attempt, st.consecutive_fail), (2, 2), "seeded history for {id}");
+    }
+
     // The interruption itself: both runs end on the rejected limit.
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
@@ -676,8 +692,8 @@ fn a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupt
 
     for id in ["iss-1", "iss-2"] {
         let st = h.sched.store().get(id).unwrap().unwrap();
-        assert_eq!(st.attempt, 0, "{id} must not be charged an attempt");
-        assert_eq!(st.consecutive_fail, 0, "{id} must not accrue the identical-failure streak");
+        assert_eq!(st.attempt, 2, "{id} must keep the attempt it was on, not be charged another");
+        assert_eq!(st.consecutive_fail, 2, "{id} must keep the identical-failure streak it had");
         assert!(!st.is_quarantined(), "{id} must not be quarantined");
         assert_eq!(st.phase, Phase::Released, "{id} must be dispatchable again, not parked");
     }
@@ -729,7 +745,9 @@ fn a_rate_limit_pause_does_not_disturb_runs_already_in_flight() {
                 resets_at: Some(h.clock.wall().0 / 1_000 + 60),
             }),
     );
-    // Still running when iss-1 is interrupted, and past the pause's own duration.
+    // Still running when iss-1 is interrupted, and finishing well inside the 60s pause — which
+    // is the point: the run ends first and the pause is still in force afterwards, so what the
+    // assertion below proves is that a pause outlives the runs it did not interrupt.
     h.worker.script("iss-2", Script::succeeds_in(10_000));
 
     h.sched.tick().unwrap();

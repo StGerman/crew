@@ -482,7 +482,12 @@ impl Scheduler {
             // the ordinary outcome below rather than risking a pause nothing ever lifts.
             if let Some(sig) = r.handle.rate_limit() {
                 let now = self.clock.wall().0;
-                let resets_at_ms = sig.resets_at.map(|secs| secs.saturating_mul(1_000));
+                // `checked_mul`, not `saturating_mul`: saturating turns a nonsense value into
+                // `i64::MAX`, which is always in the future, so the one shape of malformed input
+                // most likely to appear — an absurd number of seconds — would pause dispatch
+                // for the life of the process. Overflow is `None` here, which is the same
+                // "cannot be trusted" case as a missing value and takes the fallback below.
+                let resets_at_ms = sig.resets_at.and_then(|secs| secs.checked_mul(1_000));
                 match resets_at_ms {
                     Some(at) if at > now => {
                         self.pause_for_rate_limit(&issue_id, &r, sig.kind, at)?;
@@ -1292,7 +1297,13 @@ impl Scheduler {
                 None => {}
             }
 
-            self.launch(&issue, 0, None)?;
+            // `st.attempt`, not a literal 0. For a genuinely new issue these are the same,
+            // but a rate-limit pause releases the claim with the attempt preserved
+            // (`release_for_rate_limit`) and sends the issue back through here — so a hard 0
+            // would tell the worker and the transcript this is a first attempt while the store
+            // still says it is the Nth, which is exactly the disagreement the pause exists to
+            // avoid.
+            self.launch(&issue, st.attempt, None)?;
         }
         Ok(())
     }
