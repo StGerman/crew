@@ -76,13 +76,18 @@
 //!
 //! ## The transcript
 //!
-//! [`run_reader`] parses four things out of the stream and drops the rest. Everything it drops
-//! — `system`, `rate_limit_event`, every tool call the agent made — is what a post-mortem
-//! actually wants, so the same loop copies each line verbatim to this run's
-//! [`TranscriptWriter`] *before* deciding whether the parser has a use for it. Lines that fail
-//! to parse are written too: a stream the parser choked on is the single most interesting one
-//! to still have afterwards. See [`crate::transcript`] for the retention bounds and for why the
-//! file does not live in the worktree.
+//! [`run_reader`] parses a handful of things out of the stream and drops the rest. Everything
+//! it drops — `system`, every tool call the agent made — is what a post-mortem actually wants,
+//! so the same loop copies each line verbatim to this run's [`TranscriptWriter`] *before*
+//! deciding whether the parser has a use for it. Lines that fail to parse are written too: a
+//! stream the parser choked on is the single most interesting one to still have afterwards. See
+//! [`crate::transcript`] for the retention bounds and for why the file does not live in the
+//! worktree.
+//!
+//! `rate_limit_event` is the one exception: a rejected one is not a per-run detail but the
+//! scheduler's cue that the whole account is throttled, so [`parse_rate_limit_event`] reads it
+//! here rather than leaving it for a post-mortem (#37). It is still copied to the transcript
+//! like every other line.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -91,7 +96,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
+use super::{
+    KillResult, Progress, RateLimitSignal, RunHandle, Session, TokenUsage, ToolEndpoint, Worker,
+};
 use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict, looks_like_commit,
 };
@@ -159,6 +166,10 @@ struct Inner {
     progress: Progress,
     outcome: Option<Outcome>,
     verdicts: Vec<ReviewVerdict>,
+    /// Set when the stream carried a rejected `rate_limit_event` — see [`parse_rate_limit_event`].
+    /// Independent of `outcome`: the CLI still reports its own verdict (ordinarily `Failed`,
+    /// since the process exits with no explicit marker) alongside this.
+    rate_limit: Option<RateLimitSignal>,
     /// Set only once the child has been reaped (`Child::wait` returned). `kill` must not
     /// return before this is true — the caller deletes the workspace next.
     reaped: bool,
@@ -191,6 +202,10 @@ impl RunHandle for ClaudeRun {
 
     fn verdicts(&self) -> Vec<ReviewVerdict> {
         self.state.0.lock().unwrap().verdicts.clone()
+    }
+
+    fn rate_limit(&self) -> Option<RateLimitSignal> {
+        self.state.0.lock().unwrap().rate_limit.clone()
     }
 
     fn kill(&self, grace_ms: u64) -> KillResult {
@@ -427,6 +442,11 @@ fn run_reader(
                     break;
                 }
             }
+            Some("rate_limit_event") => {
+                if let Some(sig) = parse_rate_limit_event(&value) {
+                    state.0.lock().unwrap().rate_limit = Some(sig);
+                }
+            }
             Some("result") => {
                 let mut g = state.0.lock().unwrap();
                 // The one place totals come from. A budget cut or a kill never reaches here —
@@ -440,7 +460,7 @@ fn run_reader(
                 drop(g);
                 break;
             }
-            _ => {} // system/rate_limit_event/etc: nothing this module needs
+            _ => {} // system/etc: nothing this module needs
         }
     }
 
@@ -563,6 +583,25 @@ fn extract_usage(v: &serde_json::Value) -> Option<TokenUsage> {
             + get("cache_read_input_tokens"),
         output: get("output_tokens"),
     })
+}
+
+/// Reads `rate_limit_info` off a `rate_limit_event` line, when its `status` is `"rejected"`.
+/// Every other status is the CLI reporting where it stands, not that it stopped, and is not
+/// this module's to act on (#37 is scoped to a rejection).
+///
+/// `rateLimitType` is kept as whatever string the CLI sent rather than matched against a known
+/// set: a window name this crate has never seen must still carry its own `resetsAt` forward
+/// instead of being dropped as unrecognised. `resetsAt` itself is left as `Option` — a missing
+/// or unparseable value is the scheduler's cue to fall back to ordinary backoff rather than
+/// guess a pause length.
+fn parse_rate_limit_event(v: &serde_json::Value) -> Option<RateLimitSignal> {
+    let info = v.get("rate_limit_info")?;
+    if info.get("status").and_then(|s| s.as_str()) != Some("rejected") {
+        return None;
+    }
+    let kind = info.get("rateLimitType").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
+    let resets_at = info.get("resetsAt").and_then(|r| r.as_i64());
+    Some(RateLimitSignal { kind, resets_at })
 }
 
 fn extract_text(v: &serde_json::Value) -> Option<String> {
@@ -983,6 +1022,58 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// #37: a rejected rate limit is a separate signal from the CLI's own verdict, which stays
+    /// `Failed` here exactly as an ordinary crash would — the scheduler is what tells the two
+    /// apart, using `rate_limit()`.
+    #[test]
+    fn a_rejected_rate_limit_is_reported_alongside_the_crash_it_causes() {
+        let ws = tmp_workspace("rate-limited");
+        let w = ClaudeWorker::new(fixture("rate_limited.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+
+        let outcome = wait_for_finish(&h);
+        assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }));
+        assert_eq!(
+            h.rate_limit(),
+            Some(RateLimitSignal { kind: "five_hour".into(), resets_at: Some(1_789_981_200) })
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn an_allowed_rate_limit_event_is_not_mistaken_for_a_rejected_one() {
+        let allowed = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour", "resetsAt": 1_789_981_200_i64},
+        });
+        assert_eq!(parse_rate_limit_event(&allowed), None);
+    }
+
+    #[test]
+    fn an_unrecognised_rate_limit_window_still_pauses_on_its_own_resets_at() {
+        let v = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "brand_new_window", "resetsAt": 42},
+        });
+        assert_eq!(
+            parse_rate_limit_event(&v),
+            Some(RateLimitSignal { kind: "brand_new_window".into(), resets_at: Some(42) })
+        );
+    }
+
+    #[test]
+    fn a_rejected_rate_limit_with_no_resets_at_reports_none_rather_than_guessing() {
+        let v = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour"},
+        });
+        assert_eq!(
+            parse_rate_limit_event(&v),
+            Some(RateLimitSignal { kind: "five_hour".into(), resets_at: None })
+        );
     }
 
     #[test]

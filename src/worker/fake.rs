@@ -11,7 +11,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{KillResult, Progress, RunHandle, Session, TokenUsage, ToolEndpoint, Worker};
+use super::{
+    KillResult, Progress, RateLimitSignal, RunHandle, Session, TokenUsage, ToolEndpoint, Worker,
+};
 use crate::clock::{Clock, Mono};
 use crate::model::{ErrorClass, Feedback, Issue, Outcome, ReviewVerdict};
 use crate::transcript::TranscriptWriter;
@@ -29,6 +31,10 @@ pub struct Script {
     /// Review verdicts reported at completion, the way the real worker parses them off the
     /// final message. Empty by default: most scripted runs were never handed a review.
     pub verdicts: Vec<ReviewVerdict>,
+    /// Reported at completion like `verdicts`, the way the real worker's `rate_limit()` only
+    /// ever answers once the process has exited. `None` by default: most scripted runs were
+    /// never handed a rate limit.
+    pub rate_limit: Option<RateLimitSignal>,
 }
 
 impl Script {
@@ -40,6 +46,7 @@ impl Script {
             outcome: Outcome::Done,
             silent_after_ms: None,
             verdicts: vec![],
+            rate_limit: None,
         }
     }
 
@@ -53,6 +60,14 @@ impl Script {
         self
     }
 
+    /// Simulates the CLI's own account-wide rate limit rejecting this run (#37). Orthogonal to
+    /// `outcome`, the same as the real worker: the CLI still reports its ordinary verdict — set
+    /// `with_outcome` alongside this the way a real rejection reads as `Failed`.
+    pub fn with_rate_limit(mut self, sig: RateLimitSignal) -> Self {
+        self.rate_limit = Some(sig);
+        self
+    }
+
     pub fn stalls_after(ms: u64) -> Self {
         Self {
             duration_ms: u64::MAX, // never completes on its own
@@ -61,6 +76,7 @@ impl Script {
             outcome: Outcome::Failed { class: ErrorClass::Stall, msg: "no output".into() },
             silent_after_ms: Some(ms),
             verdicts: vec![],
+            rate_limit: None,
         }
     }
 }
@@ -254,6 +270,12 @@ impl RunHandle for FakeRun {
     /// its own power. A killed run's verdicts, like its totals, never arrive.
     fn verdicts(&self) -> Vec<ReviewVerdict> {
         if self.completed() { self.script.verdicts.clone() } else { Vec::new() }
+    }
+
+    /// Reported the same way as `verdicts`: only once the run has completed under its own
+    /// power, mirroring the real worker's stream-driven signal.
+    fn rate_limit(&self) -> Option<RateLimitSignal> {
+        if self.completed() { self.script.rate_limit.clone() } else { None }
     }
 
     fn finished(&self) -> Option<Outcome> {

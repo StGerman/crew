@@ -27,7 +27,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 226 unit + 90 integration
+cargo test                                 # 232 unit + 93 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -286,12 +286,31 @@ real install produces no `result` at all — reports `None`, stored as NULL, and
 dashboard's `(+N uncounted)` tally rather than as a zero or an estimate. Schema v3 dropped the
 totals recorded before this; they were unrelated to the real cost, not a rough version of it.
 
+A rejected `rate_limit_event` is the one other thing `run_reader` parses off the stream, added
+for #29's sibling defect (#37): three ordinary-looking dispatches interrupted by the same
+account-wide limit each quarantined on their own, after three retries inside ninety seconds
+against a five-hour reset nineteen minutes away — the exact "quarantine a ticket a bad token had
+nothing to do with" mistake `TrackerError::class()`'s doc already warns against, on the worker
+side of the process instead of the tracker side. `ClaudeWorker::rate_limit()` surfaces the
+signal independently of `Outcome` — the CLI still reports its own verdict, ordinarily `Failed`,
+since the process exits with no explicit marker — and `harvest_finished` checks it *before*
+`apply_outcome` even sees the outcome: a run interrupted this way charges no attempt and no
+quarantine streak, and releases the claim with `Store::release_for_rate_limit` rather than
+`release`, which is what lets the issue resume at the attempt and session it was already on
+rather than looking like a fresh start. What pauses is dispatch itself — `Scheduler::rate_limited`
+checked once per tick, between `sweep_parked` and the two dispatch steps — until the CLI's own
+`resetsAt`, published on `Snapshot::rate_limit_pause` so `status` reads "waiting on a five-hour
+limit until 09:00Z" instead of showing an idle daemon with no explanation. A `resetsAt` the
+scheduler cannot trust — missing, or already behind the clock — degrades to the ordinary
+`Failed` path rather than risking a pause nothing ever lifts, the same failure mode a clock skew
+would otherwise turn into a silent, permanent stop.
+
 **Every run leaves a transcript** ([src/transcript.rs](src/transcript.rs)). The reader copies
 each `stream-json` line to a per-run file *before* deciding whether the parser has a use for it
-— so the `system`, `rate_limit_event` and tool-call lines it drops, and the lines it could not
-parse at all, are still there afterwards — then appends how the process exited and what it said
-on stderr. The path is on the run row (`Store::run`, `runs_for`) and in the dispatch log line
-and the TUI detail pane, so "show me what run X did" needs no knowledge of the layout. Three
+— so the `system` and tool-call lines it drops, and the lines it could not parse at all, are
+still there afterwards — then appends how the process exited and what it said on stderr. The
+path is on the run row (`Store::run`, `runs_for`) and in the dispatch log line and the TUI
+detail pane, so "show me what run X did" needs no knowledge of the layout. Three
 things there are load-bearing and each looks removable: writes are **unbuffered, one per line**,
 because a block-buffered transcript reproduces the exact defect that caused the wrong diagnosis
 this exists to prevent; the root sits **beside** the worktrees rather than inside one, because a
@@ -581,6 +600,8 @@ reading — check that the named test is still meaningful, not just still green.
 | A new head is not left unreviewed | `set_delivery_pr` resets `review_requested` when the head changes, not only when the pull request number does, so the request-then-verify runs again for every push | `a_new_head_on_the_same_pull_request_needs_its_review_requested_again`, `a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed` |
 | An acceptance names a commit the branch carries, never a bare acknowledgement | `extract_verdicts` drops an `accepted:` whose detail is not commit-shaped; `verified_verdicts` checks the rest with `Publisher::carries` as the run reports `Done`, before the gate's rebase rewrites the shas | `an_acceptance_that_names_no_commit_leaves_its_comment_outstanding`, `an_acceptance_is_believed_only_for_a_commit_the_delivered_branch_carries`, `an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_outstanding` |
 | A rebased branch updates its pull request, and never overwrites someone else's work | `publish` pushes `--force-with-lease`; a lease failure is classified on its own as permanent, naming the remote branch that moved, so it stays distinct from a stale-base rejection | `a_rebased_branch_is_pushed_over_its_own_history_but_never_over_someone_elses` |
+| An account-wide rate limit is not any one issue's failure | a rejected `rate_limit_event` releases the claim (`Store::release_for_rate_limit`, not `release`) without charging an attempt or the identical-failure streak, and pauses dispatch itself until `resets_at` rather than scheduling a per-issue retry | `a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupted` |
+| A rate limit cannot stop dispatch on a clock the host disagrees with | a `resets_at` that is missing or already behind the clock falls through to the ordinary `Failed` path instead of pausing on a value that would never lift | `a_rate_limit_with_no_usable_resets_at_degrades_to_ordinary_backoff` |
 
 The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
 way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop

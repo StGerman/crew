@@ -107,6 +107,26 @@ impl Session {
     }
 }
 
+/// What a run's stream reported about an account-wide rate limit, read off a `rate_limit_event`
+/// whose `status` is `"rejected"` (#37). Orthogonal to [`Outcome`]: the CLI still reports its
+/// ordinary verdict for a run cut short this way — typically [`Outcome::Failed`], since the
+/// process exits with no explicit marker — and this is the separate signal that tells the
+/// scheduler *why*, so it can treat the interruption as account-wide rather than as this issue's
+/// own failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitSignal {
+    /// Whatever the CLI named the window that rejected the request — `"five_hour"`,
+    /// `"seven_day"`, or a name this crate has never seen. Kept as the raw string rather than
+    /// parsed into an enum, so an unrecognised window still carries its own `resets_at` instead
+    /// of being dropped as unrecognised.
+    pub kind: String,
+    /// Unix seconds the window resets at, when the event carried one that parsed as a number.
+    /// `None` is the scheduler's cue to fall back to ordinary backoff rather than pause
+    /// dispatch — the same degrade a `resets_at` already in the past gets, since a clock the
+    /// host disagrees with must not be able to stop dispatch permanently.
+    pub resets_at: Option<i64>,
+}
+
 /// A run in flight. Dropping the handle does not stop the work — call [`RunHandle::kill`].
 pub trait RunHandle: Send + Sync {
     fn progress(&self) -> Progress;
@@ -118,6 +138,12 @@ pub trait RunHandle: Send + Sync {
     /// settled.
     fn verdicts(&self) -> Vec<ReviewVerdict> {
         Vec::new()
+    }
+    /// Set once the run's stream reported a rejected, account-wide rate limit. Defaulted to
+    /// `None` rather than required alongside `finished()`: only [`crate::worker::claude`] ever
+    /// sees this on the wire, and every other implementation is correct reporting nothing.
+    fn rate_limit(&self) -> Option<RateLimitSignal> {
+        None
     }
     /// Request termination and wait, bounded, for the run to actually stop.
     ///

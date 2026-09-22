@@ -289,6 +289,27 @@ impl Store {
         Ok(())
     }
 
+    /// Release a claim exactly as an account-wide rate limit found it: `phase` back to
+    /// `released`, but `attempt`, `consecutive_fail` and `last_fail_class` all left alone.
+    ///
+    /// [`Store::release`] zeroes those columns, which is right after a `Done` or `Blocked`
+    /// verdict but wrong here — the run this interrupted did not fail on its own account, so
+    /// the next attempt must not look like a fresh start (#37). No retry row to clear either:
+    /// this is only ever called on an issue the claim just found `running`, which cannot also
+    /// hold one.
+    pub fn release_for_rate_limit(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET phase = 'released', updated_at = ?2 WHERE issue_id = ?1",
+            params![issue_id, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
     /// Record a failure and decide whether it quarantines the issue.
     ///
     /// Permanent classes quarantine immediately. Retryable classes quarantine after
@@ -755,6 +776,25 @@ mod tests {
         assert!(!s.claim(&c, "id-1").unwrap(), "second claim must fail");
         s.release(&c, "id-1").unwrap();
         assert!(s.claim(&c, "id-1").unwrap());
+    }
+
+    /// #37: unlike `release`, this must not zero `attempt`/`consecutive_fail` — an account-wide
+    /// rate limit is not this issue's failure, so the issue must resume at the attempt it was
+    /// already on rather than looking like a fresh start.
+    #[test]
+    fn releasing_for_a_rate_limit_leaves_the_attempt_and_failure_streak_untouched() {
+        let (s, c) = setup();
+        s.record_failure(&c, "id-1", ErrorClass::AgentCrash, "boom", 5).unwrap();
+        assert!(s.claim(&c, "id-1").unwrap());
+
+        s.release_for_rate_limit(&c, "id-1").unwrap();
+
+        let st = s.get("id-1").unwrap().unwrap();
+        assert_eq!(st.phase, Phase::Released, "the claim is released");
+        assert_eq!(st.attempt, 1, "the attempt this issue was already on survives");
+        assert_eq!(st.consecutive_fail, 1);
+        assert_eq!(st.last_fail_class, Some(ErrorClass::AgentCrash));
+        assert!(s.claim(&c, "id-1").unwrap(), "and the issue is dispatchable again");
     }
 
     #[test]
