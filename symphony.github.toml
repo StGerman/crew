@@ -10,7 +10,7 @@
 [tracker]
 kind = "github"
 owner = "StGerman"
-repo = "symphony-cc"
+repo = "crewd"
 active_states = ["open"]
 terminal_states = ["closed"]
 required_labels = ["agent"]

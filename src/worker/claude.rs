@@ -51,7 +51,7 @@
 //! servers, and this repo commits a [`.mcp.json`] that gives every dispatched agent
 //! rust-analyzer. The broker is added to what the operator configured, not substituted for it.
 //!
-//! [`.mcp.json`]: https://github.com/StGerman/symphony-cc/blob/master/.mcp.json
+//! [`.mcp.json`]: https://github.com/StGerman/crewd/blob/master/.mcp.json
 //!
 //! ## The outcome convention
 //!

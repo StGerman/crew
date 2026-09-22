@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 first edit. It is the authoritative statement of how code is written here, with a check named
 for every rule. This file covers what the system is and why; that file covers how to change it.
 
+Development here is done by agents, so this file is the working surface: every command, every
+switch, every trap. [README.md](README.md) is for a person deciding whether to adopt this and
+what it is for — intention, installation, contribution. Commands belong here, not there.
+
 ## What this is
 
 `symphony-cc` is a tracker-driven orchestrator for Claude Code agents: a daemon that polls an
@@ -16,6 +20,11 @@ found several concrete defects in that design.
 
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
+
+The repository is `crewd`, but the crate and binary are still `symphony-cc`: the rename to
+`crewd` and `crewctl` is #45 and has not happened. So are `SYMPHONY_DB`, `.symphony/`,
+`symphony.toml`, `SYMPHONY_OUTCOME` and `mcp__symphony__*`. Use the name the code uses, not the
+one the repository has.
 
 Slices 1–6 are complete and green: a deterministic core with a fake behind every external
 seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
