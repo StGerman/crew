@@ -123,6 +123,10 @@ pub enum AppFileError {
     Parse { path: PathBuf, message: String },
     #[error("{path} has no {field}")]
     Missing { path: PathBuf, field: &'static str },
+    /// A placeholder left in a template: GitHub ids start at 1, so a zero would pass startup and
+    /// fail only at the first mint.
+    #[error("{path} has {field} = 0; GitHub ids are positive")]
+    Zero { path: PathBuf, field: &'static str },
     #[error("private key {path} is not readable: {source}")]
     KeyRead { path: PathBuf, source: std::io::Error },
     #[error("private key {path} is not an RSA private key: {message}")]
@@ -145,13 +149,16 @@ impl GithubAppFile {
             .map_err(|source| AppFileError::Read { path: path.clone(), source })?;
         let raw: RawAppFile = toml::from_str(&text)
             .map_err(|e| AppFileError::Parse { path: path.clone(), message: e.to_string() })?;
-        let missing = |field| AppFileError::Missing { path: path.clone(), field };
-        let app_id = raw.app_id.ok_or_else(|| missing("app_id"))?;
-        let installation_id = raw.installation_id.ok_or_else(|| missing("installation_id"))?;
-        let key = raw
-            .private_key_path
-            .filter(|p| !p.trim().is_empty())
-            .ok_or_else(|| missing("private_key_path"))?;
+        let positive = |value: Option<u64>, field| match value {
+            None => Err(AppFileError::Missing { path: path.clone(), field }),
+            Some(0) => Err(AppFileError::Zero { path: path.clone(), field }),
+            Some(v) => Ok(v),
+        };
+        let app_id = positive(raw.app_id, "app_id")?;
+        let installation_id = positive(raw.installation_id, "installation_id")?;
+        let key = raw.private_key_path.filter(|p| !p.trim().is_empty()).ok_or_else(|| {
+            AppFileError::Missing { path: path.clone(), field: "private_key_path" }
+        })?;
         let key = expand_home(Path::new(&key));
         // Relative to the file that names it, not to wherever the daemon happened to start.
         let private_key_path = match path.parent() {
@@ -468,6 +475,10 @@ pub(crate) mod tests {
         assert!(err("installation_id = 1\nprivate_key_path = \"k\"").ends_with("has no app_id"));
         assert!(err("app_id = 1\nprivate_key_path = \"k\"").ends_with("has no installation_id"));
         assert!(err("app_id = 1\ninstallation_id = 2").ends_with("has no private_key_path"));
+        let zero = "app_id = 0\ninstallation_id = 2\nprivate_key_path = \"k\"";
+        assert!(err(zero).ends_with("has app_id = 0; GitHub ids are positive"));
+        let zero = "app_id = 1\ninstallation_id = 0\nprivate_key_path = \"k\"";
+        assert!(err(zero).ends_with("has installation_id = 0; GitHub ids are positive"));
 
         std::fs::write(&path, "app_id = 1\ninstallation_id = 2\nprivate_key_path = \"k.pem\"")
             .unwrap();
