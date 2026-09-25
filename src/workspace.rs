@@ -258,6 +258,26 @@ impl PushCredentialFile {
     }
 }
 
+fn classify_push(remote: &str, branch: &str, text: &str) -> ForgeError {
+    if text.contains("stale info") {
+        // The lease failed: the remote branch carries something this repository never pushed.
+        // A real conflict, and the one case forcing must not resolve.
+        ForgeError::Permanent(format!(
+            "{remote}/{branch} has moved since it was last fetched; refusing to force over work \
+             this orchestrator did not push: {text}"
+        ))
+    } else if is_auth_refusal(text) {
+        // Reached only after `retry_on_auth` has already tried a fresh token, so a transient
+        // here would re-mint and re-push on every poll for a credential that stays refused.
+        ForgeError::Permanent(format!("{remote} refused the push credential: {text}"))
+    } else if text.contains("rejected") || text.contains("permission") || text.contains("denied") {
+        // Any other rejection will be rejected again; the rest is the network.
+        ForgeError::Permanent(text.to_string())
+    } else {
+        ForgeError::Transient(text.to_string())
+    }
+}
+
 /// What git prints when the remote refused the credential it sent: `Authentication failed` is
 /// git's own wording for a 401 over HTTPS, and `Invalid username or token` is GitHub's.
 fn is_auth_refusal(stderr: &str) -> bool {
@@ -707,25 +727,7 @@ impl Publisher for GitWorktreeWorkspace {
             drop(credential);
             Ok(pushed)
         };
-        self.retry_on_auth(push)?.map_err(|e| {
-            let text = e.to_string();
-            if text.contains("stale info") {
-                // The lease failed: the remote branch carries something this repository
-                // never pushed. A real conflict, and the one case forcing must not resolve.
-                ForgeError::Permanent(format!(
-                    "{remote}/{branch} has moved since it was last fetched; refusing to \
-                         force over work this orchestrator did not push: {text}"
-                ))
-            } else if text.contains("rejected")
-                || text.contains("permission")
-                || text.contains("denied")
-            {
-                // Any other rejection will be rejected again; the rest is the network.
-                ForgeError::Permanent(text)
-            } else {
-                ForgeError::Transient(text)
-            }
-        })?;
+        self.retry_on_auth(push)?.map_err(|e| classify_push(remote, branch, &e.to_string()))?;
         let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
             .map_err(|e| ForgeError::Transient(e.to_string()))?;
 
@@ -1635,6 +1637,18 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn an_authentication_refusal_that_survived_its_retry_is_permanent() {
+        let text = "git push failed: fatal: Authentication failed for 'https://github.com/o/r/'";
+        assert!(matches!(classify_push("origin", "crew/x", text), ForgeError::Permanent(_)));
+        let text = "remote: Invalid username or token. Password authentication is not supported";
+        assert!(matches!(classify_push("origin", "crew/x", text), ForgeError::Permanent(_)));
+        assert!(
+            classify_push("origin", "crew/x", "Could not resolve host: github.com").retryable(),
+            "the network is still transient"
+        );
     }
 
     #[test]
