@@ -27,8 +27,11 @@ label.
 Keeping Backlog as a real milestone is what makes "no milestone" mean *untriaged* and nothing
 else, so `is:open no:milestone` is the complete inbox with no extra label to maintain.
 
-Milestones carry a **human-readable outcome name** — a phrase that says what is true once it
-closes ("The daemon can be trusted with its own backlog"), never a bare "M3". Read the current
+Milestones are titled **`M<n> - <outcome>`**: a sequence number, then a human-readable phrase
+that says what is true once it closes ("M1 - The daemon can be trusted with its own backlog").
+The `M<n>` is the order milestones are worked in — it is the sequence in the title, not
+GitHub's internal milestone number, which only records creation. Backlog has no `M<n>`, because
+it is not in the sequence. Read the current
 set from GitHub rather than from memory; it changes:
 
 ```bash
@@ -67,17 +70,18 @@ Apply this rule top-down; the first match wins.
 5. **Duplicate, already fixed, or not worth doing** → close as *not planned* with the reason
    (link the duplicate or the PR that fixed it).
 
-"Current milestone" is the lowest-numbered open named milestone other than Backlog.
+"Current milestone" is the open milestone with the lowest `M<n>`.
 
 ## Priority is the milestone
 
-There are no priority labels. Milestones are worked one at a time, lowest-numbered first, and
+There are no priority labels. Milestones are worked one at a time in `M<n>` order, and
 that sequence is the whole priority order. Inside a milestone, issues are peers: the daemon
 takes them oldest first, and nothing tries to steer that.
 
 So when order inside a milestone *matters* — one issue must land before another, or a fix is
-more urgent than the rest — the milestone is too big: **split it**. Keep the name and number
-for the part that goes first and move the rest to a new milestone after it. A milestone whose
+more urgent than the rest — the milestone is too big: **split it**. The part that goes first keeps
+its `M<n>`; the rest moves to a new milestone right after it, and every later milestone's `M<n>`
+is shifted up by one so the titles still read as the sequence. A milestone whose
 issues could land in any order is the right size.
 
 The milestone description lists its issues with one clause each on why they belong to that
@@ -113,7 +117,7 @@ Run through these in order. Triage is done when every step's criterion holds.
 
 When a milestone closes:
 
-1. The next-lowest-numbered milestone becomes current. Check its name still states the outcome.
+1. The milestone with the next `M<n>` becomes current. Check its name still states the outcome.
 2. Promote from Backlog whatever serves that outcome; leave the rest. If the result has issues
    that must land in a particular order, split it before going on.
 3. Update the description's list.
