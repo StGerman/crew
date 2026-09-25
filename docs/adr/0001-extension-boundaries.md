@@ -30,10 +30,11 @@ crewd stays **one daemon process with one authority**. It is extended at four bo
 every new piece of work names the one it belongs to:
 
 1. **A trait implementation.** `Tracker`, `TrackerWrites`, `Worker`, `Workspace`, `Forge`,
-   `Gate`, `Store` and `Projector` are the plugin interface, chosen at compile time. #84 moves
-   them and the model types into `crew-core`, so that a new backend (a Linear tracker, another
-   agent CLI) is a crate depending on `crew-core` rather than a patch to `crewd`. The
-   scheduler stays in `crewd`.
+   `Gate`, `Store` and `Projector` are plugin interfaces, chosen at compile time. #84
+   moves `Tracker`, `TrackerWrites`, `Worker`, `Workspace`, `Store`, `Projector` and their
+   model types into `crew-core`, so that a new backend (a Linear tracker, another agent
+   CLI) is a crate depending on `crew-core` rather than a patch to `crewd`. The scheduler
+   stays in `crewd`.
 2. **An external command.** `crewctl <name>` runs `crewctl-<name>` from `PATH` when `<name>`
    is not built in (git and cargo do the same). The ops API address is passed in the
    environment. Such a command talks to the published API only, so it gains no authority the
