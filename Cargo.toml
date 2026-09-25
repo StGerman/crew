@@ -1,7 +1,16 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
 [package]
-name = "symphony-cc"
+name = "crewd"
 version = "0.1.0"
 edition = "2024"
+
+# `use crew::` rather than `use crewd::`: the daemon, the client and the shared library read as
+# three parts of one suite (#45).
+[lib]
+name = "crew"
 
 [dependencies]
 anyhow = "1.0.104"

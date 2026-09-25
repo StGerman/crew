@@ -7,22 +7,22 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use symphony_cc::broker::fake::FakeWrites;
-use symphony_cc::broker::{Broker, BrokerLimits, TrackerWrites};
-use symphony_cc::clock::{Clock, FakeClock};
-use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
-use symphony_cc::gate::Verdict as GateVerdict;
-use symphony_cc::gate::fake::{FakeGate, GateScript};
-use symphony_cc::model::{ErrorClass, Issue, Outcome, Phase};
-use symphony_cc::project::{NoopProjector, Projector, TasksProjector};
-use symphony_cc::sched::Scheduler;
-use symphony_cc::store::Store;
-use symphony_cc::tracker::TrackerError;
-use symphony_cc::tracker::fake::FakeTracker;
-use symphony_cc::transcript::Transcripts;
-use symphony_cc::worker::fake::{FakeWorker, Script};
-use symphony_cc::worker::{Effort, ModelChoice, RateLimitSignal, Session};
-use symphony_cc::workspace::{DirWorkspace, GitWorktreeWorkspace, Workspace};
+use crew::broker::fake::FakeWrites;
+use crew::broker::{Broker, BrokerLimits, TrackerWrites};
+use crew::clock::{Clock, FakeClock};
+use crew::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
+use crew::gate::Verdict as GateVerdict;
+use crew::gate::fake::{FakeGate, GateScript};
+use crew::model::{ErrorClass, Issue, Outcome, Phase};
+use crew::project::{NoopProjector, Projector, TasksProjector};
+use crew::sched::Scheduler;
+use crew::store::Store;
+use crew::tracker::TrackerError;
+use crew::tracker::fake::FakeTracker;
+use crew::transcript::Transcripts;
+use crew::worker::fake::{FakeWorker, Script};
+use crew::worker::{Effort, ModelChoice, RateLimitSignal, Session};
+use crew::workspace::{DirWorkspace, GitWorktreeWorkspace, Workspace};
 
 struct Harness {
     sched: Scheduler,
@@ -1936,7 +1936,7 @@ fn the_published_branch_is_the_one_prepare_recorded_not_one_recomputed_from_the_
 struct FailingProjector;
 
 impl Projector for FailingProjector {
-    fn project(&self, _issues: &[symphony_cc::project::ProjectedIssue]) -> anyhow::Result<()> {
+    fn project(&self, _issues: &[crew::project::ProjectedIssue]) -> anyhow::Result<()> {
         anyhow::bail!("disk full")
     }
 }
@@ -2163,10 +2163,10 @@ fn retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file(
 
 // ---- delivery ------------------------------------------------------------------
 
-use symphony_cc::forge::fake::{FakeForge, Op};
-use symphony_cc::forge::{CiStatus, ForgeError, PrState, Publisher};
-use symphony_cc::model::{Feedback, ReviewVerdict, Verdict};
-use symphony_cc::workspace::{Prepared, Removed, WorkspaceError};
+use crew::forge::fake::{FakeForge, Op};
+use crew::forge::{CiStatus, ForgeError, PrState, Publisher};
+use crew::model::{Feedback, ReviewVerdict, Verdict};
+use crew::workspace::{Prepared, Removed, WorkspaceError};
 
 /// A plain-directory workspace that names a branch, the way a git one would.
 ///
@@ -2187,7 +2187,7 @@ impl Workspace for NamedBranches {
         self.0.path_for(issue_id, identifier)
     }
     fn branch_for(&self, issue_id: &str, identifier: &str) -> Option<String> {
-        Some(format!("symphony/{}", symphony_cc::model::worktree_key(issue_id, identifier)))
+        Some(format!("symphony/{}", crew::model::worktree_key(issue_id, identifier)))
     }
 }
 
@@ -2226,7 +2226,7 @@ fn delivery_harness_with(
     (h, forge)
 }
 
-fn delivery_of(h: &Harness, id: &str) -> symphony_cc::store::DeliveryRecord {
+fn delivery_of(h: &Harness, id: &str) -> crew::store::DeliveryRecord {
     h.sched.store().delivery(id).unwrap().expect("a delivery row")
 }
 
@@ -2263,7 +2263,7 @@ fn a_run_that_finishes_leaves_an_open_pull_request_not_only_a_branch() {
     // The push comes before the pull request, and the snapshot carries both.
     assert!(matches!(forge.ops()[0], Op::Publish { .. }));
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready, "green CI, nothing outstanding");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready, "green CI, nothing outstanding");
     let row = &h.sched.snapshot().unwrap().rows[0];
     assert_eq!(row.delivery.as_ref().unwrap().pr_url.as_deref(), Some(prs[0].url.as_str()));
     // Delivery does not disturb the parked issue: it is still released, still parked.
@@ -2294,7 +2294,7 @@ fn a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_
     let st = h.sched.store().get("iss-1").unwrap().unwrap();
     assert_eq!(st.phase, Phase::Running, "a red gate must send the issue back, not park it");
     assert!(st.parked_state.is_none(), "and lift the park so the retry is not refused");
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
     let fb = h.worker.feedback_for("iss-1");
     assert_eq!(fb.len(), 2, "one first run, one fix round: {fb:?}");
     assert!(fb[0].is_none(), "the first run had nothing to be told");
@@ -2316,7 +2316,7 @@ fn a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_
     // The fix lands green, and only then does the issue come to rest.
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
     assert_eq!(forge.open_prs().len(), 1, "the same pull request, updated, not a second one");
     assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
 }
@@ -2343,7 +2343,7 @@ fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reporte
         forge.ops()
     );
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::HandedOff, "not a success");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "not a success");
     let why = d.review_error.expect("the failure is recorded on the delivery");
     assert!(why.contains("attached nobody"), "{why}");
     assert!(why.contains("copilot-pull-request-reviewer[bot]"), "and names who: {why}");
@@ -2363,7 +2363,7 @@ fn a_review_request_the_provider_accepts_without_attaching_a_reviewer_is_reporte
         },
     );
     run_once(&mut h2);
-    assert_eq!(delivery_of(&h2, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h2, "iss-1").stage, crew::store::DeliveryStage::Ready);
     assert!(delivery_of(&h2, "iss-1").review_error.is_none());
     drop(forge2);
 }
@@ -2399,7 +2399,7 @@ fn each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and
     h.sched.tick().unwrap();
 
     // Handed to a run as work, not as text: the round is dispatched with both comments.
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
     match &h.worker.feedback_for("iss-1")[1] {
         Some(Feedback::Review { comments, .. }) => {
             assert_eq!(comments.len(), 2, "{comments:?}");
@@ -2419,7 +2419,7 @@ fn each_review_comment_ends_accepted_with_a_commit_or_rejected_with_a_reason_and
     assert_eq!(verdicts[&no].0, Verdict::Rejected, "rejected, with the reason");
     assert!(forge.replies_to(pr, &fix_me)[0].contains("abc1234"));
     assert!(forge.replies_to(pr, &no)[0].contains("restrict()"));
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
 
     // Settled threads are not handed out again, however many times the pull request is polled.
     for _ in 0..5 {
@@ -2452,7 +2452,7 @@ fn a_verdict_is_not_settled_by_a_reply_that_did_not_land() {
     }]));
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
 
     // The run settles the comment; the network drops the reply that would say so.
     forge.fail_reply_with(Some(ForgeError::Transient("connection reset".into())));
@@ -2464,7 +2464,7 @@ fn a_verdict_is_not_settled_by_a_reply_that_did_not_land() {
         "a verdict whose reply did not land is not settled"
     );
     let d = delivery_of(&h, "iss-1");
-    assert_ne!(d.stage, symphony_cc::store::DeliveryStage::Ready, "and delivery cannot rest on it");
+    assert_ne!(d.stage, crew::store::DeliveryStage::Ready, "and delivery cannot rest on it");
     assert!(d.pending_verdicts.is_some(), "the verdict is still queued, not dropped: {d:?}");
     assert!(
         h.sched.snapshot().unwrap().last_error.as_deref().unwrap().contains("connection reset"),
@@ -2482,7 +2482,7 @@ fn a_verdict_is_not_settled_by_a_reply_that_did_not_land() {
     assert_eq!(forge.replies_to(pr, &c).len(), 1, "one reply, once it could land");
     assert_eq!(h.sched.store().verdicts_for("iss-1").unwrap()[&c].0, Verdict::Rejected);
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
     assert!(d.pending_verdicts.is_none(), "the queue is empty once every reply has landed");
     assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and it cost no agent run");
 }
@@ -2508,7 +2508,7 @@ fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
         forge.ops().iter().filter(|o| matches!(o, Op::RequestReview { .. })).count()
     };
     assert_eq!(requests(&forge), 1);
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Redispatched);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
     // The reviewer answers on that head while the fix is being written.
     forge.add_review(pr, "reviewer", "APPROVED");
 
@@ -2522,7 +2522,7 @@ fn a_fix_round_re_requests_review_so_the_new_head_is_not_left_unreviewed() {
         forge.pr(pr).unwrap().requested_reviewers.contains(&"reviewer".to_string()),
         "and it verifiably attached"
     );
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
 }
 
 /// Finding 5 on #47, the half the parser cannot do: `deadbee` is shaped like a commit, and only
@@ -2565,7 +2565,7 @@ fn an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_ou
 
     // The comment is still open, so it goes back to an agent — as one it already left hanging.
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Redispatched, "{d:?}");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Redispatched, "{d:?}");
     assert_eq!(d.rounds_pr, 2);
     match &h.worker.feedback_for("iss-1")[2] {
         Some(Feedback::Review { comments, unanswered_before, .. }) => {
@@ -2595,7 +2595,7 @@ fn fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_
         delivery_harness(vec![issue(1, "In Progress", Some(1))], Store::open(&db).unwrap(), tune);
     // Every head is red, every run says done: the loop with no bound of its own.
     forge.set_ci_default(Some(CiStatus::Failure {
-        failures: vec![symphony_cc::forge::CiFailure {
+        failures: vec![crew::forge::CiFailure {
             name: "gate".into(),
             url: None,
             detail: "still red".into(),
@@ -2607,11 +2607,7 @@ fn fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_
         h.clock.advance_ms(1_000);
     }
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(
-        d.stage,
-        symphony_cc::store::DeliveryStage::HandedOff,
-        "the per-PR bound must stop it"
-    );
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "the per-PR bound must stop it");
     assert_eq!((d.rounds_pr, d.rounds_issue), (2, 2));
     assert!(
         d.handoff_reason.as_deref().unwrap().contains("gate"),
@@ -2637,7 +2633,7 @@ fn fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_
         h.clock.advance_ms(1_000);
     }
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::HandedOff);
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff);
     assert_eq!(d.rounds_issue, 3, "the issue-wide bound is what stopped the second pull request");
     assert_eq!(d.rounds_pr, 1, "with the new pull request's own count nowhere near its bound");
     assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "one fresh run plus the single round left");
@@ -2664,7 +2660,7 @@ fn nothing_merges_without_a_human() {
         h.clock.advance_ms(60_000);
         h.sched.tick().unwrap();
     }
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
     assert_eq!(
         forge.pr(pr).unwrap().state,
         PrState::Open,
@@ -2675,7 +2671,7 @@ fn nothing_merges_without_a_human() {
     forge.set_state(pr, PrState::Merged);
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Closed);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Closed);
     let before = forge.ops().len();
     h.clock.advance_ms(60_000);
     h.sched.tick().unwrap();
@@ -2692,7 +2688,7 @@ fn a_transient_forge_failure_retries_delivery_without_re_running_the_agent() {
     forge.fail_with(Some(ForgeError::Transient("connection reset".into())));
 
     run_once(&mut h);
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Pending);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Pending);
     assert!(forge.open_prs().is_empty());
     assert!(
         h.sched.snapshot().unwrap().last_error.as_deref().unwrap().contains("connection reset")
@@ -2724,7 +2720,7 @@ fn a_permanent_forge_failure_hands_off_rather_than_retrying_forever() {
     forge.fail_with(Some(ForgeError::Permanent("401 bad credentials".into())));
     run_once(&mut h);
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::HandedOff);
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff);
     assert!(d.handoff_reason.unwrap().contains("bad credentials"));
     let calls = forge.ops().len();
     for _ in 0..5 {
@@ -2744,7 +2740,7 @@ fn a_run_that_committed_nothing_delivers_nothing_and_stays_parked() {
     forge.set_commits(vec![]);
     run_once(&mut h);
     assert!(!forge.ops().iter().any(|o| matches!(o, Op::OpenPr { .. })), "{:?}", forge.ops());
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Closed);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Closed);
     let st = h.sched.store().get("iss-1").unwrap().unwrap();
     assert_eq!(st.phase, Phase::Released);
     assert_eq!(st.parked_state.as_deref(), Some("in progress"));
@@ -2851,7 +2847,7 @@ fn a_pull_request_whose_desired_base_has_changed_is_retargeted_and_the_snapshot_
         !forge.spec_of(top).unwrap().body.contains("Stacked on"),
         "the body no longer claims a stack that is over"
     );
-    assert_eq!(delivery_of(&h, "iss-2").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-2").stage, crew::store::DeliveryStage::Ready);
 }
 
 /// Finding 2 on #47. Every issue's branch was a stack candidate, pushed or not; when the upper
@@ -2880,7 +2876,7 @@ fn a_base_that_is_not_published_is_not_selected_as_a_stack_base() {
     let prs = forge.open_prs();
     assert_eq!(prs.len(), 1, "the upper branch delivered: {:?}", forge.ops());
     assert_eq!(prs[0].base, "master", "against the trunk, not a base the remote does not have");
-    assert_eq!(delivery_of(&h, "iss-2").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-2").stage, crew::store::DeliveryStage::Ready);
     assert_eq!(delivery_of(&h, "iss-2").base.as_deref(), Some("master"));
 }
 
@@ -2896,7 +2892,7 @@ fn a_merged_pull_request_whose_branch_cleanup_deleted_closes_delivery_rather_tha
     );
     run_once(&mut h);
     let pr = forge.open_prs()[0].number;
-    assert_eq!(delivery_of(&h, "iss-1").stage, symphony_cc::store::DeliveryStage::Ready);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
 
     // The human merges; the ticket closes; cleanup deletes the now-merged branch.
     forge.set_state(pr, PrState::Merged);
@@ -2905,7 +2901,7 @@ fn a_merged_pull_request_whose_branch_cleanup_deleted_closes_delivery_rather_tha
     h.clock.advance_ms(1_000);
     h.sched.tick().unwrap();
     let d = delivery_of(&h, "iss-1");
-    assert_eq!(d.stage, symphony_cc::store::DeliveryStage::Closed, "{d:?}");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Closed, "{d:?}");
     assert_eq!(d.handoff_reason.as_deref(), Some("merged"));
     assert!(
         h.sched.store().get("iss-1").unwrap().unwrap().last_error.is_none(),

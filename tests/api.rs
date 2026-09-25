@@ -10,23 +10,23 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crew::api::client::{Client, Endpoint, Source, StatusError};
+use crew::api::mcp::{self, OpsMcp};
+use crew::api::{Api, Command};
+use crew::broker::fake::FakeWrites;
+use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
+use crew::clock::FakeClock;
+use crew::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
+use crew::model::{ErrorClass, Issue, Outcome};
+use crew::project::NoopProjector;
+use crew::sched::{Scheduler, Snapshot};
+use crew::store::Store;
+use crew::tracker::fake::FakeTracker;
+use crew::worker::fake::{FakeWorker, Script};
+use crew::workspace::DirWorkspace;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serde_json::{Value, json};
-use symphony_cc::api::client::{Client, Endpoint, Source, StatusError};
-use symphony_cc::api::mcp::{self, OpsMcp};
-use symphony_cc::api::{Api, Command};
-use symphony_cc::broker::fake::FakeWrites;
-use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
-use symphony_cc::clock::FakeClock;
-use symphony_cc::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
-use symphony_cc::model::{ErrorClass, Issue, Outcome};
-use symphony_cc::project::NoopProjector;
-use symphony_cc::sched::{Scheduler, Snapshot};
-use symphony_cc::store::Store;
-use symphony_cc::tracker::fake::FakeTracker;
-use symphony_cc::worker::fake::{FakeWorker, Script};
-use symphony_cc::workspace::DirWorkspace;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -299,7 +299,7 @@ fn row<'a>(snapshot: &'a Value, identifier: &str) -> &'a Value {
 /// Render a snapshot through the dashboard, without a terminal.
 fn as_dashboard(snap: &Snapshot) -> String {
     let mut term = Terminal::new(TestBackend::new(110, 26)).unwrap();
-    term.draw(|f| symphony_cc::tui::render_snapshot(f, snap, 0)).unwrap();
+    term.draw(|f| crew::tui::render_snapshot(f, snap, 0)).unwrap();
     term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
 }
 
@@ -519,7 +519,7 @@ async fn the_status_client_renders_the_same_snapshot_the_api_publishes() {
     h.tick();
 
     let snap = via_client(h.addr, |c| c.snapshot()).await.expect("a running daemon answers");
-    let text = symphony_cc::api::render::snapshot(&snap, "127.0.0.1:8787");
+    let text = crew::api::render::snapshot(&snap, "127.0.0.1:8787");
 
     // The numbers an operator opens this for, against a scheduler that really dispatched.
     assert!(text.contains("2 running"), "{text}");
@@ -540,7 +540,7 @@ async fn the_status_client_answers_phase_attempt_turns_cost_and_branch_for_one_i
     h.tick();
 
     let row = via_client(h.addr, |c| c.issue("MT-7")).await.expect("the issue resolves");
-    let text = symphony_cc::api::render::issue(&row);
+    let text = crew::api::render::issue(&row);
 
     for field in ["phase", "attempt", "turns", "tokens", "branch"] {
         assert!(text.contains(field), "the detail view dropped {field}:\n{text}");
@@ -601,7 +601,7 @@ async fn a_padded_bind_address_in_the_config_reaches_the_daemon_the_way_a_trimme
         .join(format!("symphony-api-test-padded-bind-{}.toml", std::process::id()));
     std::fs::write(&cfg_path, format!("[api]\nbind = \"  {}  \"\n", h.addr)).unwrap();
 
-    let ep = symphony_cc::api::client::endpoint(None, &cfg_path);
+    let ep = crew::api::client::endpoint(None, &cfg_path);
     assert_eq!(ep.addr, h.addr.to_string(), "the padding must not survive into the address used");
 
     let snap = tokio::task::spawn_blocking(move || Client::new(ep).snapshot())

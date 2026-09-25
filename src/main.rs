@@ -21,29 +21,29 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use symphony_cc::api::client::{Client, endpoint};
-use symphony_cc::api::mcp::OpsMcp;
-use symphony_cc::api::{Api, Command, render};
-use symphony_cc::broker::fake::FakeWrites;
-use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
-use symphony_cc::clock::{Clock, SystemClock};
-use symphony_cc::config::{Config, TrackerKind, WorkerKind};
-use symphony_cc::forge::fake::FakeForge;
-use symphony_cc::forge::github::GithubForge;
-use symphony_cc::forge::{Forge, Publisher};
-use symphony_cc::gate::{Gate, GitGate};
-use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
-use symphony_cc::sched::{Scheduler, Snapshot};
-use symphony_cc::store::Store;
-use symphony_cc::tracker::Tracker;
-use symphony_cc::tracker::fake::FakeTracker;
-use symphony_cc::tracker::github::{GithubTracker, UreqHttp};
-use symphony_cc::transcript::Transcripts;
-use symphony_cc::tui::{Ui, UiAction};
-use symphony_cc::worker::Worker;
-use symphony_cc::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
-use symphony_cc::worker::fake::{FakeWorker, Script};
-use symphony_cc::workspace::GitWorktreeWorkspace;
+use crew::api::client::{Client, endpoint};
+use crew::api::mcp::OpsMcp;
+use crew::api::{Api, Command, render};
+use crew::broker::fake::FakeWrites;
+use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
+use crew::clock::{Clock, SystemClock};
+use crew::config::{Config, TrackerKind, WorkerKind};
+use crew::forge::fake::FakeForge;
+use crew::forge::github::GithubForge;
+use crew::forge::{Forge, Publisher};
+use crew::gate::{Gate, GitGate};
+use crew::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
+use crew::sched::{Scheduler, Snapshot};
+use crew::store::Store;
+use crew::tracker::Tracker;
+use crew::tracker::fake::FakeTracker;
+use crew::tracker::github::{GithubTracker, UreqHttp};
+use crew::transcript::Transcripts;
+use crew::tui::{Ui, UiAction};
+use crew::worker::Worker;
+use crew::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
+use crew::worker::fake::{FakeWorker, Script};
+use crew::workspace::GitWorktreeWorkspace;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "symphony_cc=info".into()),
+                .unwrap_or_else(|_| "crew=info".into()),
         )
         .init();
 
@@ -322,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
     // Best-effort by contract: the API failing to start costs the API. Dispatch is not the
     // scheduler's opinion of whether a port was free.
     if api_cfg.enabled {
-        match symphony_cc::api::bind(&api_cfg).await {
+        match crew::api::bind(&api_cfg).await {
             Ok(listener) => {
                 tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
             }
@@ -336,12 +336,12 @@ async fn main() -> anyhow::Result<()> {
     // `--mcp-config` a worker receives is written by `Broker::open` alone, so no dispatched
     // agent learns this address. `a_dispatched_worker_is_not_handed_the_ops_tools` holds that.
     if api_cfg.mcp_enabled {
-        match symphony_cc::api::mcp::bind(&api_cfg) {
+        match crew::api::mcp::bind(&api_cfg) {
             Ok(listener) => {
                 let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
                 let ops = Arc::new(OpsMcp::new(Api::new(snap_rx.clone(), cmd_tx.clone())));
                 broker::server::serve(ops, listener);
-                tracing::info!(%addr, path = symphony_cc::api::mcp::PATH, "ops MCP server listening");
+                tracing::info!(%addr, path = crew::api::mcp::PATH, "ops MCP server listening");
             }
             Err(e) => {
                 tracing::error!(error = %e, "ops MCP server not started; scheduling continues")
@@ -516,7 +516,7 @@ fn start_broker(
 /// Give the demo tracker a spread of behaviours so the dashboard shows every state worth
 /// recognising: clean completions, work that continues, a hard failure, and a wedged agent.
 fn seed_demo_scripts(w: &FakeWorker) {
-    use symphony_cc::model::{ErrorClass, Outcome};
+    use crew::model::{ErrorClass, Outcome};
 
     w.set_default(Script::succeeds_in(12_000));
     w.script(
