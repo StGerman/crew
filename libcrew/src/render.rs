@@ -1,4 +1,4 @@
-//! Plain text for [`Snapshot`] and [`Row`], for `symphony-cc status`.
+//! Plain text for [`Snapshot`] and [`Row`], for `crewctl status`.
 //!
 //! The acceptance criterion is "readable without `jq`", and the thing that makes a CLI fail it
 //! is not missing data — it is a wall of it. So the table carries what an operator scans for
@@ -14,11 +14,8 @@
 //! width probing — output that survives a pipe into `grep` is worth more here than output that
 //! looks its best in a wide window.
 
-use crate::model::Phase;
-use crate::sched::{Row, Snapshot};
-use crate::store::RunRecord;
-use crate::tui::{fmt_count, fmt_ms};
-use crate::worker::TokenUsage;
+use crate::fmt::{fmt_count, fmt_ms};
+use crate::{Phase, Row, RunRecord, Snapshot, TokenUsage};
 
 /// What a missing value prints as, everywhere. The same mark the dashboard's table uses, and
 /// never `0` — an unreported cost is unknown, not free.
@@ -28,10 +25,7 @@ const NONE: &str = "-";
 pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!(
-        "symphony-cc @ {addr}  —  {} running / {} limit",
-        snap.running, snap.limit
-    ));
+    out.push_str(&format!("crewd @ {addr}  —  {} running / {} limit", snap.running, snap.limit));
     if snap.retrying > 0 {
         out.push_str(&format!(", {} retrying", snap.retrying));
     }
@@ -358,8 +352,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sched::RateLimitPause;
-    use crate::worker::TokenUsage;
+    use crate::RateLimitPause;
 
     /// The whole point of a transcript is that it is readable after the run is over, so the
     /// surface an operator actually types has to name it — a path that only reaches `--json`
@@ -503,7 +496,7 @@ mod tests {
             attempt: 2,
             turns: 12,
             tokens: Some(TokenUsage { input: 82_100, output: 3_400 }),
-            branch: Some("symphony/MT-601-a1b2c3d4e5f6".into()),
+            branch: Some("crew/MT-601-a1b2c3d4e5f6".into()),
             workspace: Some("/tmp/ws/MT-601-a1b2c3d4e5f6".into()),
             age_ms: 252_000,
             ..row("MT-601", Phase::Running)
@@ -514,7 +507,7 @@ mod tests {
         assert!(out.contains("attempt    2"), "{out}");
         assert!(out.contains("turns      12"), "{out}");
         assert!(out.contains("82.1k in / 3.4k out"), "{out}");
-        assert!(out.contains("symphony/MT-601-a1b2c3d4e5f6"), "{out}");
+        assert!(out.contains("crew/MT-601-a1b2c3d4e5f6"), "{out}");
         assert!(out.contains("4m12s"), "{out}");
     }
 
@@ -587,11 +580,11 @@ mod tests {
         let r = Row {
             phase: Phase::Released,
             workspace: None,
-            branch: Some("symphony/MT-9-deadbeef".into()),
+            branch: Some("crew/MT-9-deadbeef".into()),
             ..row("MT-9", Phase::Released)
         };
         let out = issue(&r);
-        assert!(out.contains("symphony/MT-9-deadbeef"), "{out}");
+        assert!(out.contains("crew/MT-9-deadbeef"), "{out}");
         assert!(!out.contains("workspace"), "a deleted worktree must not be listed: {out}");
     }
 

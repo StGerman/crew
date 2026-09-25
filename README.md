@@ -5,9 +5,8 @@
 crewd is a daemon that polls an issue tracker, opens a git worktree per issue, runs a coding
 agent in it, and reconciles what comes back. You review pull requests. Nothing it does merges.
 
-> The crate and binary are still named `symphony-cc`. Renaming them to `crewd` (the daemon)
-> and `crewctl` (the client) is tracked in
-> [#45](https://github.com/StGerman/crewd/issues/45); the repository has been renamed already.
+It ships as two binaries: `crewd`, the daemon, and `crewctl`, which asks a running daemon what
+it is doing without being able to touch its state.
 
 ## Why this exists
 
@@ -50,9 +49,16 @@ cargo run -- --tui
 That last command runs against fake demo data — no tracker is contacted and no agent is
 spawned, so it is safe to explore. `q` quits.
 
+Run headless with the ops API on, and ask it what it is doing from another terminal:
+
+```bash
+cargo run -- --api 127.0.0.1:8787
+cargo run -p crewctl -- status
+```
+
 ### Pointing it at your own repository
 
-1. **Copy `symphony.github.toml`** and set `tracker.owner` / `tracker.repo` to yours. Both
+1. **Copy `crew.github.toml`** and set `tracker.owner` / `tracker.repo` to yours. Both
    shipped configs are heavily commented; the comments explain why each number is what it is,
    which is usually more useful than the number.
 2. **Label the issues you want worked.** `tracker.required_labels` is the filter — `agent` by

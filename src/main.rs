@@ -1,4 +1,4 @@
-//! symphony-cc entry point.
+//! crewd entry point.
 //!
 //! Headless is the default; `--tui` opts into the dashboard. That asymmetry is deliberate —
 //! it keeps the UI a client of the same snapshot an operator could curl, rather than a
@@ -10,48 +10,44 @@
 //! messages are fire-and-forget; the API's carry a `oneshot` to answer on, because an HTTP
 //! client is owed a response and a keypress is not.
 //!
-//! `status` is the third surface and the odd one out: it is a *client* of a daemon in another
-//! process, so it returns before any of the setup below. It opens no store, prepares no
-//! worktree and needs no tracker credential — an operator asking what is running must not be
-//! able to disturb what is running, and a second process touching `symphony.db` while the
-//! daemon holds it would be exactly that.
+//! This binary has no `status`: asking a running daemon what it is doing is `crewctl`, a separate
+//! package that links no store, worktree or tracker code (#45), because an operator asking what
+//! is running must not be able to disturb it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
-use symphony_cc::api::client::{Client, endpoint};
-use symphony_cc::api::mcp::OpsMcp;
-use symphony_cc::api::{Api, Command, render};
-use symphony_cc::broker::fake::FakeWrites;
-use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
-use symphony_cc::clock::{Clock, SystemClock};
-use symphony_cc::config::{Config, TrackerKind, WorkerKind};
-use symphony_cc::forge::fake::FakeForge;
-use symphony_cc::forge::github::GithubForge;
-use symphony_cc::forge::{Forge, Publisher};
-use symphony_cc::gate::{Gate, GitGate};
-use symphony_cc::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
-use symphony_cc::sched::{Scheduler, Snapshot};
-use symphony_cc::store::Store;
-use symphony_cc::tracker::Tracker;
-use symphony_cc::tracker::fake::FakeTracker;
-use symphony_cc::tracker::github::{GithubTracker, UreqHttp};
-use symphony_cc::transcript::Transcripts;
-use symphony_cc::tui::{Ui, UiAction};
-use symphony_cc::worker::Worker;
-use symphony_cc::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
-use symphony_cc::worker::fake::{FakeWorker, Script};
-use symphony_cc::workspace::GitWorktreeWorkspace;
+use clap::Parser;
+use crew::api::mcp::OpsMcp;
+use crew::api::{Api, Command};
+use crew::broker::fake::FakeWrites;
+use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
+use crew::clock::{Clock, SystemClock};
+use crew::config::{Config, TrackerKind, WorkerKind};
+use crew::forge::fake::FakeForge;
+use crew::forge::github::GithubForge;
+use crew::forge::{Forge, Publisher};
+use crew::gate::{Gate, GitGate};
+use crew::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
+use crew::sched::{Scheduler, Snapshot};
+use crew::store::Store;
+use crew::tracker::Tracker;
+use crew::tracker::fake::FakeTracker;
+use crew::tracker::github::{GithubTracker, UreqHttp};
+use crew::transcript::Transcripts;
+use crew::tui::{Ui, UiAction};
+use crew::worker::Worker;
+use crew::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
+use crew::worker::fake::{FakeWorker, Script};
+use crew::workspace::GitWorktreeWorkspace;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
-#[command(name = "symphony-cc", about = "Tracker-driven orchestrator for coding agents")]
+#[command(name = "crewd", about = "Tracker-driven orchestrator for coding agents")]
 struct Args {
-    /// Path to the TOML config. Global, so `status` can read `[api] bind` out of the same
-    /// file the daemon was started with, written on either side of the subcommand.
-    #[arg(short, long, default_value = "symphony.toml", global = true)]
+    /// Path to the TOML config.
+    #[arg(short, long, default_value = "crew.toml")]
     config: PathBuf,
 
     /// Show the terminal dashboard. Without it the service runs headless and logs.
@@ -63,9 +59,8 @@ struct Args {
     max_ticks: Option<u64>,
 
     /// Serve the ops HTTP API on this address, overriding `[api]` in the config. A
-    /// non-loopback address still needs `api.allow_public`. Under `status`, the address to
-    /// query instead of the one to serve.
-    #[arg(long, value_name = "ADDR", global = true)]
+    /// non-loopback address still needs `api.allow_public`.
+    #[arg(long, value_name = "ADDR")]
     api: Option<String>,
 
     /// Serve the ops API as MCP tools on this address, for the agent supervising this daemon,
@@ -73,26 +68,6 @@ struct Args {
     /// address to a dispatched worker — see `api::mcp`.
     #[arg(long, value_name = "ADDR")]
     mcp: Option<String>,
-
-    #[command(subcommand)]
-    command: Option<Cmd>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Cmd {
-    /// Print what a running daemon is doing, read from its ops API.
-    Status(StatusArgs),
-}
-
-#[derive(clap::Args, Debug)]
-struct StatusArgs {
-    /// One issue in full, by dispatch id or tracker identifier. Omit for every issue.
-    #[arg(value_name = "ISSUE")]
-    issue: Option<String>,
-
-    /// Print the API's JSON verbatim. For a script; the rendered form is for a person.
-    #[arg(long)]
-    json: bool,
 }
 
 #[tokio::main]
@@ -104,35 +79,25 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "symphony_cc=info".into()),
+                .unwrap_or_else(|_| "crew=info".into()),
         )
         .init();
-
-    // Before the config is even loaded: `status` is a client, and a daemon-side preflight
-    // failure is not its business to report.
-    if let Some(Cmd::Status(status)) = &args.command {
-        std::process::exit(run_status(&args, status));
-    }
 
     let cfg = Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
-    let db_path = std::env::var("SYMPHONY_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("symphony.db"));
+    let db_path =
+        std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
     let store = Store::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
-    let ws_root = cfg
-        .workspace
-        .root
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("symphony_workspaces"));
+    let ws_root =
+        cfg.workspace.root.clone().unwrap_or_else(|| std::env::temp_dir().join("crew_workspaces"));
     let repo = cfg.workspace.repo.clone().unwrap_or_else(|| PathBuf::from("."));
     let workspace = Arc::new(GitWorktreeWorkspace::new(&ws_root, &repo)?);
 
-    let tasks_root = std::env::var_os("SYMPHONY_TASKS_ROOT")
+    let tasks_root = std::env::var_os("CREW_TASKS_ROOT")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude/tasks")))
         .unwrap_or_else(|| PathBuf::from(".claude/tasks"));
@@ -322,7 +287,7 @@ async fn main() -> anyhow::Result<()> {
     // Best-effort by contract: the API failing to start costs the API. Dispatch is not the
     // scheduler's opinion of whether a port was free.
     if api_cfg.enabled {
-        match symphony_cc::api::bind(&api_cfg).await {
+        match crew::api::bind(&api_cfg).await {
             Ok(listener) => {
                 tokio::spawn(Api::new(snap_rx.clone(), cmd_tx.clone()).serve(listener));
             }
@@ -336,12 +301,12 @@ async fn main() -> anyhow::Result<()> {
     // `--mcp-config` a worker receives is written by `Broker::open` alone, so no dispatched
     // agent learns this address. `a_dispatched_worker_is_not_handed_the_ops_tools` holds that.
     if api_cfg.mcp_enabled {
-        match symphony_cc::api::mcp::bind(&api_cfg) {
+        match crew::api::mcp::bind(&api_cfg) {
             Ok(listener) => {
                 let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
                 let ops = Arc::new(OpsMcp::new(Api::new(snap_rx.clone(), cmd_tx.clone())));
                 broker::server::serve(ops, listener);
-                tracing::info!(%addr, path = symphony_cc::api::mcp::PATH, "ops MCP server listening");
+                tracing::info!(%addr, path = crew::api::mcp::PATH, "ops MCP server listening");
             }
             Err(e) => {
                 tracing::error!(error = %e, "ops MCP server not started; scheduling continues")
@@ -434,41 +399,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `symphony-cc status`: ask a running daemon what it is doing, and say so plainly.
-///
-/// Returns a process exit code rather than a `Result`, because the two failures an operator
-/// cares about are not the same event. "No daemon is listening" is the answer to a question a
-/// script may legitimately be asking; rendering it through `anyhow` would bury a message
-/// written to be read in a `Error:` chain written to be debugged.
-///
-/// `1` for anything that stopped this from printing a snapshot. The message on stderr is what
-/// distinguishes the cases; see `StatusError`.
-fn run_status(args: &Args, status: &StatusArgs) -> i32 {
-    let client = Client::new(endpoint(args.api.as_deref(), &args.config));
-    let addr = client.endpoint().addr.clone();
-
-    let rendered = match (&status.issue, status.json) {
-        (None, false) => client.snapshot().map(|s| render::snapshot(&s, &addr)),
-        (Some(key), false) => client.issue(key).map(|r| render::issue(&r)),
-        (None, true) => client.raw_snapshot(),
-        (Some(key), true) => client.raw_issue(key),
-    };
-
-    match rendered {
-        Ok(text) => {
-            print!("{}", text);
-            if !text.ends_with('\n') {
-                println!();
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            1
-        }
-    }
-}
-
 /// Bind the broker's loopback listener and start serving.
 ///
 /// Every failure here returns `None` rather than propagating: a broker that cannot start is an
@@ -495,7 +425,7 @@ fn start_broker(
     };
 
     // Per-process, so two orchestrators on one host cannot collide or read each other's tokens.
-    let config_dir = std::env::temp_dir().join(format!("symphony-mcp-{}", std::process::id()));
+    let config_dir = std::env::temp_dir().join(format!("crew-mcp-{}", std::process::id()));
     let limits = BrokerLimits {
         max_calls_per_run: cfg.broker.max_calls_per_run,
         max_calls_per_issue: cfg.broker.max_calls_per_issue,
@@ -516,7 +446,7 @@ fn start_broker(
 /// Give the demo tracker a spread of behaviours so the dashboard shows every state worth
 /// recognising: clean completions, work that continues, a hard failure, and a wedged agent.
 fn seed_demo_scripts(w: &FakeWorker) {
-    use symphony_cc::model::{ErrorClass, Outcome};
+    use crew::model::{ErrorClass, Outcome};
 
     w.set_default(Script::succeeds_in(12_000));
     w.script(

@@ -1,0 +1,19 @@
+---
+source: crewctl/tests/status.rs
+expression: "stdout(&one, &addr, &root)"
+---
+MT-7  iss-7
+issue 7
+
+  phase      running
+  state      in progress
+  attempt    first
+  turns      1
+  tokens     not yet reported
+  branch     -
+  transcript -
+  workspace  [ROOT]/workspaces/MT-7-23956606c457
+  last event turn_completed
+
+  runs (newest first)
+    iss-7-1770000000000  started 2026-02-02 02:40:00Z  ended still open  turns 0     outcome -          tokens -  model cli default

@@ -1,4 +1,4 @@
-//! symphony-cc — a tracker-driven orchestrator for Claude Code agents.
+//! crewd — a tracker-driven orchestrator for Claude Code agents.
 //!
 //! Layering follows the Symphony spec's better instincts: a deterministic coordination layer
 //! that owns polling, claims, concurrency and retries, sitting above pluggable execution and

@@ -339,6 +339,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "crewctl"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crewd",
+ "insta",
+ "libcrew",
+ "rusqlite",
+ "tokio",
+]
+
+[[package]]
+name = "crewd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "crossterm",
+ "insta",
+ "libc",
+ "libcrew",
+ "ratatui",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -832,6 +868,15 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libcrew"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "libm"
@@ -1734,29 +1779,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "symphony-cc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "crossterm",
- "insta",
- "libc",
- "ratatui",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "ureq",
-]
 
 [[package]]
 name = "syn"

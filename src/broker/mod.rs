@@ -74,8 +74,8 @@ use crate::worker::ToolEndpoint;
 pub use server::McpService;
 pub use writes::TrackerWrites;
 
-/// The MCP server name. Tools reach the agent as `mcp__symphony__<tool>`.
-pub const SERVER_NAME: &str = "symphony";
+/// The MCP server name. Tools reach the agent as `mcp__crew__<tool>`.
+pub const SERVER_NAME: &str = "crew";
 
 pub const TOOL_COMMENT: &str = "comment";
 pub const TOOL_SET_STATE: &str = "set_state";
@@ -637,7 +637,7 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "symphony-broker-{}-{tag}-{:?}",
+            "crew-broker-{}-{tag}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

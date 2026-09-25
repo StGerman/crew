@@ -67,8 +67,8 @@
 //! agent to end that text with:
 //!
 //! ```text
-//! SYMPHONY_OUTCOME: continue: <reason>
-//! SYMPHONY_OUTCOME: blocked: <reason>
+//! CREW_OUTCOME: continue: <reason>
+//! CREW_OUTCOME: blocked: <reason>
 //! ```
 //!
 //! Absence of either line, with `is_error: false`, means `Done`. This is a text convention and
@@ -140,12 +140,12 @@ pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
     "RUSTUP_HOME",
 ];
 
-const OUTCOME_MARKER: &str = "SYMPHONY_OUTCOME:";
-/// `SYMPHONY_REVIEW: <comment-id>: accepted: <commit>` or `...: rejected: <reason>`, one per
+const OUTCOME_MARKER: &str = "CREW_OUTCOME:";
+/// `CREW_REVIEW: <comment-id>: accepted: <commit>` or `...: rejected: <reason>`, one per
 /// review comment the run was handed. The same kind of soft convention as the outcome marker,
 /// and for the same reason: the CLI has no structured channel for it. A comment the agent
 /// gives no line for simply stays outstanding — see the delivery section of `sched`.
-const REVIEW_MARKER: &str = "SYMPHONY_REVIEW:";
+const REVIEW_MARKER: &str = "CREW_REVIEW:";
 
 /// Bounded by design: the last thing read from a crashing or malicious child should not become
 /// an unbounded log line or error message.
@@ -312,7 +312,7 @@ impl Worker for ClaudeWorker {
         if let Some(t) = transcript.as_mut() {
             t.write_line(
                 &serde_json::json!({
-                    "type": "symphony_run_start",
+                    "type": "crew_run_start",
                     "issue": issue.identifier,
                     "issue_id": issue.id,
                     "attempt": attempt,
@@ -347,7 +347,7 @@ impl Worker for ClaudeWorker {
                 if let Some(t) = transcript.as_mut() {
                     t.write_line(
                         &serde_json::json!({
-                            "type": "symphony_run_end",
+                            "type": "crew_run_end",
                             "exit": "spawn failed",
                             "stderr": e.to_string(),
                         })
@@ -516,7 +516,7 @@ fn run_reader(
         };
         t.write_line(
             &serde_json::json!({
-                "type": "symphony_run_end",
+                "type": "crew_run_end",
                 "exit": exit,
                 "turns": turns,
                 "stderr": stderr_tail,
@@ -573,7 +573,7 @@ fn interpret_result(v: &serde_json::Value, api_error: Option<&str>) -> Outcome {
     Outcome::Done
 }
 
-/// Looks for a `SYMPHONY_OUTCOME: <kind>: <reason>` line anywhere in the agent's final text —
+/// Looks for a `CREW_OUTCOME: <kind>: <reason>` line anywhere in the agent's final text —
 /// see the module doc for why this is a text convention rather than a structured signal.
 fn extract_marker(text: &str, kind: &str) -> Option<String> {
     let prefix = format!("{OUTCOME_MARKER} {kind}:");
@@ -585,7 +585,7 @@ fn extract_marker(text: &str, kind: &str) -> Option<String> {
     })
 }
 
-/// Every well-formed `SYMPHONY_REVIEW: <id>: <accepted|rejected>: <detail>` line in the final
+/// Every well-formed `CREW_REVIEW: <id>: <accepted|rejected>: <detail>` line in the final
 /// text. Malformed lines are skipped rather than failing the run: the run's own outcome does not
 /// depend on this, and a comment left unsettled stays outstanding, which is the safe reading.
 ///
@@ -681,9 +681,9 @@ fn build_continuation_prompt(
          The same rules apply: commit as you go, and when the work is fully complete, simply \
          stop. If you need another turn, end your final message with a line reading \
          exactly:\n\
-         SYMPHONY_OUTCOME: continue: <one-sentence reason>\n\n\
+         CREW_OUTCOME: continue: <one-sentence reason>\n\n\
          If you are stuck and need a human to unblock you, end with:\n\
-         SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
+         CREW_OUTCOME: blocked: <one-sentence reason>\n",
         issue.identifier
     );
     p.push_str(&feedback_help(feedback));
@@ -712,9 +712,9 @@ fn build_prompt(
          changes as you go. When you have fully completed the work, simply stop.\n\n\
          If you have made real progress but need another turn to finish, end your final \
          message with a line reading exactly:\n\
-         SYMPHONY_OUTCOME: continue: <one-sentence reason>\n\n\
+         CREW_OUTCOME: continue: <one-sentence reason>\n\n\
          If you are stuck and need a human to unblock you, end your final message with:\n\
-         SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
+         CREW_OUTCOME: blocked: <one-sentence reason>\n",
     );
     p.push_str(&feedback_help(feedback));
     p.push_str(&wip_help(wip));
@@ -768,8 +768,8 @@ fn feedback_help(feedback: Option<&Feedback>) -> String {
                  verdict each. For every comment below, either fix what it raises and commit, \
                  or decide it should not change and say why. Do not merely acknowledge one. \
                  Then end your final message with one line per comment, exactly:\n\
-                 SYMPHONY_REVIEW: <comment-id>: accepted: <commit sha that resolved it>\n\
-                 SYMPHONY_REVIEW: <comment-id>: rejected: <one-sentence reason>\n"
+                 CREW_REVIEW: <comment-id>: accepted: <commit sha that resolved it>\n\
+                 CREW_REVIEW: <comment-id>: rejected: <one-sentence reason>\n"
             ));
             if !unanswered_before.is_empty() {
                 s.push_str(&format!(
@@ -816,7 +816,7 @@ fn wip_help(wip: &[WipSnapshot]) -> String {
 /// Names the broker's tools in the prompt.
 ///
 /// Without this the tools are wired up and never called: they arrive in the tool list as
-/// `mcp__symphony__*` among everything else the operator's config provides, with nothing to say
+/// `mcp__crew__*` among everything else the operator's config provides, with nothing to say
 /// they are the sanctioned way to touch the ticket. Saying so is also the only lever there is
 /// against the agent reaching for ambient `gh` instead — see [`crate::broker`] on why that
 /// remains possible and why this is persuasion rather than enforcement.
@@ -859,7 +859,7 @@ mod tests {
 
     fn tmp_workspace(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "symphony-claude-worker-{}-{tag}-{:?}",
+            "crew-claude-worker-{}-{tag}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -962,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn a_symphony_outcome_continue_marker_is_parsed_from_the_final_text() {
+    fn a_crew_outcome_continue_marker_is_parsed_from_the_final_text() {
         let ws = tmp_workspace("continue");
         let w = ClaudeWorker::new(fixture("explicit_continue.sh"), vec!["PATH".into()], 0);
         let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
@@ -1008,11 +1008,11 @@ mod tests {
     #[test]
     fn an_acceptance_that_names_no_commit_leaves_its_comment_outstanding() {
         let v = extract_verdicts(
-            "SYMPHONY_REVIEW: 1: accepted: fixed\n\
-             SYMPHONY_REVIEW: 2: accepted: a1b2c3d\n\
-             SYMPHONY_REVIEW: 3: accepted: see commit a1b2c3d\n\
-             SYMPHONY_REVIEW: 4: accepted: 0123456789abcdef0123456789abcdef01234567\n\
-             SYMPHONY_REVIEW: 5: rejected: fixed\n",
+            "CREW_REVIEW: 1: accepted: fixed\n\
+             CREW_REVIEW: 2: accepted: a1b2c3d\n\
+             CREW_REVIEW: 3: accepted: see commit a1b2c3d\n\
+             CREW_REVIEW: 4: accepted: 0123456789abcdef0123456789abcdef01234567\n\
+             CREW_REVIEW: 5: rejected: fixed\n",
         );
         let ids: Vec<&str> = v.iter().map(|x| x.comment_id.as_str()).collect();
         assert_eq!(ids, vec!["2", "4", "5"], "{v:?}");
@@ -1060,11 +1060,11 @@ mod tests {
     fn snapshots_of_uncommitted_work_are_named_in_both_prompts_with_their_diffstats() {
         let wip = [
             WipSnapshot {
-                ref_name: "refs/symphony/wip/iss-1-abc/000001-0123456789ab".into(),
+                ref_name: "refs/crew/wip/iss-1-abc/000001-0123456789ab".into(),
                 diffstat: " half.txt | 1 +\n 1 file changed, 1 insertion(+)".into(),
             },
             WipSnapshot {
-                ref_name: "refs/symphony/wip/iss-1-abc/000002-ba9876543210".into(),
+                ref_name: "refs/crew/wip/iss-1-abc/000002-ba9876543210".into(),
                 diffstat: " src/lib.rs | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)"
                     .into(),
             },
@@ -1302,7 +1302,7 @@ mod tests {
         let ws = tmp_workspace("env-leak");
         // SAFETY: a unique key nothing else reads or writes, scoped to this one test.
         unsafe {
-            std::env::set_var("SYMPHONY_TEST_TRACKER_TOKEN_MUST_NOT_LEAK", "super-secret-value");
+            std::env::set_var("CREW_TEST_TRACKER_TOKEN_MUST_NOT_LEAK", "super-secret-value");
         }
 
         let w = ClaudeWorker::new(fixture("dump_env.sh"), vec!["PATH".into()], 0);
@@ -1310,12 +1310,12 @@ mod tests {
         wait_for_finish(&h);
 
         let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
-        assert!(!dump.contains("SYMPHONY_TEST_TRACKER_TOKEN_MUST_NOT_LEAK"));
+        assert!(!dump.contains("CREW_TEST_TRACKER_TOKEN_MUST_NOT_LEAK"));
         assert!(!dump.contains("super-secret-value"));
 
         // SAFETY: cleaning up the same unique key set above.
         unsafe {
-            std::env::remove_var("SYMPHONY_TEST_TRACKER_TOKEN_MUST_NOT_LEAK");
+            std::env::remove_var("CREW_TEST_TRACKER_TOKEN_MUST_NOT_LEAK");
         }
         std::fs::remove_dir_all(&ws).ok();
     }
@@ -1368,9 +1368,9 @@ mod tests {
             "an unparseable line is the one most worth still having"
         );
         // And the two facts the stream never carries at all.
-        assert!(text.contains("symphony_run_start"), "dispatch header missing");
+        assert!(text.contains("crew_run_start"), "dispatch header missing");
         assert!(text.contains(r#""attempt":2"#), "the header must name the attempt");
-        assert!(text.contains("symphony_run_end"), "exit status missing");
+        assert!(text.contains("crew_run_end"), "exit status missing");
 
         // Every line but the deliberately broken one must still parse, so a reader can treat
         // the file as JSONL rather than guessing.
@@ -1429,7 +1429,7 @@ mod tests {
         ));
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("symphony_run_start"));
+        assert!(text.contains("crew_run_start"));
         assert!(text.contains("spawn failed"), "got: {text}");
 
         std::fs::remove_dir_all(&ws).ok();

@@ -1,0 +1,17 @@
+[package]
+name = "crewctl"
+version = "0.1.0"
+edition = "2024"
+
+# The client. Its dependency graph is the guarantee that it cannot open the daemon's store:
+# `libcrew` and `clap`, and nothing that links SQLite, a terminal UI, an async runtime or an
+# HTTP stack. CI fails the build if `cargo tree -p crewctl -e normal` ever shows one (#45).
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+libcrew = { path = "../libcrew" }
+
+[dev-dependencies]
+crewd = { path = ".." }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+insta = "1.48.0"

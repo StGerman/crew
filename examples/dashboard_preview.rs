@@ -5,12 +5,12 @@
 //! Useful for reviewing layout changes in a diff, and as a standing reminder that the UI is a
 //! pure function of a [`Snapshot`] — if it renders here, it renders anywhere.
 
+use crew::model::Phase;
+use crew::sched::{Row, Snapshot};
+use crew::tui::render_snapshot;
+use crew::worker::TokenUsage;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use symphony_cc::model::Phase;
-use symphony_cc::sched::{Row, Snapshot};
-use symphony_cc::tui::render_snapshot;
-use symphony_cc::worker::TokenUsage;
 
 fn row(identifier: &str, title: &str, state: &str, phase: Phase) -> Row {
     Row {
@@ -19,7 +19,7 @@ fn row(identifier: &str, title: &str, state: &str, phase: Phase) -> Row {
         title: title.into(),
         tracker_state: state.into(),
         phase,
-        workspace: Some(format!("/tmp/symphony_workspaces/{identifier}-d36eac00286d")),
+        workspace: Some(format!("/tmp/crew_workspaces/{identifier}-d36eac00286d")),
         url: Some(format!("https://tracker.example/issues/{identifier}")),
         ..Default::default()
     }

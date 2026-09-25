@@ -17,18 +17,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use symphony_cc::broker::fake::FakeWrites;
-use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
-use symphony_cc::clock::{Clock, SystemClock};
-use symphony_cc::model::Issue;
-use symphony_cc::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
-use symphony_cc::worker::{Session, Spawn, Worker};
+use crew::broker::fake::FakeWrites;
+use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
+use crew::clock::{Clock, SystemClock};
+use crew::model::Issue;
+use crew::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
+use crew::worker::{Session, Spawn, Worker};
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter("symphony_cc=debug")
-        .init();
+    tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter("crew=debug").init();
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let writes = Arc::new(FakeWrites::new());
@@ -36,7 +33,7 @@ fn main() -> anyhow::Result<()> {
 
     let listener = broker::server::bind()?;
     let addr = listener.local_addr()?;
-    let dir = std::env::temp_dir().join(format!("symphony-mcp-live-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("crew-mcp-live-{}", std::process::id()));
     let broker = Arc::new(Broker::new(
         w,
         clock,
@@ -56,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         title: "Broker smoke test".into(),
         body: Some(
             "Do not read or modify any files, and do not run any commands. Call the \
-             mcp__symphony__comment tool exactly once with the body 'live broker check', then \
+             mcp__crew__comment tool exactly once with the body 'live broker check', then \
              stop and report what it returned."
                 .into(),
         ),
@@ -70,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         blocked_by: vec![],
     };
 
-    let workspace = std::env::temp_dir().join(format!("symphony-live-ws-{}", std::process::id()));
+    let workspace = std::env::temp_dir().join(format!("crew-live-ws-{}", std::process::id()));
     std::fs::create_dir_all(&workspace)?;
 
     let session = broker.open(&issue, "live-run")?;
@@ -84,8 +81,8 @@ fn main() -> anyhow::Result<()> {
     // A real transcript for a real run: this is the one place in the crate where the stream
     // comes from the actual CLI, so it is also the best place to see what a transcript of one
     // looks like.
-    let transcripts = symphony_cc::transcript::Transcripts::new(
-        &std::env::temp_dir().join("symphony-live-transcripts"),
+    let transcripts = crew::transcript::Transcripts::new(
+        &std::env::temp_dir().join("crew-live-transcripts"),
         8 << 20,
         10,
     )?;
@@ -97,12 +94,7 @@ fn main() -> anyhow::Result<()> {
     let handle = worker.spawn(Spawn {
         tools: Some(session.endpoint()),
         transcript,
-        ..Spawn::new(
-            &issue,
-            &workspace,
-            0,
-            &Session::New(symphony_cc::model::session_id("live", 1)),
-        )
+        ..Spawn::new(&issue, &workspace, 0, &Session::New(crew::model::session_id("live", 1)))
     });
 
     let deadline = Instant::now() + Duration::from_secs(180);

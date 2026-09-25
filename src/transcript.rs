@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 /// Written as the final line when a run exceeds its byte cap, so a truncated transcript says so
 /// rather than just ending. Shaped as an event of its own, since everything else in the file is
 /// one and a reader is already parsing per-line JSON.
-const TRUNCATION_MARKER: &str = "symphony_transcript_truncated";
+const TRUNCATION_MARKER: &str = "crew_transcript_truncated";
 
 /// A root directory of per-run transcripts, plus the retention policy over it.
 pub struct Transcripts {
@@ -217,7 +217,7 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "symphony-transcript-{}-{tag}-{:?}",
+            "crew-transcript-{}-{tag}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

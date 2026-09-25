@@ -189,7 +189,7 @@ pub fn serve_with<S: McpService>(service: Arc<S>, listener: TcpListener, limits:
                     // process is out of threads, and a panic on this thread would take the
                     // whole orchestrator down over a connection it could simply have refused.
                     let spawned = std::thread::Builder::new()
-                        .name("symphony-broker-conn".into())
+                        .name("crew-broker-conn".into())
                         .spawn(move || {
                             // Held for the life of the connection, released however it ends.
                             let _slot = slot;
@@ -466,7 +466,7 @@ mod tests {
         let writes = Arc::new(FakeWrites::new());
         let w: Arc<dyn TrackerWrites> = writes.clone();
         let dir = std::env::temp_dir().join(format!(
-            "symphony-broker-srv-{}-{tag}-{:?}",
+            "crew-broker-srv-{}-{tag}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

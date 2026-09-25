@@ -48,9 +48,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
-pub mod client;
+pub use libcrew::client;
 pub mod mcp;
-pub mod render;
+pub use libcrew::render;
 
 use crate::config::ApiConfig;
 use crate::sched::{Row, Snapshot};
@@ -66,17 +66,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Every response this API writes carries this header, so [`client::Client`] can tell "the ops
-/// API answered" apart from "something on this port answered" before it trusts anything else in
-/// the response. Without it, a 404 from an unrelated service on the same port reads exactly like
-/// this router's own 404, and `--json` would pass either straight through. A header rather than
-/// a body field: the body is [`Snapshot`]/[`Row`] JSON, handed back to an operator verbatim by
-/// the client's `--json` paths, and a marker key inside it would leak into output meant to be
-/// piped into `jq`.
-const API_MARKER_HEADER: &str = "X-Symphony-Ops-Api";
-/// A version rather than a bare flag, so a wire-incompatible future change has somewhere to say
-/// so. Today the client only checks that this equals what it expects.
-const API_MARKER_VERSION: &str = "1";
+use libcrew::api::{API_MARKER_HEADER, API_MARKER_VERSION, normalize_bind};
 
 /// Work only the scheduler loop may do, with a channel to answer on.
 ///
@@ -122,15 +112,6 @@ pub(crate) fn resolve_bind(
         );
     }
     Ok(addr)
-}
-
-/// The one normalization `api.bind` gets before it is treated as an address. Shared with
-/// `client::bind_in` (and, through it, [`client::endpoint`]'s `--api` handling) so a client
-/// built from the same config file looks for the daemon at the address the daemon actually
-/// bound — a value with incidental surrounding whitespace must not bind here and build an
-/// unreachable URL there.
-fn normalize_bind(raw: &str) -> &str {
-    raw.trim()
 }
 
 #[derive(Clone)]

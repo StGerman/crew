@@ -1,0 +1,13 @@
+[package]
+name = "libcrew"
+version = "0.1.0"
+edition = "2024"
+
+# What the daemon and `crewctl` both need, and nothing else: the published snapshot types, the
+# ops API's address and wire constants, and the client that reads them (#45). Its dependency list
+# is the point — no SQLite, no terminal UI, no async runtime, no HTTP crate — because everything
+# here ends up linked into a client that must never be able to open the daemon's store.
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"

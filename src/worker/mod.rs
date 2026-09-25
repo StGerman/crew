@@ -66,22 +66,7 @@ pub struct Progress {
     pub last_event: Option<String>,
 }
 
-/// Token totals for one run, as reported by the agent CLI itself in its terminal `result` event.
-///
-/// Taken from there and nowhere else. Summing the `usage` block of each streamed `assistant`
-/// event looked equivalent and was not, in both directions: the CLI emits one `assistant` event
-/// per content block, each carrying the whole turn's usage, so a thinking-then-text turn is
-/// counted twice; and the per-event `output_tokens` is a streaming placeholder that reads `1`
-/// for a full paragraph. The first live dispatch recorded ten million input tokens and four
-/// hundred output tokens over eighty-three turns that way.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenUsage {
-    /// Prompt-side tokens billed for the run: fresh input plus cache creation plus cache reads.
-    /// One figure rather than three because the dashboard has one column; the split is in the
-    /// CLI's own transcript if a cost breakdown is ever needed.
-    pub input: u64,
-    pub output: u64,
-}
+pub use libcrew::TokenUsage;
 
 /// Which conversation an attempt runs in.
 ///

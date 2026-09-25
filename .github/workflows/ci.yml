@@ -99,3 +99,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo test
         run: cargo test --locked
+      # The client must not be able to open the daemon's store, and its dependency graph is what
+      # proves it (#45): a `crewctl` that links SQLite is one careless refactor from opening it.
+      # `-e normal` because the integration tests may use the daemon as a dev-dependency.
+      - name: crewctl links no daemon-side crate
+        run: |
+          if cargo tree --locked -p crewctl -e normal --prefix none | grep -E '^(rusqlite|ratatui|tokio|ureq) '; then
+            echo "crewctl must not depend on the crates above"; exit 1
+          fi

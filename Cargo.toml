@@ -1,9 +1,25 @@
+[workspace]
+members = [".", "libcrew", "crewctl"]
+# A plain `cargo test`, `cargo clippy` and `cargo build` cover every package, not only the root
+# one, so the commit gate and CI keep checking the client and the shared library too.
+default-members = [".", "libcrew", "crewctl"]
+resolver = "3"
+
 [package]
-name = "symphony-cc"
+name = "crewd"
 version = "0.1.0"
 edition = "2024"
+# `cargo run` means the daemon, as the quickstart in CLAUDE.md and the README assumes, even
+# though `default-members` also builds `crewctl`.
+default-run = "crewd"
+
+# `use crew::` rather than `use crewd::`: the daemon, the client and the shared library read as
+# three parts of one suite (#45).
+[lib]
+name = "crew"
 
 [dependencies]
+libcrew = { path = "libcrew" }
 anyhow = "1.0.104"
 blake3 = "1.8.7"
 clap = { version = "4.6.7", features = ["derive"] }

@@ -1,5 +1,5 @@
 target
-.symphony/
+.crew/
 *.db
 *.db-wal
 *.db-shm

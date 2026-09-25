@@ -179,7 +179,7 @@ impl<H: Http> GithubForge<H> {
             ("Authorization", format!("Bearer {}", self.token)),
             ("Accept", "application/vnd.github+json".to_string()),
             ("X-GitHub-Api-Version", API_VERSION.to_string()),
-            ("User-Agent", "symphony-cc".to_string()),
+            ("User-Agent", "crewd".to_string()),
         ]
     }
 
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn a_reused_pull_request_whose_desired_base_has_changed_is_retargeted() {
         let http = FakeHttp::new();
-        http.push(ok(json!([gh_pr(7, "sha1", "symphony/lower", "open")])));
+        http.push(ok(json!([gh_pr(7, "sha1", "crew/lower", "open")])));
         http.push(ok(gh_pr(7, "sha1", "master", "open")));
         let f = forge(http);
 

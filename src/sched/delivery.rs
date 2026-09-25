@@ -44,27 +44,13 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
 use super::Scheduler;
 use crate::clock::Wall;
 use crate::forge::{CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec};
 use crate::model::{Feedback, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
 
-/// What the published snapshot says about an issue's delivery. A view, so that observers get
-/// the stage and the pull request without a `Store` — rule 3, same as every other `Row` field.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeliveryView {
-    pub stage: String,
-    pub pr_number: Option<u64>,
-    pub pr_url: Option<String>,
-    pub base: Option<String>,
-    pub rounds_pr: u32,
-    pub rounds_issue: u32,
-    pub review_error: Option<String>,
-    pub handoff_reason: Option<String>,
-}
+pub use libcrew::DeliveryView;
 
 impl From<&DeliveryRecord> for DeliveryView {
     fn from(d: &DeliveryRecord) -> Self {
@@ -677,7 +663,7 @@ impl Scheduler {
                 _ => acc,
             });
         body.push_str(&format!(
-            "\n## Provenance\n\nOpened by symphony-cc from {} run{} of {} ({} turns, {} tokens in / {} \
+            "\n## Provenance\n\nOpened by crewd from {} run{} of {} ({} turns, {} tokens in / {} \
              out{}). The verdict on each review comment is recorded as a reply on its thread; \
              merging is left to a human.\n",
             runs.len(),

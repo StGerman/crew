@@ -10,7 +10,7 @@ required_labels = ["agent"]
 interval_ms = 2000
 
 [workspace]
-root = ".symphony/workspaces"
+root = ".crew/workspaces"
 
 [agent]
 max_concurrent = 3
@@ -44,7 +44,7 @@ max_calls_per_issue = 100
 # without editing this file. `POST /refresh` and `POST /unquarantine` control agent execution,
 # so a non-loopback `bind` additionally needs `allow_public = true`.
 #
-# `bind` is also where `symphony-cc status` looks, so a client run from this directory needs no
+# `bind` is also where `crewctl status` looks, so a client run from this directory needs no
 # address of its own. Turning `enabled` on is what makes that work: with it off there is nothing
 # listening, and `status` says so rather than guessing the daemon is down.
 [api]
@@ -53,7 +53,7 @@ bind = "127.0.0.1:8787"
 # The same four routes as MCP tools, for the *agent* supervising this daemon (src/api/mcp.rs);
 # `--mcp 127.0.0.1:8788` flips it for one run. Its own port on purpose — never the broker's —
 # and it must never reach a dispatched worker: register it in the supervising agent's local or
-# project scope (`claude mcp add --scope local --transport http symphony_ops
+# project scope (`claude mcp add --scope local --transport http crew_ops
 # http://127.0.0.1:8788/ops`), never user scope, which every worker inherits.
 mcp_enabled = false
 mcp_bind = "127.0.0.1:8788"
@@ -78,7 +78,7 @@ timeout_ms = 1800000
 commands = []
 # Delivery (src/sched/delivery.rs): push a finished run's branch, open a pull request, read CI,
 # request and verify review, hand review comments back to an agent as work. Off here because
-# the demo tracker has no repository to deliver to; `symphony.github.toml` turns it on. The
+# the demo tracker has no repository to deliver to; `crew.github.toml` turns it on. The
 # round bounds are the brake on the review-fix loop this creates — see that file.
 [delivery]
 enabled = false

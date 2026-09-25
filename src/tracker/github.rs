@@ -5,7 +5,7 @@
 //! GitHub Issues have exactly two workflow states: open and closed. This project's scheduler
 //! wants an arbitrary set of `active_states` and `terminal_states` — enough to express, for
 //! example, a busy "in review" state with its own `max_concurrent_by_state` cap, which
-//! `symphony.toml`'s demo config already relies on. Open/closed alone cannot express that.
+//! `crew.toml`'s demo config already relies on. Open/closed alone cannot express that.
 //!
 //! Three ways to add states on top of open/closed: a `state:<name>` label convention, a
 //! Projects v2 board field, or open/closed plus assignee as a two-value stand-in. This adapter
@@ -16,7 +16,7 @@
 //!   configure, and a second pagination scheme.
 //! * It supports as many states as the operator wants, unlike open/closed+assignee, which
 //!   caps out at two.
-//! * The label text *is* the state string — `active_states`/`terminal_states` in `symphony.toml`
+//! * The label text *is* the state string — `active_states`/`terminal_states` in `crew.toml`
 //!   read the same vocabulary an operator already sees on the issue.
 //!
 //! `closed` always wins over any `state:*` label when deriving an issue's state — an operator
@@ -33,7 +33,7 @@
 //! primary limit of 5000 requests/hour, `interval_ms` should keep
 //! `(1 + agent.max_concurrent) * (3_600_000 / interval_ms)` comfortably under that — a 30s
 //! interval at `max_concurrent = 2` is `3 * 120 = 360/hour`, nowhere near the ceiling.
-//! `symphony.github.toml` uses that combination. A 403/429 with a rate-limit signal still
+//! `crew.github.toml` uses that combination. A 403/429 with a rate-limit signal still
 //! classifies as [`crate::model::ErrorClass::RateLimited`] and backs off rather than escalates,
 //! but a tight interval against a real repo will find that path often enough to be worth
 //! avoiding up front.
@@ -294,7 +294,7 @@ impl<H: Http> GithubTracker<H> {
             ("Authorization", format!("Bearer {}", self.token)),
             ("Accept", "application/vnd.github+json".to_string()),
             ("X-GitHub-Api-Version", API_VERSION.to_string()),
-            ("User-Agent", "symphony-cc".to_string()),
+            ("User-Agent", "crewd".to_string()),
         ]
     }
 
