@@ -1008,19 +1008,24 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_of_uncommitted_work_is_named_in_both_prompts_with_its_diffstat() {
-        let wip = WipSnapshot {
-            ref_name: "refs/symphony/wip/MT-1-abc".into(),
-            diffstat: " half.txt | 1 +\n 1 file changed, 1 insertion(+)".into(),
-        };
-        for prompt in [
-            build_prompt(&issue(), None, None, std::slice::from_ref(&wip)),
-            build_continuation_prompt(&issue(), None, None, std::slice::from_ref(&wip)),
-        ] {
-            assert!(prompt.contains("`refs/symphony/wip/MT-1-abc`"), "{prompt}");
-            assert!(prompt.contains("half.txt | 1 +"), "{prompt}");
-        }
-        assert!(!build_prompt(&issue(), None, None, &[]).contains("refs/symphony/wip"));
+    fn snapshots_of_uncommitted_work_are_named_in_both_prompts_with_their_diffstats() {
+        let wip = [
+            WipSnapshot {
+                ref_name: "refs/symphony/wip/iss-1-abc/000001-0123456789ab".into(),
+                diffstat: " half.txt | 1 +\n 1 file changed, 1 insertion(+)".into(),
+            },
+            WipSnapshot {
+                ref_name: "refs/symphony/wip/iss-1-abc/000002-ba9876543210".into(),
+                diffstat: " src/lib.rs | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)"
+                    .into(),
+            },
+        ];
+        insta::assert_snapshot!("new_prompt_with_wip", build_prompt(&issue(), None, None, &wip));
+        insta::assert_snapshot!(
+            "continuation_prompt_with_wip",
+            build_continuation_prompt(&issue(), None, None, &wip)
+        );
+        insta::assert_snapshot!("new_prompt_without_wip", build_prompt(&issue(), None, None, &[]));
     }
 
     #[test]
