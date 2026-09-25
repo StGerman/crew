@@ -88,7 +88,7 @@ Before placing an issue, name the boundary its work lands on
 
 | Boundary | Fits when |
 |---|---|
-| **trait implementation** | a new backend behind `Tracker`, `Worker`, `Workspace`, `Forge`, `Gate`, `Store` or `Projector` |
+| **trait implementation** | a new backend behind `Tracker`, `TrackerWrites`, `Worker`, `Workspace`, `Forge`, `Gate`, `Store` or `Projector` |
 | **external command** | an operator tool that needs only the ops API: a `crewctl-<name>` program on `PATH` |
 | **hook** | a reaction to a lifecycle event that decides nothing: notifications, metrics |
 | **core change** | it closes or protects an invariant, or needs the scheduler's authority: a claim, a budget, a bound, a write on an agent's behalf |
