@@ -328,7 +328,13 @@ impl GitWorktreeWorkspace {
             ("GIT_COMMITTER_EMAIL", "symphony-cc@localhost".as_ref()),
         ];
         let result = (|| {
-            Self::git_env(path, &["read-tree", "HEAD"], &env)?;
+            // Seeded from the worktree's own index, not from HEAD: a path the agent staged past
+            // `.gitignore` (`git add -f`) exists only there, and `add -A` over a HEAD-seeded
+            // index would treat it as ignored and leave it out of the snapshot.
+            let real = path.join(Self::git(path, &["rev-parse", "--git-path", "index"])?);
+            if std::fs::copy(&real, &index).is_err() {
+                Self::git_env(path, &["read-tree", "HEAD"], &env)?;
+            }
             Self::git_env(path, &["add", "-A"], &env)?;
             let tree = Self::git_env(path, &["write-tree"], &env)?;
             if tree == Self::git(path, &["rev-parse", "HEAD^{tree}"])? {
@@ -997,6 +1003,35 @@ mod tests {
         let show = |r: &str, f: &str| git_stdout(&repo, &["show", &format!("{r}:{f}")]);
         assert_eq!(show(&reported[0].ref_name, "first.txt").as_deref(), Some("first run"));
         assert_eq!(show(&reported[1].ref_name, "second.txt").as_deref(), Some("second run"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A path staged past `.gitignore` lives only in the worktree's own index; a scratch index
+    /// rebuilt from HEAD would see it as ignored and drop it from the snapshot.
+    #[test]
+    fn a_file_force_staged_past_gitignore_is_kept_in_the_snapshot() {
+        let root = tmp_root("wt-wip-force");
+        let repo = tmp_repo("wt-wip-force");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        std::fs::write(p.join(".gitignore"), b"generated.txt\n").unwrap();
+        std::fs::write(p.join("generated.txt"), b"staged on purpose").unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(["add", "-f", "generated.txt"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        ws.remove("id-1", "MT-1").unwrap();
+
+        let refs = wip_refs(&repo, "id-1");
+        assert_eq!(refs.len(), 1, "exactly one snapshot: {refs:?}");
+        let show = |f: &str| git_stdout(&repo, &["show", &format!("{}:{f}", refs[0])]);
+        assert_eq!(show("generated.txt").as_deref(), Some("staged on purpose"));
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
