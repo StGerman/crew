@@ -7,16 +7,16 @@
 //! [`FakeClock`]: crate::clock::FakeClock
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    KillResult, Progress, RateLimitSignal, RunHandle, Session, TokenUsage, ToolEndpoint, Worker,
+    KillResult, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage, ToolEndpoint,
+    Worker,
 };
 use crate::clock::{Clock, Mono};
-use crate::model::{ErrorClass, Feedback, Issue, Outcome, ReviewVerdict};
-use crate::transcript::TranscriptWriter;
+use crate::model::{ErrorClass, Feedback, Outcome, ReviewVerdict};
+use crate::workspace::WipSnapshot;
 
 #[derive(Debug, Clone)]
 pub struct Script {
@@ -103,6 +103,8 @@ pub struct FakeWorker {
     /// this, and whether a red CI or a review actually reached the next run is exactly what
     /// its tests need to see.
     feedback: Mutex<HashMap<String, Vec<Option<Feedback>>>>,
+    /// The work-in-progress snapshot each spawn was told about, for the same reason.
+    wips: Mutex<HashMap<String, Vec<Vec<WipSnapshot>>>>,
 }
 
 impl FakeWorker {
@@ -114,6 +116,7 @@ impl FakeWorker {
             sessions: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(HashMap::new()),
             feedback: Mutex::new(HashMap::new()),
+            wips: Mutex::new(HashMap::new()),
         }
     }
 
@@ -140,22 +143,20 @@ impl FakeWorker {
     pub fn feedback_for(&self, issue_id: &str) -> Vec<Option<Feedback>> {
         self.feedback.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
     }
+
+    /// The work-in-progress snapshot each spawn for this issue was handed, oldest first.
+    pub fn wips_for(&self, issue_id: &str) -> Vec<Vec<WipSnapshot>> {
+        self.wips.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
+    }
 }
 
 impl Worker for FakeWorker {
-    fn spawn(
-        &self,
-        issue: &Issue,
-        _workspace: &Path,
-        _attempt: u32,
-        session: &Session,
-        tools: Option<&ToolEndpoint>,
-        transcript: Option<TranscriptWriter>,
-        feedback: Option<&Feedback>,
-    ) -> Arc<dyn RunHandle> {
+    fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
+        let Spawn { issue, session, tools, transcript, feedback, wip, .. } = req;
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
         self.endpoints.lock().unwrap().entry(issue.id.clone()).or_default().push(tools.cloned());
         self.feedback.lock().unwrap().entry(issue.id.clone()).or_default().push(feedback.cloned());
+        self.wips.lock().unwrap().entry(issue.id.clone()).or_default().push(wip.to_vec());
 
         let script = self
             .scripts
@@ -313,7 +314,10 @@ impl RunHandle for FakeRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
     use crate::clock::FakeClock;
+    use crate::model::Issue;
 
     fn issue() -> Issue {
         Issue {
@@ -336,8 +340,7 @@ mod tests {
     fn a_run_finishes_only_once_the_clock_reaches_its_duration() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h =
-            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into())));
 
         assert!(h.finished().is_none());
         c.advance_ms(3_999);
@@ -350,8 +353,7 @@ mod tests {
     fn progress_accumulates_turns_as_time_passes_and_totals_appear_only_at_completion() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h =
-            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into())));
 
         let p0 = h.progress();
         c.advance_ms(3_999);
@@ -369,8 +371,7 @@ mod tests {
         // total, and the fake must not hand the scheduler one the real thing never would.
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h =
-            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into())));
 
         c.advance_ms(2_000);
         assert_eq!(h.kill(1_000), KillResult::Stopped);
@@ -383,8 +384,7 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h =
-            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into())));
 
         c.advance_ms(1_000);
         let frozen = h.progress();
@@ -398,8 +398,7 @@ mod tests {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
         w.script("iss-1", Script::stalls_after(1_000));
-        let h =
-            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into())));
 
         c.advance_ms(5_000);
         assert_eq!(h.kill(1_000), KillResult::Forced);
@@ -410,8 +409,7 @@ mod tests {
     fn killing_an_already_finished_run_is_a_no_op() {
         let c = Arc::new(FakeClock::new());
         let w = FakeWorker::new(c.clone());
-        let h =
-            w.spawn(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into()), None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), Path::new("/tmp"), 0, &Session::New("s-1".into())));
         c.advance_ms(4_000);
         assert_eq!(h.kill(1_000), KillResult::AlreadyDone);
         assert_eq!(h.finished(), Some(Outcome::Done), "verdict must not be rewritten");

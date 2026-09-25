@@ -40,7 +40,7 @@ use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RunRecord, Store};
 use crate::tracker::{Tracker, TrackerError};
 use crate::transcript::Transcripts;
-use crate::worker::{Progress, RunHandle, Session, TokenUsage, Worker};
+use crate::worker::{Progress, RunHandle, Session, Spawn, TokenUsage, Worker};
 use crate::workspace::Workspace;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
@@ -1427,15 +1427,13 @@ impl Scheduler {
             })
             .or_else(|| brief.map(|b| Feedback::Gate { output: b.to_string() }));
 
-        let handle = self.worker.spawn(
-            issue,
-            &prepared.path,
-            attempt,
-            &session,
-            broker_session.as_ref().map(|s| s.endpoint()),
+        let handle = self.worker.spawn(Spawn {
+            tools: broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
-            feedback.as_ref(),
-        );
+            feedback: feedback.as_ref(),
+            wip: &prepared.wip,
+            ..Spawn::new(issue, &prepared.path, attempt, &session)
+        });
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
         let now = self.clock.mono();
@@ -1452,6 +1450,7 @@ impl Scheduler {
             resumed = session.is_resume(),
             tools = broker_session.is_some(),
             feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
+            wip = prepared.wip.len(),
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
             "dispatched"
         );

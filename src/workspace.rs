@@ -49,6 +49,22 @@ pub struct Prepared {
     /// and a name derived from the *current* identifier would silently stop matching the ref
     /// this call actually checked out.
     pub branch: Option<String>,
+    /// Uncommitted work earlier runs' removals saved for this issue, oldest first; empty when
+    /// there is none. Reported rather than applied: a stale snapshot applied silently can
+    /// conflict with work committed since, so the agent is told it exists and decides (#22).
+    pub wip: Vec<WipSnapshot>,
+}
+
+/// A side ref holding the uncommitted state of a worktree at the moment it was removed.
+///
+/// Kept off the run's branch on purpose: the handoff gate, delivery and `remove`'s merged check
+/// all read the branch, and a snapshot commit there would be handed off as the agent's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WipSnapshot {
+    /// Full ref name, `refs/symphony/wip/<issue key>/<sequence>-<commit>`.
+    pub ref_name: String,
+    /// `git diff --stat` of the snapshot against the branch head it was taken on.
+    pub diffstat: String,
 }
 
 /// What `remove` did to the branch, as distinct from the worktree directory it always removes.
@@ -137,7 +153,7 @@ impl Workspace for DirWorkspace {
         let created_now = !path.exists();
         std::fs::create_dir_all(&path)
             .map_err(|source| WorkspaceError::Io { path: path.clone(), source })?;
-        Ok(Prepared { path, created_now, branch: None })
+        Ok(Prepared { path, created_now, branch: None, wip: Vec::new() })
     }
 
     fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
@@ -154,12 +170,14 @@ impl Workspace for DirWorkspace {
 /// A real `git worktree` per issue, checked out on its own branch off whatever `repo`'s HEAD
 /// happens to be when the worktree is created.
 ///
-/// **Uncommitted work is discarded on removal.** `remove` force-removes the worktree, which
-/// throws away anything the agent never committed. The alternative — refusing to remove a
-/// dirty worktree — would strand every issue that reaches a terminal state with so much as an
-/// untracked scratch file, and nothing upstream of this type inspects worktree contents before
-/// asking for cleanup. An agent that wants work preserved has to commit it; that is the only
-/// signal this type can see.
+/// **Uncommitted work is snapshotted, not discarded, on removal.** A run killed mid-flight —
+/// stall, turn budget, shutdown — leaves whatever it had not committed in the directory, and
+/// `remove` force-removes that directory (#22). Refusing to remove a dirty worktree instead
+/// would strand every issue that reaches a terminal state with so much as a scratch file. So
+/// `remove` first commits the dirty tree under [`GitWorktreeWorkspace::wip_prefix`], a side ref the
+/// branch never sees, and `prepare` reports it to the next run. Every removal path goes through
+/// here, and every caller has already confirmed the run stopped, so this is the one place the
+/// snapshot can sit in the window between `kill` and deletion without a caller forgetting it.
 ///
 /// **Committed work survives it.** The branch outlives the worktree whenever it carries commits
 /// `repo`'s HEAD does not already have. Cleanup is driven by a ticket reaching a terminal state,
@@ -236,10 +254,19 @@ impl GitWorktreeWorkspace {
     }
 
     fn git(repo: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
+        Self::git_env(repo, args, &[])
+    }
+
+    fn git_env(
+        repo: &Path,
+        args: &[&str],
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Result<String, WorkspaceError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo)
             .args(args)
+            .envs(env.iter().copied())
             .output()
             .map_err(|source| WorkspaceError::Io { path: repo.to_path_buf(), source })?;
         if !output.status.success() {
@@ -259,11 +286,107 @@ impl GitWorktreeWorkspace {
     /// Dots are dropped even though the directory name keeps them: `a..b` is a legal directory
     /// and an illegal ref, and a hostile identifier reaches both.
     fn branch_name(issue_id: &str, identifier: &str) -> String {
-        let key: String = worktree_key(issue_id, identifier)
-            .chars()
-            .map(|c| if c == '.' { '_' } else { c })
-            .collect();
-        format!("symphony/{key}")
+        format!("symphony/{}", Self::ref_key(issue_id, identifier))
+    }
+
+    fn ref_key(issue_id: &str, identifier: &str) -> String {
+        worktree_key(issue_id, identifier).chars().map(|c| if c == '.' { '_' } else { c }).collect()
+    }
+
+    /// Where this issue's snapshots live, one ref per snapshot beneath it.
+    ///
+    /// Keyed on the issue id alone: the identifier can be renamed after a snapshot is taken
+    /// (`Store::ensure` allows it), and a ref named after the old one would be invisible to
+    /// the next `prepare`. Outside `refs/heads/` so no branch listing, push or merged check
+    /// ever sees it, and outside `refs/worktree/` so it lives in the shared `.git` and
+    /// outlives the worktree.
+    pub fn wip_prefix(issue_id: &str) -> String {
+        format!("refs/symphony/wip/{}", Self::ref_key(issue_id, issue_id))
+    }
+
+    /// Commit the worktree's tracked changes and untracked, non-ignored files to a new ref
+    /// under `prefix`, parented on its HEAD, and return that ref when there was anything to
+    /// save.
+    ///
+    /// One ref per snapshot rather than one per issue: two runs stopped in turn both snapshot
+    /// off the branch head, so moving a single ref would orphan the first before the agent had
+    /// decided anything about it.
+    ///
+    /// Built in a scratch index so the worktree's own index — which the agent may have staged
+    /// into deliberately — is never touched, and compared against HEAD's tree so a clean
+    /// worktree creates no ref and an ordinary finish gains no noise. Authored as `symphony-cc`
+    /// so it cannot be mistaken for the agent's own commit.
+    fn snapshot(path: &Path, prefix: &str) -> Result<Option<String>, WorkspaceError> {
+        let index = Self::git(path, &["rev-parse", "--git-path", "symphony-wip-index"])?;
+        let index = path.join(index);
+        let _ = std::fs::remove_file(&index);
+        let env: [(&str, &std::ffi::OsStr); 5] = [
+            ("GIT_INDEX_FILE", index.as_os_str()),
+            ("GIT_AUTHOR_NAME", "symphony-cc".as_ref()),
+            ("GIT_AUTHOR_EMAIL", "symphony-cc@localhost".as_ref()),
+            ("GIT_COMMITTER_NAME", "symphony-cc".as_ref()),
+            ("GIT_COMMITTER_EMAIL", "symphony-cc@localhost".as_ref()),
+        ];
+        let result = (|| {
+            // Seeded from the worktree's own index, not from HEAD: a path the agent staged past
+            // `.gitignore` (`git add -f`) exists only there, and `add -A` over a HEAD-seeded
+            // index would treat it as ignored and leave it out of the snapshot.
+            let real = path.join(Self::git(path, &["rev-parse", "--git-path", "index"])?);
+            if std::fs::copy(&real, &index).is_err() {
+                Self::git_env(path, &["read-tree", "HEAD"], &env)?;
+            }
+            Self::git_env(path, &["add", "-A"], &env)?;
+            let tree = Self::git_env(path, &["write-tree"], &env)?;
+            if tree == Self::git(path, &["rev-parse", "HEAD^{tree}"])? {
+                return Ok(None);
+            }
+            let msg = "symphony-cc: uncommitted work at removal\n\nSnapshot of the worktree as \
+                       its run left it, parented on the branch head. Not on any branch; apply \
+                       with `git cherry-pick --no-commit <ref>`.";
+            let commit =
+                Self::git_env(path, &["commit-tree", &tree, "-p", "HEAD", "-m", msg], &env)?;
+            let wip_ref = format!(
+                "{prefix}/{:06}-{}",
+                Self::next_wip_seq(path, prefix),
+                &commit[..commit.len().min(12)]
+            );
+            Self::git(path, &["update-ref", &wip_ref, &commit])?;
+            Ok(Some(wip_ref))
+        })();
+        // Best-effort: the scratch index lives in this worktree's admin directory, which the
+        // `worktree remove` that follows deletes anyway.
+        let _ = std::fs::remove_file(&index);
+        result
+    }
+
+    /// One past the highest sequence number already under `prefix`, so `refname` order is
+    /// creation order. Commit dates cannot give that: they have one-second resolution, and two
+    /// removals of the same issue inside one second would list in arbitrary order.
+    fn next_wip_seq(repo: &Path, prefix: &str) -> u32 {
+        let refs = Self::git(repo, &["for-each-ref", "--format=%(refname:lstrip=-1)", prefix])
+            .unwrap_or_default();
+        refs.lines()
+            .filter_map(|name| name.split('-').next()?.parse::<u32>().ok())
+            .max()
+            .map_or(1, |n| n + 1)
+    }
+
+    /// Every snapshot earlier removals left for this issue, oldest first.
+    ///
+    /// Best-effort: a listing git refuses reads as none, costing the next run a hint and never
+    /// costing it the dispatch. The refs themselves are untouched either way.
+    fn existing_wip(&self, issue_id: &str) -> Vec<WipSnapshot> {
+        let prefix = Self::wip_prefix(issue_id);
+        let args = ["for-each-ref", "--sort=refname", "--format=%(refname)", &prefix];
+        let Ok(refs) = Self::git(&self.repo, &args) else { return Vec::new() };
+        refs.lines()
+            .map(|ref_name| {
+                let range = format!("{ref_name}^..{ref_name}");
+                let diffstat =
+                    Self::git(&self.repo, &["diff", "--stat", &range]).unwrap_or_default();
+                WipSnapshot { ref_name: ref_name.to_string(), diffstat }
+            })
+            .collect()
     }
 
     /// True when `branch` exists and holds commits `repo`'s HEAD does not already contain.
@@ -323,8 +446,9 @@ impl Workspace for GitWorktreeWorkspace {
         // this type, or any other stray write to the workspace root — as an already-prepared
         // worktree, when nothing ever registered it with git.
         let branch = Self::branch_name(issue_id, identifier);
+        let wip = self.existing_wip(issue_id);
         if Self::is_worktree_checkout(&path) {
-            return Ok(Prepared { path, created_now: false, branch: Some(branch) });
+            return Ok(Prepared { path, created_now: false, branch: Some(branch), wip });
         }
 
         let path_str = path.to_string_lossy().into_owned();
@@ -341,7 +465,7 @@ impl Workspace for GitWorktreeWorkspace {
         } else {
             Self::git(&self.repo, &["worktree", "add", "-B", &branch, &path_str])?;
         }
-        Ok(Prepared { path, created_now: true, branch: Some(branch) })
+        Ok(Prepared { path, created_now: true, branch: Some(branch), wip })
     }
 
     fn remove(&self, issue_id: &str, identifier: &str) -> Result<Removed, WorkspaceError> {
@@ -362,6 +486,19 @@ impl Workspace for GitWorktreeWorkspace {
             .into_iter()
             .filter(|(wt, _)| wt != &path && wt.starts_with(&path))
             .collect();
+
+        // Before the directory goes, and failing closed: a snapshot that could not be taken
+        // leaves the worktree in place for the next cleanup to retry, rather than deleting the
+        // only copy of the work. A plain directory at the path has nothing to snapshot, and
+        // `worktree remove` below refuses it with git's own error.
+        if Self::is_worktree_checkout(&path)
+            && let Some(wip_ref) = Self::snapshot(&path, &Self::wip_prefix(issue_id))?
+        {
+            tracing::info!(
+                worktree = %path.display(), wip = %wip_ref,
+                "worktree held uncommitted work; snapshotted it before removal"
+            );
+        }
 
         let path_str = path.to_string_lossy().into_owned();
         Self::git(&self.repo, &["worktree", "remove", "--force", &path_str])?;
@@ -725,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_worktree_discards_uncommitted_work_and_prunes_the_branch() {
+    fn removing_a_worktree_prunes_a_branch_that_carries_no_commits_even_from_a_dirty_tree() {
         let root = tmp_root("wt-remove");
         let repo = tmp_repo("wt-remove");
         let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
@@ -811,6 +948,174 @@ mod tests {
         assert!(!p.exists(), "the directory is scratch space and still goes");
         assert!(branch_exists(&repo, &branch), "the run's commits must survive cleanup");
         assert!(!removed.branch_deleted, "and remove must say so, not just leave it alone");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    fn git_stdout(at: &Path, args: &[&str]) -> Option<String> {
+        let out = Command::new("git").arg("-C").arg(at).args(args).output().unwrap();
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn wip_refs(repo: &Path, issue_id: &str) -> Vec<String> {
+        let prefix = GitWorktreeWorkspace::wip_prefix(issue_id);
+        let out = git_stdout(repo, &["for-each-ref", "--format=%(refname)", &prefix]).unwrap();
+        out.lines().map(str::to_string).collect()
+    }
+
+    /// `Store::ensure` lets an identifier change under a live issue id. A snapshot keyed on the
+    /// identifier it was taken under would be invisible to every `prepare` after the rename.
+    #[test]
+    fn a_snapshot_is_reported_after_its_issue_is_renamed() {
+        let root = tmp_root("wt-wip-rename");
+        let repo = tmp_repo("wt-wip-rename");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        std::fs::write(p.join("half.txt"), b"half-done").unwrap();
+        ws.remove("id-1", "MT-1").unwrap();
+
+        let renamed = ws.prepare("id-1", "MT-1-renamed").unwrap();
+        assert_eq!(renamed.wip.len(), 1, "the snapshot must follow the issue, not its name");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Both snapshots are parented on the branch head, so neither is an ancestor of the other:
+    /// moving one ref per issue would have left the first reachable from nothing.
+    #[test]
+    fn a_second_interrupted_run_does_not_overwrite_the_first_runs_snapshot() {
+        let root = tmp_root("wt-wip-twice");
+        let repo = tmp_repo("wt-wip-twice");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        std::fs::write(p.join("first.txt"), b"first run").unwrap();
+        ws.remove("id-1", "MT-1").unwrap();
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        std::fs::write(p.join("second.txt"), b"second run").unwrap();
+        ws.remove("id-1", "MT-1").unwrap();
+
+        let reported = ws.prepare("id-1", "MT-1").unwrap().wip;
+        assert_eq!(reported.len(), 2, "both snapshots must be reported: {reported:?}");
+        let show = |r: &str, f: &str| git_stdout(&repo, &["show", &format!("{r}:{f}")]);
+        assert_eq!(show(&reported[0].ref_name, "first.txt").as_deref(), Some("first run"));
+        assert_eq!(show(&reported[1].ref_name, "second.txt").as_deref(), Some("second run"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A path staged past `.gitignore` lives only in the worktree's own index; a scratch index
+    /// rebuilt from HEAD would see it as ignored and drop it from the snapshot.
+    #[test]
+    fn a_file_force_staged_past_gitignore_is_kept_in_the_snapshot() {
+        let root = tmp_root("wt-wip-force");
+        let repo = tmp_repo("wt-wip-force");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        std::fs::write(p.join(".gitignore"), b"generated.txt\n").unwrap();
+        std::fs::write(p.join("generated.txt"), b"staged on purpose").unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(["add", "-f", "generated.txt"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        ws.remove("id-1", "MT-1").unwrap();
+
+        let refs = wip_refs(&repo, "id-1");
+        assert_eq!(refs.len(), 1, "exactly one snapshot: {refs:?}");
+        let show = |f: &str| git_stdout(&repo, &["show", &format!("{}:{f}", refs[0])]);
+        assert_eq!(show("generated.txt").as_deref(), Some("staged on purpose"));
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The guard for #22: a run stopped mid-flight leaves its uncommitted work in the worktree,
+    /// and `remove` is what deletes it. Without the snapshot step the ref does not exist.
+    #[test]
+    fn a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref() {
+        let root = tmp_root("wt-wip");
+        let repo = tmp_repo("wt-wip");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        commit_in(&p, "work.txt", "committed");
+        let branch_head = head_of(&p);
+        std::fs::write(p.join("work.txt"), b"edited, not committed").unwrap();
+        std::fs::write(p.join("new.txt"), b"never added").unwrap();
+        ws.remove("id-1", "MT-1").unwrap();
+
+        assert!(!p.exists());
+        let refs = wip_refs(&repo, "id-1");
+        assert_eq!(refs.len(), 1, "exactly one snapshot: {refs:?}");
+        let wip = &refs[0];
+        let show = |f: &str| git_stdout(&repo, &["show", &format!("{wip}:{f}")]);
+        assert_eq!(show("work.txt").as_deref(), Some("edited, not committed"));
+        assert_eq!(show("new.txt").as_deref(), Some("never added"));
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", &format!("{wip}^")]).as_deref(),
+            Some(branch_head.as_str()),
+            "the snapshot is parented on the branch head it was taken from"
+        );
+        let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", &branch]).as_deref(),
+            Some(branch_head.as_str()),
+            "the run's branch must not move: it carries only the agent's own commits"
+        );
+        assert_eq!(
+            git_stdout(&repo, &["log", "-1", "--format=%an", wip]).as_deref(),
+            Some("symphony-cc"),
+            "and the snapshot must be distinguishable from the agent's commits"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_clean_worktree_is_removed_without_creating_a_wip_ref() {
+        let root = tmp_root("wt-wip-clean");
+        let repo = tmp_repo("wt-wip-clean");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        commit_in(&p, ".gitignore", "target\n");
+        std::fs::create_dir(p.join("target")).unwrap();
+        std::fs::write(p.join("target/build.o"), b"ignored output is not work").unwrap();
+
+        ws.remove("id-1", "MT-1").unwrap();
+
+        assert_eq!(wip_refs(&repo, "id-1"), Vec::<String>::new());
+        assert!(ws.prepare("id-1", "MT-1").unwrap().wip.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn the_next_prepare_reports_the_snapshot_with_its_diffstat_and_leaves_the_tree_clean() {
+        let root = tmp_root("wt-wip-next");
+        let repo = tmp_repo("wt-wip-next");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+
+        let p = ws.prepare("id-1", "MT-1").unwrap().path;
+        assert!(ws.prepare("id-1", "MT-1").unwrap().wip.is_empty());
+        std::fs::write(p.join("half.txt"), b"half-done\n").unwrap();
+        ws.remove("id-1", "MT-1").unwrap();
+
+        let next = ws.prepare("id-1", "MT-1").unwrap();
+        let [wip] = next.wip.as_slice() else { panic!("one snapshot reported: {:?}", next.wip) };
+        assert_eq!(wip.ref_name, wip_refs(&repo, "id-1")[0]);
+        assert!(wip.diffstat.contains("half.txt"), "diffstat: {}", wip.diffstat);
+        assert!(!next.path.join("half.txt").exists(), "nothing is applied automatically");
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();

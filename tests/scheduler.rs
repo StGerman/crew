@@ -1527,6 +1527,66 @@ fn commit_in(worktree: &Path, file: &str, msg: &str) {
     git(worktree, &["commit", "-q", "-m", msg]);
 }
 
+fn git_out(at: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").arg("-C").arg(at).args(args).output().unwrap();
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Issue #22. A run stopped mid-flight by its ticket closing is killed and then has its worktree
+/// removed, and whatever it had not committed used to go with the directory. It must land on the
+/// side ref instead, leave the run's branch alone, and be named to the next run of the issue.
+#[test]
+fn a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed() {
+    let dir = tmp_dir("killed-wip");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open_in_memory().unwrap(),
+        Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+        |_| {},
+    );
+    h.worker.set_default(Script::succeeds_in(600_000));
+    h.sched.tick().unwrap();
+
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    commit_in(&ws, "work.txt", "committed before the kill");
+    let head = git_out(&ws, &["rev-parse", "HEAD"]).unwrap();
+    let branch = git_out(&ws, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+    std::fs::write(ws.join("half.txt"), b"not yet committed").unwrap();
+
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "the run is killed");
+    assert!(!ws.exists(), "and its worktree removed");
+
+    let prefix = GitWorktreeWorkspace::wip_prefix("iss-1");
+    let refs = git_out(&repo, &["for-each-ref", "--format=%(refname)", &prefix]).unwrap();
+    let wip = refs.lines().next().expect("a snapshot ref must exist").to_string();
+    assert_eq!(
+        git_out(&repo, &["show", &format!("{wip}:half.txt")]).as_deref(),
+        Some("not yet committed"),
+        "the uncommitted work must be recoverable from the snapshot ref"
+    );
+    assert_eq!(git_out(&repo, &["rev-parse", &branch]), Some(head), "the branch is untouched");
+
+    h.tracker.set_state("iss-1", "In Progress");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1);
+    assert!(!ws.join("half.txt").exists(), "nothing is applied to the new worktree");
+    let told = h.worker.wips_for("iss-1");
+    assert_eq!(told.first(), Some(&vec![]), "the first run had no snapshot to be told about");
+    let [last] = told.last().unwrap().as_slice() else { panic!("the next run must be told") };
+    assert_eq!(last.ref_name, wip);
+    assert!(last.diffstat.contains("half.txt"), "diffstat: {}", last.diffstat);
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A restarted process gets a `FakeClock` that starts where the dead one's did, which no real
 /// restart does. Run ids are `issue_id`-plus-wall-millisecond, so without this the re-dispatch
 /// collides with the row the interrupted run left behind.

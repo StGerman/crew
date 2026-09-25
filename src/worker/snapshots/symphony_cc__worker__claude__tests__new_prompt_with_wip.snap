@@ -1,0 +1,23 @@
+---
+source: src/worker/claude.rs
+expression: "build_prompt(&issue(), None, None, &wip)"
+---
+You are working on issue MT-1: t
+
+Investigate and resolve this issue in the current working directory, committing your changes as you go. When you have fully completed the work, simply stop.
+
+If you have made real progress but need another turn to finish, end your final message with a line reading exactly:
+SYMPHONY_OUTCOME: continue: <one-sentence reason>
+
+If you are stuck and need a human to unblock you, end your final message with:
+SYMPHONY_OUTCOME: blocked: <one-sentence reason>
+
+Earlier runs on this issue were stopped with uncommitted work, and the orchestrator saved it to the refs below, oldest first — each a commit on top of the branch head it was taken from, not on your branch. Decide whether each is still useful. To apply one: `git cherry-pick --no-commit <ref>`. Once you have applied or discarded it, delete it with `git update-ref -d <ref>` so the next run is not told about it again.
+
+`refs/symphony/wip/iss-1-abc/000001-0123456789ab`:
+ half.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+`refs/symphony/wip/iss-1-abc/000002-ba9876543210`:
+ src/lib.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)

@@ -1,0 +1,13 @@
+---
+source: src/worker/claude.rs
+expression: "build_prompt(&issue(), None, None, &[])"
+---
+You are working on issue MT-1: t
+
+Investigate and resolve this issue in the current working directory, committing your changes as you go. When you have fully completed the work, simply stop.
+
+If you have made real progress but need another turn to finish, end your final message with a line reading exactly:
+SYMPHONY_OUTCOME: continue: <one-sentence reason>
+
+If you are stuck and need a human to unblock you, end your final message with:
+SYMPHONY_OUTCOME: blocked: <one-sentence reason>
