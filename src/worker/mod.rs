@@ -7,13 +7,14 @@
 pub mod claude;
 pub mod fake;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Feedback, Issue, Outcome, ReviewVerdict};
 use crate::transcript::TranscriptWriter;
+use crate::workspace::WipSnapshot;
 
 /// Where this run's host-side tool broker is, when there is one.
 ///
@@ -163,32 +164,55 @@ pub enum KillResult {
     AlreadyDone,
 }
 
+/// Everything one attempt is spawned with.
+///
+/// A struct rather than positional arguments because four of these are adjacent `Option`s that a
+/// call site could swap without a type error. Build it with [`Spawn::new`] and set what applies.
+pub struct Spawn<'a> {
+    pub issue: &'a Issue,
+    pub workspace: &'a Path,
+    pub attempt: u32,
+    pub session: &'a Session,
+    /// `None` when the broker is unavailable. That is a degrade, not an error: the run proceeds
+    /// without tracker tools rather than failing, so a broker that cannot bind costs the agent a
+    /// capability and nothing else.
+    pub tools: Option<&'a ToolEndpoint>,
+    /// Owned rather than borrowed because the implementation that matters hands it to a reader
+    /// thread that outlives the call; `None` means transcripts are off or the file could not be
+    /// opened, and carries the same degrade-never-fail contract as `tools`. An implementation
+    /// writes to it and never reads it back — where it points is already known to the
+    /// scheduler, which is what records the path.
+    pub transcript: Option<TranscriptWriter>,
+    /// What the orchestrator knows about why this attempt exists that the agent cannot see from
+    /// inside its worktree — the handoff gate's failing output, a red CI, review comments — and
+    /// `None` on a first dispatch. The worker renders it into the prompt; the scheduler does not,
+    /// because the prompt's wording and the verdict marker the worker parses back are one
+    /// convention and live in one module. It reaches the agent through the prompt and nothing
+    /// else, so a worker that ignores it is degraded, not wrong.
+    pub feedback: Option<&'a Feedback>,
+    /// Uncommitted work earlier runs of this issue left behind when their worktrees were
+    /// removed, oldest first. Separate from `feedback` because the two are independent — a
+    /// gate-sent continuation can also have a snapshot — and, like it, reaches the agent only
+    /// through the prompt: the worktree it is handed is clean, and applying a snapshot is the
+    /// agent's call.
+    pub wip: &'a [WipSnapshot],
+}
+
+impl<'a> Spawn<'a> {
+    pub fn new(issue: &'a Issue, workspace: &'a Path, attempt: u32, session: &'a Session) -> Self {
+        Self {
+            issue,
+            workspace,
+            attempt,
+            session,
+            tools: None,
+            transcript: None,
+            feedback: None,
+            wip: &[],
+        }
+    }
+}
+
 pub trait Worker: Send + Sync {
-    /// `tools` is `None` when the broker is unavailable. That is a degrade, not an error: the
-    /// run proceeds without tracker tools rather than failing, so a broker that cannot bind
-    /// costs the agent a capability and nothing else.
-    ///
-    /// `transcript` is owned rather than borrowed because the implementation that matters hands
-    /// it to a reader thread that outlives this call; `None` means transcripts are off or the
-    /// file could not be opened, and carries the same degrade-never-fail contract as `tools`.
-    /// An implementation writes to it and never reads it back — where it points is already
-    /// known to the scheduler, which is what records the path.
-    ///
-    /// `feedback` is what the orchestrator knows about why this attempt exists that the agent
-    /// cannot see from inside its worktree — the handoff gate's failing output, a red CI, review
-    /// comments — and is `None` on a first dispatch. The worker renders it into the prompt; the
-    /// scheduler does not, because the prompt's wording and the verdict marker the worker
-    /// parses back are one convention and live in one module. It reaches the agent through the
-    /// prompt and nothing else, so a worker that ignores it is degraded, not wrong.
-    #[allow(clippy::too_many_arguments)]
-    fn spawn(
-        &self,
-        issue: &Issue,
-        workspace: &std::path::Path,
-        attempt: u32,
-        session: &Session,
-        tools: Option<&ToolEndpoint>,
-        transcript: Option<TranscriptWriter>,
-        feedback: Option<&Feedback>,
-    ) -> Arc<dyn RunHandle>;
+    fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle>;
 }

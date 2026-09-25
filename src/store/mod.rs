@@ -473,6 +473,32 @@ impl Store {
         Ok(())
     }
 
+    /// Count one more consecutive handoff-gate failure and return the streak including it.
+    ///
+    /// Persisted rather than kept on the scheduler, because a streak that lives in memory is
+    /// reset by every restart and `gate.max_failures` then never escalates an issue whose
+    /// suite keeps failing across restarts (#46). Deliberately not on the published `Snapshot`:
+    /// mid-streak there is nothing for an operator to do, and the `Blocked` note that ends one
+    /// already names the count.
+    pub fn bump_gate_failures(&self, issue_id: &str) -> rusqlite::Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "UPDATE issue_state SET gate_failures = gate_failures + 1 WHERE issue_id = ?1
+             RETURNING gate_failures",
+            params![issue_id],
+            |r| r.get::<_, i64>(0).map(|v| v as u32),
+        )
+    }
+
+    pub fn clear_gate_failures(&self, issue_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET gate_failures = 0 WHERE issue_id = ?1",
+            params![issue_id],
+        )?;
+        Ok(())
+    }
+
     pub fn add_turns(&self, issue_id: &str, turns: u32) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

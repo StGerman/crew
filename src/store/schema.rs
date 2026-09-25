@@ -145,6 +145,14 @@ pub(super) const MIGRATIONS: &[&str] = &[
       PRIMARY KEY (issue_id, comment_id)
     );
     "#,
+    // v7
+    r#"
+    -- Consecutive handoff-gate failures (#46). Held only in memory, a restart forgave the
+    -- streak while nothing about the issue had changed, so `gate.max_failures` bounded failures
+    -- per process rather than per line of work — and a suite the agent cannot make pass is the
+    -- case both most in need of the bound and most likely to outlive a restart.
+    ALTER TABLE issue_state ADD COLUMN gate_failures INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

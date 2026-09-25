@@ -164,6 +164,7 @@ this file.
 | `blake3` | Collision-proof suffix for `worktree_key`, derivation of `session_id` | Deterministic on purpose, see `src/model.rs` |
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
+| `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |
 | `libc` | Process-group signals in `src/worker/claude.rs` | Leaves with #50 |
 | `ratatui` | The dashboard | |
 | `rusqlite` (bundled) | The store | Bundled so no system SQLite is needed |
@@ -187,7 +188,6 @@ linked issue.
 | `getrandom` | OS entropy for the broker bearer token | #51 |
 | `tempfile` | Temp directories in tests with automatic cleanup | #54 |
 | `rstest` | Shared fixtures for the test harness | #54 |
-| `insta` | Snapshot tests for rendered text | #56 |
 | `tiny_http` | One HTTP/1.1 server for both listeners | #57 or its follow-ups |
 | `bon` | Builders for signatures over the parameter limit | #60 |
 | `serde_rusqlite` | Derived row mapping in the store | #61 |
