@@ -233,8 +233,22 @@ fn parse_created_at(s: &str) -> Option<i64> {
     OffsetDateTime::parse(s, &Rfc3339).ok().map(|t| t.unix_timestamp() * 1000)
 }
 
+/// Without this an issue labelled `Agent` never matches a configured `agent` and is never
+/// dispatched (#70): `routable` compares with plain equality against `required_labels`, which
+/// `Config::normalize` has already given this same shape.
+fn normalize_labels(labels: Vec<GhLabel>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for label in labels {
+        let name = label.name.trim().to_lowercase();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 fn to_issue(owner: &str, repo: &str, gh: GhIssue) -> Issue {
-    let labels: Vec<String> = gh.labels.into_iter().map(|l| l.name).collect();
+    let labels = normalize_labels(gh.labels);
     let closed = gh.state == "closed";
     Issue {
         id: format!("{owner}/{repo}#{}", gh.number),
@@ -314,6 +328,45 @@ impl<H: Http> GithubTracker<H> {
         })
     }
 
+    /// Labels normalized here would be renamed on GitHub by the next `set_state`, which writes
+    /// them back (#70), so this returns GitHub's own names and `by_ids` normalizes them itself.
+    fn fetch_issue(&self, id: &str) -> Result<Option<GhIssue>, TrackerError> {
+        // An id this tracker never issued (wrong owner/repo, or malformed) cannot be
+        // "visible" to it — omit rather than error, same as a clean 404 below.
+        let Some(number) = parse_dispatch_id(id, &self.owner, &self.repo) else {
+            return Ok(None);
+        };
+
+        let url = format!("{API_BASE}/repos/{}/{}/issues/{number}", self.owner, self.repo);
+        let resp = match self.http.get(&url, &self.headers()) {
+            Ok(r) => r,
+            Err(e) => return Err(TrackerError::Request(e.0)),
+        };
+        if resp.status == 404 {
+            return Ok(None); // genuinely gone: the caller's grace-count path handles this
+        }
+        if !(200..300).contains(&resp.status) {
+            // Not "gone" — a real fetch failure. Surfacing it as an error rather than an
+            // omission is the whole point of by_ids's "partial success is an error" rule:
+            // the scheduler cannot otherwise tell a failed check apart from a clean miss.
+            if resp.status == 401 {
+                return Err(TrackerError::Auth(body_snippet(&resp)));
+            }
+            let rate_limited = resp.status == 403 || resp.status == 429;
+            let rate_limit_signal = resp.header("retry-after").is_some()
+                || resp.header("x-ratelimit-remaining").is_some_and(|v| v == "0");
+            if rate_limited && rate_limit_signal {
+                return Err(TrackerError::RateLimited);
+            }
+            return Err(TrackerError::Status(format!("{}: {}", resp.status, body_snippet(&resp))));
+        }
+        let gh = Self::parse_issue(&resp)?;
+        if gh.pull_request.is_some() {
+            return Ok(None); // a PR sharing the issue numbering space; never dispatchable
+        }
+        Ok(Some(gh))
+    }
+
     fn parse_issues(resp: &HttpResponse) -> Result<Vec<GhIssue>, TrackerError> {
         serde_json::from_slice(&resp.body).map_err(|e| TrackerError::Response(e.to_string()))
     }
@@ -374,42 +427,9 @@ impl<H: Http> Tracker for GithubTracker<H> {
         }
         let mut out = Vec::new();
         for id in ids {
-            // An id this tracker never issued (wrong owner/repo, or malformed) cannot be
-            // "visible" to it — omit rather than error, same as a clean 404 below.
-            let Some(number) = parse_dispatch_id(id, &self.owner, &self.repo) else { continue };
-
-            let url = format!("{API_BASE}/repos/{}/{}/issues/{number}", self.owner, self.repo);
-            let resp = match self.http.get(&url, &self.headers()) {
-                Ok(r) => r,
-                Err(e) => return Err(TrackerError::Request(e.0)),
-            };
-            if resp.status == 404 {
-                continue; // genuinely gone: the caller's grace-count path handles this
+            if let Some(gh) = self.fetch_issue(id)? {
+                out.push(to_issue(&self.owner, &self.repo, gh));
             }
-            if !(200..300).contains(&resp.status) {
-                // Not "gone" — a real fetch failure. Surfacing it as an error rather than an
-                // omission is the whole point of by_ids's "partial success is an error" rule:
-                // the scheduler cannot otherwise tell a failed check apart from a clean miss.
-                if resp.status == 401 {
-                    return Err(TrackerError::Auth(body_snippet(&resp)));
-                }
-                let rate_limited = resp.status == 403 || resp.status == 429;
-                let rate_limit_signal = resp.header("retry-after").is_some()
-                    || resp.header("x-ratelimit-remaining").is_some_and(|v| v == "0");
-                if rate_limited && rate_limit_signal {
-                    return Err(TrackerError::RateLimited);
-                }
-                return Err(TrackerError::Status(format!(
-                    "{}: {}",
-                    resp.status,
-                    body_snippet(&resp)
-                )));
-            }
-            let gh = Self::parse_issue(&resp)?;
-            if gh.pull_request.is_some() {
-                continue; // a PR sharing the issue numbering space; never dispatchable
-            }
-            out.push(to_issue(&self.owner, &self.repo, gh));
         }
         Ok(out)
     }
@@ -461,14 +481,18 @@ impl<H: Http> TrackerWrites for GithubTracker<H> {
         // not sent back is removed, and `required_labels` (the `agent` label this repo
         // dispatches on) living in that set means a blind write would make the issue
         // undispatchable.
+        // Through `by_ids`, this would rename the operator's labels on every state change (#70).
         let current = self
-            .by_ids(std::slice::from_ref(&issue_id.to_string()))?
-            .pop()
+            .fetch_issue(issue_id)?
             .ok_or_else(|| TrackerError::Status(format!("{issue_id} is not visible")))?;
 
         let closed = state == "closed";
-        let mut labels: Vec<String> =
-            current.labels.into_iter().filter(|l| !l.starts_with("state:")).collect();
+        let mut labels: Vec<String> = current
+            .labels
+            .into_iter()
+            .map(|l| l.name)
+            .filter(|l| !l.trim().to_lowercase().starts_with("state:"))
+            .collect();
         // `open` and `closed` are carried by the flag itself, so they get no label of their own
         // — a `state:open` label would be a second, disagreeing source of truth.
         if !closed && state != "open" {
@@ -762,6 +786,32 @@ mod tests {
         assert_eq!(derive_state(false, &[]), "open");
     }
 
+    /// Guards dispatch against label casing (#70).
+    #[test]
+    fn labels_are_normalized_at_the_adapter_boundary() {
+        let http = FakeHttp::new();
+        let labels = &["Agent", " agent ", "", "State:In-Progress", "Bug"];
+        http.push(ok(serde_json::json!([gh_issue(3, labels, "open", true)])));
+        let got = tracker(http).by_states(&["in-progress".to_string()]).unwrap();
+
+        assert_eq!(got[0].labels, vec!["agent", "state:in-progress", "bug"]);
+        assert_eq!(
+            got[0].state, "in-progress",
+            "a capitalised `State:` prefix still names the state"
+        );
+    }
+
+    /// Guards dispatch against label casing (#70), by the equality `routable` uses.
+    #[test]
+    fn a_mixed_case_required_label_satisfies_the_normalized_config() {
+        let http = FakeHttp::new();
+        http.push(ok(serde_json::json!(gh_issue(4, &["AGENT"], "open", true))));
+        let got = tracker(http).by_ids(&["o/r#4".to_string()]).unwrap();
+
+        let required = ["agent".to_string()];
+        assert!(required.iter().all(|want| got[0].labels.iter().any(|l| l == want)));
+    }
+
     // ---- the write path (broker tools) -------------------------------------
 
     #[test]
@@ -822,6 +872,29 @@ mod tests {
         labels.sort();
         assert_eq!(labels, vec!["agent", "bug", "state:in-review"]);
         assert!(!labels.contains(&"state:in-progress".to_string()), "the old state must go");
+    }
+
+    /// Guards the operator's labels against being renamed by a state change (#70), and a
+    /// capitalised `State:` label against surviving as a second state.
+    #[test]
+    fn set_state_writes_labels_back_in_their_original_casing() {
+        let http = FakeHttp::new();
+        http.push(ok(serde_json::json!(gh_issue(
+            8,
+            &["Agent", "State:In-Progress", "Bug"],
+            "open",
+            true
+        ))));
+        http.push(ok(serde_json::json!({}))); // PUT labels
+        http.push(ok(serde_json::json!({}))); // PATCH state
+        let t = tracker(http);
+
+        t.set_state("o/r#8", "in-review").unwrap();
+
+        let w = t.http.writes();
+        let labels: Vec<&str> =
+            w[0].2["labels"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        assert_eq!(labels, vec!["Agent", "Bug", "state:in-review"]);
     }
 
     #[test]
