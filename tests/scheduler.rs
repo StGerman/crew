@@ -1075,6 +1075,64 @@ fn repeated_gate_failures_escalate_to_blocked_rather_than_looping() {
     }
 }
 
+/// A restart changes nothing about an issue whose suite keeps failing, so it must not forgive
+/// the streak: held in memory, every restart handed the agent a fresh `max_failures` (#46).
+#[test]
+fn a_gate_failure_streak_is_not_forgiven_by_restarting_the_daemon() {
+    let dir = tmp_dir("gate-streak-restart");
+    let db = dir.join("symphony.db");
+    let root = dir.join("workspaces");
+    let failing = GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
+        step: "cargo test".into(),
+        output: "boom".into(),
+        on_base: true,
+    });
+    let start = |failing: &GateScript| {
+        let mut h = harness_over(
+            vec![issue(1, "In Progress", Some(1))],
+            root.clone(),
+            Store::open(&db).unwrap(),
+            Arc::new(DirWorkspace::new(&root).unwrap()),
+            |c| c.gate.max_failures = 2,
+        );
+        let gate = Arc::new(FakeGate::new(h.clock.clone()));
+        gate.set_default(failing.clone());
+        h.sched.set_gate(Some(gate.clone()));
+        h.worker.set_default(Script::succeeds_in(1_000));
+        (h, gate)
+    };
+
+    {
+        let (mut h, _gate) = start(&failing);
+        dispatch_and_finish(&mut h);
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+        assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::RetryQueued);
+    }
+
+    let (mut h, gate) = start(&failing);
+    // The new process's clock starts where the old one did, so the retry's wall-clock due time
+    // is still ahead of it by the time the first process spent.
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "the continuation survives the restart");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released, "failure 2 of 2 blocks, restart or not");
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "no third try");
+    let note = st.last_error.expect("the escalation must say why");
+    assert!(note.contains("2 time(s)"), "{note}");
+    assert_eq!(gate.starts_for("iss-1").len(), 1, "one gate in this process, one before it");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pass resets the streak: two failures separated by a pass are not an escalation.
 #[test]
 fn a_passing_gate_resets_the_failure_streak() {
