@@ -725,6 +725,22 @@ that has already been broken. Only `rename` (which refuses outright) and `diagno
 (which carries a `complete` flag) wait for a quiescent workspace. Ask again until an answer
 is non-empty before concluding anything from one.
 
+## Skills
+
+Reach for each at the moment named:
+
+- **`engineering:architecture`**: a decision has to be recorded before code (an issue's "Open"
+  section, a new seam or trait, reversing a line in this file). The ADR goes in `docs/adr/`
+  (#63), and the issue and the code cite it in one line.
+- **`mattpocock-skills:diagnosing-bugs`**: a run, a scheduling decision or a test does something
+  nobody can explain. Start from the transcript, `crewctl status <issue>` and the daemon log,
+  and finish with a guard test that fails without the fix.
+- **`/code-review`**: every pull request before it merges, as well as Copilot's review. It
+  catches a second implementation of something that already exists, as on #88.
+
+Watching a running daemon is `/supervise-crewd`, typed by the operator's session. It is never
+loaded into a dispatched agent.
+
 ## Constraints for the worker and broker
 
 Decisions already taken that are expensive to rediscover. The first two are implemented in
