@@ -122,10 +122,22 @@ GITHUB_TOKEN=$(gh auth token) cargo run -- --config crew.github.toml --max-ticks
 ```
 
 points the tracker at this repo's own real Issues instead of the fake demo data —
-`crew.github.toml` is checked in and ready to use, no token in it. Today that lists this
-repo's five open, `agent`-labelled issues and dispatches none of them, because none has an
-assignee yet (see `src/tracker/github.rs`'s module doc for the dispatchability rule and the
-state-label convention).
+`crew.github.toml` is checked in and ready to use, no token in it. It sets
+`tracker.dispatch_label = "agent"`, so every open issue carrying the `agent` label is
+dispatchable and an assignee is neither needed nor sufficient (`DispatchRule` in
+`src/tracker/github.rs`; with the key unset, any assignee is the signal, as before #64).
+
+`tracker.github_app` replaces `GITHUB_TOKEN` with a GitHub App identity (#64): it names a file
+holding `app_id`, `installation_id` and `private_key_path`, and every tracker write, forge call
+and branch push is then authored by the App. The token is a *source*, not a `String`
+(`src/credentials.rs`): an installation token expires hourly, so `GithubApp` mints on the
+injected clock and re-mints `REFRESH_MARGIN_MS` before expiry. The push reaches it through a
+`git credential-store` file `publish` creates in a private temp directory and deletes after one
+push (`PushCredentialFile` in `src/workspace.rs`) — never a URL (lands in `.git/config`), an
+`http.extraheader` (lands in argv) or an environment variable. `preflight` loads the file and the
+key, so a half-configured App is refused by name. It is commented out in `crew.github.toml`
+until `~/.crewd/github-app.toml` exists on the host; an uncommented key with no file there
+fails preflight and stops all dispatch.
 
 `worker.kind = "claude"` is the other half — and it is a separate switch from the tracker on
 purpose (see `WorkerConfig`'s doc in [src/config.rs](src/config.rs)): a real tracker with the
@@ -605,6 +617,10 @@ reading — check that the named test is still meaningful, not just still green.
 | No workspace is deleted under a live agent | `kill(grace)` blocks until confirmed stopped, *then* `remove` | `a_ticket_moving_to_terminal_stops_the_run_and_cleans_up` |
 | One tracker blip cannot kill a run | `refresh_miss_grace`, reset on reappearance | `one_invisible_refresh_is_survivable_but_two_are_not` |
 | A label's casing cannot make an issue undispatchable | `GithubTracker::to_issue` trims, lowercases, drops blank and dedupes labels — the shape `Config::normalize` gives `required_labels` — so `routable`'s plain equality holds; `set_state` reads the raw labels instead, so writing them back never renames the operator's own (#70) | `labels_are_normalized_at_the_adapter_boundary`, `set_state_writes_labels_back_in_their_original_casing` |
+| An installation token cannot expire under a long-running daemon | the tracker, forge and push ask a `Credentials` source per request; `GithubApp` caches against the injected clock and re-mints `REFRESH_MARGIN_MS` before expiry, and a 401 drops the cache (#64) | `a_daemon_up_past_the_installation_tokens_lifetime_keeps_polling_without_a_401`, `an_installation_token_is_re_minted_before_it_expires_rather_than_served_stale` |
+| The push credential never reaches the agent sharing its worktree | `publish` hands git a `credential-store` file in a private temp dir, deleted after the push, behind an empty `credential.helper` that clears the operator's own — never a URL, `extraheader` or env var | `a_push_credential_reaches_git_without_touching_config_argv_or_a_lasting_file`, `the_default_allowlist_names_no_credential_variable` |
+| A teammate's assignment does not hand an issue to an agent | with `dispatch_label` set, `DispatchRule` makes the label the whole signal; unset, any assignee, as before | `with_a_dispatch_label_only_the_label_makes_an_issue_dispatchable`, `without_a_dispatch_label_any_assignee_is_still_the_signal` |
+| A half-configured App is refused by name, not met as a 401 | `preflight` loads `tracker.github_app` and its key, naming each missing field or unreadable file | `a_half_configured_github_app_is_refused_naming_the_missing_piece` |
 | A workspace path cannot escape its root | `guard()` on **both** `prepare` and `remove` | `hostile_identifiers_stay_inside_the_root` |
 | Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
 | Cleanup cannot discard an agent's *uncommitted* work | `remove` snapshots a dirty tree to a new ref under `refs/crew/wip/<issue key>/` (never the branch, never overwriting an earlier snapshot) before deleting it, failing closed; `prepare` reports every such ref and the next prompt names them | `a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref`, `a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed` |
@@ -686,7 +702,7 @@ See [docs/coding-guidelines.md](docs/coding-guidelines.md), linked at the top of
 ## Dogfooding
 
 The backlog is GitHub Issues on this repository, labelled `agent` — which is exactly the shape
-`TrackerConfig.required_labels` filters on. Work is picked up from there, not from a plan file.
+`TrackerConfig.dispatch_label` marks as ready. Work is picked up from there, not from a plan file.
 
 Every seam crewd needs to dispatch against its own backlog now has a real
 implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`

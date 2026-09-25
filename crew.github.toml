@@ -1,5 +1,6 @@
 # Points at this repo's own real GitHub Issues backlog. Requires GITHUB_TOKEN in the
-# environment — never put a token in this file, it is checked in.
+# environment unless `tracker.github_app` is set below — never put a token in this file, it is
+# checked in.
 #
 # The backlog has not adopted the `state:<name>` label convention yet (see
 # src/tracker/github.rs's module doc), so every open, `agent`-labelled issue reports as
@@ -13,7 +14,15 @@ owner = "StGerman"
 repo = "crewd"
 active_states = ["open"]
 terminal_states = ["closed"]
-required_labels = ["agent"]
+# The `agent` label is the dispatch marker (#64): carrying it is what makes an issue ready, and
+# an assignee is neither needed nor sufficient — a teammate taking a ticket does not hand it to
+# an agent. The poll filters on it too, so its cost follows the labelled issues, not the backlog.
+dispatch_label = "agent"
+# Every write — comments, `state:*` labels, pull requests, pushes — authored by the Crew GitHub
+# App rather than by whoever's GITHUB_TOKEN this is. Uncomment once ~/.crewd/github-app.toml
+# exists (app_id, installation_id, private_key_path): with the key set and the file absent,
+# preflight refuses and every dispatch stops.
+# github_app = "~/.crewd/github-app.toml"
 
 # A poll costs one `by_states` request plus one `by_ids` per running issue, so the hourly cost
 # is (1 + max_concurrent) * 120 at this interval. That scales with the worker count, which is

@@ -61,9 +61,11 @@ cargo run -p crewctl -- status
 1. **Copy `crew.github.toml`** and set `tracker.owner` / `tracker.repo` to yours. Both
    shipped configs are heavily commented; the comments explain why each number is what it is,
    which is usually more useful than the number.
-2. **Label the issues you want worked.** `tracker.required_labels` is the filter — `agent` by
-   default. An issue without the label is invisible to the daemon.
-3. **Give it a token.** `GITHUB_TOKEN` in the environment, never in the file.
+2. **Label the issues you want worked.** `tracker.dispatch_label` — `agent` in
+   `crew.github.toml` — is what marks an issue as ready; an issue without it is never
+   dispatched, whoever it is assigned to. Unset, any assignee marks it instead.
+3. **Give it a credential.** A GitHub App (below), or `GITHUB_TOKEN` in the environment —
+   never a token in the file.
 4. **Decide whether it acts.** `tracker.kind = "github"` decides what it *looks at*;
    `worker.kind = "claude"` decides whether it *works*. Leaving the worker fake is a safe way
    to watch real dispatch decisions before you let anything edit code.
@@ -79,10 +81,23 @@ By default every comment, label and branch is authored by *you*, because the tok
 GitHub App gives the daemon its own identity, so its writes are distinguishable from yours and
 it can hold `contents: write` while being denied merge entirely.
 
-This is **not wired up yet** — the config keys land with
-[#64](https://github.com/StGerman/crewd/issues/64), and a one-click `init` that registers the
-App for you is [#65](https://github.com/StGerman/crewd/issues/65). `GITHUB_TOKEN` is the
-supported path today and will stay supported.
+Register an App with `contents`, `issues` and `pull_requests` set to write, install it on the
+repository, and write a small file naming it:
+
+```toml
+# ~/.crewd/github-app.toml
+app_id = 123456
+installation_id = 7890123
+private_key_path = "~/.crewd/crew.private-key.pem"   # relative paths resolve beside this file
+```
+
+Then point `tracker.github_app` at that file. Every comment, label change, pull request and
+branch push is then authored by the App; the daemon mints a one-hour installation token and
+refreshes it itself, and neither the key nor a token ever reaches a dispatched agent's
+environment, argv or `.git/config`. `crewd` refuses to start with a half-written file and names
+the missing piece. A one-click `init` that registers the App for you is
+[#65](https://github.com/StGerman/crewd/issues/65). `GITHUB_TOKEN` stays supported for anyone
+not running an App.
 
 Two findings from setting one up by hand, since they shape how dispatch works: an App's
 `[bot]` account **cannot be an issue assignee** outside GitHub's partner agent program, and a

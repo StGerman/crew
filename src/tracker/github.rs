@@ -37,6 +37,10 @@
 //! classifies as [`crate::model::ErrorClass::RateLimited`] and backs off rather than escalates,
 //! but a tight interval against a real repo will find that path often enough to be worth
 //! avoiding up front.
+//!
+//! With `tracker.github_app` set, that 5000 is the App installation's own pool rather than the
+//! operator's, so the poll no longer competes with whatever else their personal token is doing.
+//! A mint costs one more request an hour.
 
 use std::collections::HashMap;
 use std::sync::Arc;
