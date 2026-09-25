@@ -1,11 +1,14 @@
 # The commit gate, run by a machine instead of by whoever remembers.
 #
 # `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` are the
-# standing bar in CLAUDE.md, and until this file existed nothing enforced them. That was
-# defensible while one person wrote every commit; it stopped being defensible once dispatched
-# agents started leaving branches behind, because "someone ran it locally" then has nobody to
-# name. So `push` here is deliberately unfiltered: a pushed agent branch with no pull request
-# yet is exactly the case this job exists for.
+# standing bar in CLAUDE.md, and until this file existed nothing enforced them. It runs on pull
+# requests only: every dispatched agent's branch reaches review through one, because delivery
+# opens it, so a pull request is where a red gate can still stop a merge. A push with no pull
+# request behind it is checked locally or not at all.
+#
+# Each gate is its own job, so a pull request shows three checks that pass or fail separately
+# and run in parallel. None waits on another: ordering them would only delay the answer, since
+# each one fails for reasons the others cannot see.
 #
 # The suite is unusually well suited to a runner and that is not an accident. Time only moves
 # when a test moves it (`FakeClock`), every external seam has a fake, and there are no sleeps
@@ -29,14 +32,9 @@
 name: CI
 
 on:
-  push:
   pull_request:
 
-# Keyed on the full `github.ref` rather than the branch name, so a push run and a pull-request
-# run for the same branch sit in different groups and cannot cancel each other. They overlap
-# and that is fine -- a cancelled run reports as neither pass nor fail, and a required check
-# stuck in that state would block a merge for no reason. Duplicated seconds are the cheaper
-# mistake. Successive pushes to one ref still supersede each other.
+# One run per pull request: a new push supersedes the run for the previous head.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -47,46 +45,57 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-jobs:
-  gate:
-    name: fmt + clippy + test
-    runs-on: ubuntu-latest
-    # The suite finishes in seconds; anything near this limit is hung, not slow.
-    timeout-minutes: 15
+# No setup-toolchain action in any job, on purpose: `rust-toolchain.toml` is the single pin and
+# rustup honours it on the first cargo invocation. Two places to state a version is one place
+# for them to drift apart. Each job's first step forces that install before the cache step,
+# which keys on `rustc -vV`, and leaves the resolved version in the log so "which toolchain
+# ran" is answerable from the run alone. `cargo --version` goes first and is doing real work:
+# it is the rustup proxy, and invoking it is what installs the pinned toolchain. `rustup show`
+# is not a substitute -- since rustup 1.28 it reports without installing.
+#
+# The suite finishes in seconds; a job near its timeout is hung, not slow.
 
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # No setup-toolchain action on purpose: `rust-toolchain.toml` is the single pin and
-      # rustup honours it on the first cargo invocation. Two places to state a version is one
-      # place for them to drift apart. This step forces that install to happen before the
-      # cache step, which keys on `rustc -vV`, and leaves the resolved version in the log so
-      # "which toolchain ran" is answerable from the run alone.
       - name: Resolve pinned toolchain
         run: |
-          # `cargo --version` goes first and is doing real work: it is the rustup proxy, and
-          # invoking it is what installs the toolchain the pin names. `rustup show` is not a
-          # substitute -- since rustup 1.28 it reports without installing, so asking it first
-          # on a clean runner fails on a toolchain nothing has fetched yet.
+          cargo --version
+          rustup show active-toolchain
+          cargo fmt --version
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve pinned toolchain
+        run: |
           cargo --version
           rustup show active-toolchain
           cargo clippy --version
-          cargo fmt --version
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      # Every gate reports even when an earlier one fails. The job still fails -- this only
-      # decides how much you learn per run, and the whole premise of this file is that people
-      # skip gates they have to run three times to get three answers out of.
-      - name: cargo fmt --check
-        if: ${{ !cancelled() }}
-        run: cargo fmt --check
-
       # `--locked` so a drifted Cargo.lock fails the job instead of being quietly updated.
       - name: cargo clippy --all-targets -- -D warnings
-        if: ${{ !cancelled() }}
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve pinned toolchain
+        run: |
+          cargo --version
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo test
-        if: ${{ !cancelled() }}
         run: cargo test --locked
