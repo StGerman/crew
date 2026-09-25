@@ -14,3 +14,4 @@ libcrew = { path = "../libcrew" }
 crewd = { path = ".." }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+insta = "1.48.0"

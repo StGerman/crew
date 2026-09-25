@@ -87,6 +87,17 @@ async fn crewctl(cwd: &Path, db: &Path, args: &[&str]) -> Output {
     .unwrap()
 }
 
+/// What a person reads, with the parts that differ per run — the port the OS handed out and the
+/// temporary root, in both its given and canonical spelling — named rather than printed.
+/// Everything else comes from the fake clock and is stable.
+fn stdout(out: &Output, addr: &str, root: &Path) -> String {
+    let mut text = String::from_utf8_lossy(&out.stdout).replace(addr, "[ADDR]");
+    if let Ok(canonical) = root.canonicalize() {
+        text = text.replace(&canonical.display().to_string(), "[ROOT]");
+    }
+    text.replace(&root.display().to_string(), "[ROOT]")
+}
+
 #[tokio::test]
 async fn a_status_query_does_not_open_the_database_the_daemon_holds() {
     let root: PathBuf = std::env::temp_dir().join(format!("crewctl-status-{}", std::process::id()));
@@ -120,12 +131,11 @@ async fn a_status_query_does_not_open_the_database_the_daemon_holds() {
 
     let all = crewctl(&root, &db, &["status", "--api", &addr]).await;
     assert!(all.status.success(), "stderr: {}", String::from_utf8_lossy(&all.stderr));
-    let text = String::from_utf8_lossy(&all.stdout);
-    assert!(text.contains("MT-7"), "the snapshot names the issue: {text}");
+    insta::assert_snapshot!("status_all", stdout(&all, &addr, &root));
 
     let one = crewctl(&root, &db, &["status", "--api", &addr, "MT-7"]).await;
     assert!(one.status.success(), "stderr: {}", String::from_utf8_lossy(&one.stderr));
-    assert!(String::from_utf8_lossy(&one.stdout).contains("issue 7"));
+    insta::assert_snapshot!("status_one", stdout(&one, &addr, &root));
 
     drop(lock);
     let _ = std::fs::remove_dir_all(&root);
@@ -142,6 +152,6 @@ async fn a_closed_port_reads_as_no_daemon_from_the_binary_too() {
     let dir = std::env::temp_dir();
     let out = crewctl(&dir, &dir.join("absent.db"), &["status", "--api", &addr]).await;
     assert_eq!(out.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("nothing is listening") && err.contains(&addr), "{err}");
+    let err = String::from_utf8_lossy(&out.stderr).replace(&addr, "[ADDR]");
+    insta::assert_snapshot!("status_no_daemon", err);
 }

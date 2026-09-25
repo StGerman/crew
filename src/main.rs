@@ -10,11 +10,9 @@
 //! messages are fire-and-forget; the API's carry a `oneshot` to answer on, because an HTTP
 //! client is owed a response and a keypress is not.
 //!
-//! `status` is the third surface and the odd one out: it is a *client* of a daemon in another
-//! process, so it returns before any of the setup below. It opens no store, prepares no
-//! worktree and needs no tracker credential — an operator asking what is running must not be
-//! able to disturb what is running, and a second process touching `crew.db` while the
-//! daemon holds it would be exactly that.
+//! This binary has no `status`: asking a running daemon what it is doing is `crewctl`, a separate
+//! package that links no store, worktree or tracker code (#45), because an operator asking what
+//! is running must not be able to disturb it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
