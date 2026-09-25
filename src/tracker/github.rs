@@ -39,6 +39,7 @@
 //! avoiding up front.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -47,6 +48,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::{Tracker, TrackerError};
 use crate::broker::TrackerWrites;
+use crate::credentials::{Credentials, StaticToken};
 use crate::model::Issue;
 
 const API_BASE: &str = "https://api.github.com";
@@ -212,7 +214,6 @@ struct GhLabel {
 
 #[derive(Debug, Deserialize)]
 struct GhUser {
-    #[allow(dead_code)]
     login: String,
 }
 
@@ -247,8 +248,33 @@ fn normalize_labels(labels: Vec<GhLabel>) -> Vec<String> {
     out
 }
 
-fn to_issue(owner: &str, repo: &str, gh: GhIssue) -> Issue {
+/// Which issues are for Crew (#64). With `label` set, carrying it is the whole signal — an
+/// assignee is neither needed nor sufficient, because a teammate taking a ticket must not hand it
+/// to an agent. Unset, any assignee makes an issue dispatchable, as before the label existed.
+/// `assignee`, when set, narrows either rule to one login; it is never required.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchRule {
+    pub label: Option<String>,
+    pub assignee: Option<String>,
+}
+
+impl DispatchRule {
+    fn dispatchable(&self, labels: &[String], assignees: &[GhUser]) -> bool {
+        let marked = match &self.label {
+            Some(label) => labels.iter().any(|l| l == label),
+            None => !assignees.is_empty(),
+        };
+        let narrowed = self
+            .assignee
+            .as_ref()
+            .is_none_or(|want| assignees.iter().any(|a| a.login.eq_ignore_ascii_case(want)));
+        marked && narrowed
+    }
+}
+
+fn to_issue(owner: &str, repo: &str, rule: &DispatchRule, gh: GhIssue) -> Issue {
     let labels = normalize_labels(gh.labels);
+    let dispatchable = rule.dispatchable(&labels, &gh.assignees);
     let closed = gh.state == "closed";
     Issue {
         id: format!("{owner}/{repo}#{}", gh.number),
@@ -259,9 +285,7 @@ fn to_issue(owner: &str, repo: &str, gh: GhIssue) -> Issue {
         priority: None, // GitHub has no native priority; an adapter over Projects v2 could add one.
         url: Some(gh.html_url),
         labels,
-        // Assignment is the adapter-level eligibility signal here: an unassigned issue is not
-        // yet ready for an agent to pick up, matching how this repo's own backlog is worked.
-        dispatchable: !gh.assignees.is_empty(),
+        dispatchable,
         created_at: parse_created_at(&gh.created_at),
         native_ref: Some(serde_json::json!({ "number": gh.number, "node_id": gh.node_id })),
         blocked_by: vec![], // GitHub's native issue-dependency graph is not read by this slice.
@@ -274,36 +298,57 @@ pub struct GithubTracker<H: Http> {
     http: H,
     owner: String,
     repo: String,
-    token: String,
+    creds: Arc<dyn Credentials>,
     required_labels: Vec<String>,
+    rule: DispatchRule,
 }
 
 impl<H: Http> GithubTracker<H> {
+    /// A static token and the any-assignee rule: the `GITHUB_TOKEN` deployment, unchanged.
     pub fn new(http: H, owner: &str, repo: &str, token: &str, required_labels: &[String]) -> Self {
         Self {
             http,
             owner: owner.to_string(),
             repo: repo.to_string(),
-            token: token.to_string(),
+            creds: Arc::new(StaticToken::new(token)),
             required_labels: required_labels.to_vec(),
+            rule: DispatchRule::default(),
         }
     }
 
-    fn headers(&self) -> Vec<(&str, String)> {
-        vec![
-            ("Authorization", format!("Bearer {}", self.token)),
+    pub fn with_credentials(mut self, creds: Arc<dyn Credentials>) -> Self {
+        self.creds = creds;
+        self
+    }
+
+    pub fn with_dispatch_rule(mut self, rule: DispatchRule) -> Self {
+        self.rule = rule;
+        self
+    }
+
+    fn headers(&self) -> Result<Vec<(&'static str, String)>, TrackerError> {
+        Ok(vec![
+            ("Authorization", format!("Bearer {}", self.creds.token()?)),
             ("Accept", "application/vnd.github+json".to_string()),
             ("X-GitHub-Api-Version", API_VERSION.to_string()),
             ("User-Agent", "crewd".to_string()),
-        ]
+        ])
+    }
+
+    /// A 401 here means the cached token is dead, not that the next one will be.
+    fn observe(&self, resp: HttpResponse) -> HttpResponse {
+        if resp.status == 401 {
+            self.creds.invalidate();
+        }
+        resp
     }
 
     /// One authenticated GET, classified onto [`TrackerError`]. The only branch a caller needs
     /// to handle specially beyond this is "404 on a single-issue fetch", which `by_ids` treats
     /// as absence rather than as an error.
     fn request(&self, url: &str) -> Result<HttpResponse, TrackerError> {
-        let resp = self.http.get(url, &self.headers()).map_err(|e| TrackerError::Request(e.0))?;
-        classify(resp)
+        let resp = self.http.get(url, &self.headers()?).map_err(|e| TrackerError::Request(e.0))?;
+        classify(self.observe(resp))
     }
 
     /// One authenticated write, classified the same way a read is — so a broker tool failing
@@ -314,9 +359,9 @@ impl<H: Http> GithubTracker<H> {
             serde_json::to_vec(body).map_err(|e| TrackerError::Response(e.to_string()))?;
         let resp = self
             .http
-            .send_json(method, url, &self.headers(), &payload)
+            .send_json(method, url, &self.headers()?, &payload)
             .map_err(|e| TrackerError::Request(e.0))?;
-        classify(resp)
+        classify(self.observe(resp))
     }
 
     fn number_for(&self, issue_id: &str) -> Result<u64, TrackerError> {
@@ -338,8 +383,8 @@ impl<H: Http> GithubTracker<H> {
         };
 
         let url = format!("{API_BASE}/repos/{}/{}/issues/{number}", self.owner, self.repo);
-        let resp = match self.http.get(&url, &self.headers()) {
-            Ok(r) => r,
+        let resp = match self.http.get(&url, &self.headers()?) {
+            Ok(r) => self.observe(r),
             Err(e) => return Err(TrackerError::Request(e.0)),
         };
         if resp.status == 404 {
@@ -379,8 +424,17 @@ impl<H: Http> GithubTracker<H> {
     /// be arbitrarily large and is never active, so pulling it every poll would burn the rate
     /// budget on rows this call always discards. `by_ids` still sees closed issues — that is
     /// how reconciliation notices a running issue's ticket got closed.
+    ///
+    /// The dispatch label joins the query too, so the poll's cost follows the marked issues
+    /// rather than the repository's whole open backlog.
     fn fetch_open_labelled(&self) -> Result<Vec<GhIssue>, TrackerError> {
-        let labels = self.required_labels.join(",");
+        let mut labels = self.required_labels.clone();
+        if let Some(l) = &self.rule.label
+            && !labels.contains(l)
+        {
+            labels.push(l.clone());
+        }
+        let labels = labels.join(",");
         let mut all = Vec::new();
         let mut page = 1u32;
         loop {
@@ -416,7 +470,7 @@ impl<H: Http> Tracker for GithubTracker<H> {
             .fetch_open_labelled()?
             .into_iter()
             .filter(|gh| gh.pull_request.is_none())
-            .map(|gh| to_issue(&self.owner, &self.repo, gh))
+            .map(|gh| to_issue(&self.owner, &self.repo, &self.rule, gh))
             .filter(|issue| want.contains(issue.state_key().as_str()))
             .collect())
     }
@@ -428,7 +482,7 @@ impl<H: Http> Tracker for GithubTracker<H> {
         let mut out = Vec::new();
         for id in ids {
             if let Some(gh) = self.fetch_issue(id)? {
-                out.push(to_issue(&self.owner, &self.repo, gh));
+                out.push(to_issue(&self.owner, &self.repo, &self.rule, gh));
             }
         }
         Ok(out)
@@ -935,6 +989,187 @@ mod tests {
         let e = t.comment("o/r#7", "hi").unwrap_err();
         assert!(matches!(e, TrackerError::Auth(_)), "got {e:?}");
         assert!(!e.class().retryable());
+    }
+}
+
+/// The seam above `FakeHttp` (#64): which credential a request carries, and which issues are
+/// marked for Crew. Kept apart from the tests above so those stay exactly as they were.
+#[cfg(test)]
+mod app_tests {
+    use std::collections::VecDeque;
+
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::clock::{Clock, FakeClock};
+    use crate::credentials::tests::throwaway_key;
+    use crate::credentials::{GithubApp, GithubAppFile, REFRESH_MARGIN_MS};
+
+    /// Answers every mint with a fresh token valid for an hour of the fake clock, and every read
+    /// with 401 unless it carries the token minted last — which is what GitHub does to an
+    /// expired installation token.
+    struct Github {
+        clock: Arc<FakeClock>,
+        issues: Value,
+        state: Mutex<(u32, Option<String>, VecDeque<String>)>,
+    }
+
+    impl Github {
+        fn new(clock: Arc<FakeClock>, issues: Value) -> Arc<Self> {
+            Arc::new(Self { clock, issues, state: Mutex::new((0, None, VecDeque::new())) })
+        }
+
+        fn mints(&self) -> u32 {
+            self.state.lock().0
+        }
+
+        fn queries(&self) -> Vec<String> {
+            self.state.lock().2.iter().cloned().collect()
+        }
+    }
+
+    fn respond(status: u16, body: Value) -> HttpResponse {
+        HttpResponse { status, headers: HashMap::new(), body: body.to_string().into_bytes() }
+    }
+
+    impl Http for Arc<Github> {
+        fn get(
+            &self,
+            url: &str,
+            headers: &[(&str, String)],
+        ) -> Result<HttpResponse, HttpTransportError> {
+            let mut g = self.state.lock();
+            g.2.push_back(url.to_string());
+            let sent = headers.iter().find(|(k, _)| *k == "Authorization").map(|(_, v)| v.clone());
+            let live = g.1.as_ref().map(|t| format!("Bearer {t}"));
+            if sent.is_none() || sent != live {
+                return Ok(respond(401, json!({ "message": "Bad credentials" })));
+            }
+            Ok(respond(200, self.issues.clone()))
+        }
+
+        fn send_json(
+            &self,
+            _method: &str,
+            url: &str,
+            _headers: &[(&str, String)],
+            _body: &[u8],
+        ) -> Result<HttpResponse, HttpTransportError> {
+            assert!(url.ends_with("/app/installations/7/access_tokens"), "{url}");
+            let mut g = self.state.lock();
+            g.0 += 1;
+            let token = format!("ghs_{}", g.0);
+            g.1 = Some(token.clone());
+            let expires =
+                OffsetDateTime::from_unix_timestamp(self.clock.wall().0 / 1000 + 3600).unwrap();
+            let expires_at = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                expires.year(),
+                u8::from(expires.month()),
+                expires.day(),
+                expires.hour(),
+                expires.minute(),
+                expires.second()
+            );
+            Ok(respond(201, json!({ "token": token, "expires_at": expires_at })))
+        }
+    }
+
+    fn issue(number: u64, labels: &[&str], assignees: &[&str]) -> Value {
+        json!({
+            "number": number,
+            "node_id": format!("node-{number}"),
+            "title": format!("issue {number}"),
+            "state": "open",
+            "html_url": format!("https://github.com/o/r/issues/{number}"),
+            "labels": labels.iter().map(|l| json!({ "name": l })).collect::<Vec<_>>(),
+            "assignees": assignees.iter().map(|a| json!({ "login": a })).collect::<Vec<_>>(),
+            "created_at": "2024-01-15T10:30:00Z",
+        })
+    }
+
+    fn app_tracker(clock: Arc<FakeClock>, gh: &Arc<Github>) -> GithubTracker<Arc<Github>> {
+        // Per thread: the tests below run in parallel, and each generates its own key.
+        let dir = std::env::temp_dir().join(format!(
+            "crew-tracker-app-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file =
+            GithubAppFile { app_id: 42, installation_id: 7, private_key_path: throwaway_key(&dir) };
+        let app = GithubApp::new(gh.clone(), &file, clock).unwrap();
+        GithubTracker::new(gh.clone(), "o", "r", "unused", &[]).with_credentials(Arc::new(app))
+    }
+
+    #[test]
+    fn a_daemon_up_past_the_installation_tokens_lifetime_keeps_polling_without_a_401() {
+        let clock = Arc::new(FakeClock::new());
+        let gh = Github::new(clock.clone(), json!([issue(1, &[], &["someone"])]));
+        let t = app_tracker(clock.clone(), &gh);
+        let open = ["open".to_string()];
+
+        assert_eq!(t.by_states(&open).unwrap().len(), 1);
+        assert_eq!(gh.mints(), 1);
+
+        // Every 30s poll for a day and a half: the token is refreshed, never served stale.
+        for _ in 0..(36 * 120) {
+            clock.advance_ms(30_000);
+            t.by_states(&open).expect("no 401 may reach the scheduler");
+        }
+        assert!(gh.mints() >= 36, "one mint per hour, not one per process: {}", gh.mints());
+        let per_token_ms = (36 * 3_600_000) / i64::from(gh.mints() - 1);
+        assert!(per_token_ms >= 3_600_000 - REFRESH_MARGIN_MS - 30_000, "not minted per poll");
+    }
+
+    fn by_label(label: Option<&str>) -> DispatchRule {
+        DispatchRule { label: label.map(str::to_string), assignee: None }
+    }
+
+    #[test]
+    fn with_a_dispatch_label_only_the_label_makes_an_issue_dispatchable() {
+        let clock = Arc::new(FakeClock::new());
+        let issues = json!([
+            issue(1, &["agent"], &[]),
+            issue(2, &[], &["someone"]),
+            issue(3, &["agent"], &["someone"]),
+        ]);
+        let gh = Github::new(clock.clone(), issues);
+        let t = app_tracker(clock, &gh).with_dispatch_rule(by_label(Some("agent")));
+
+        let got = t.by_states(&["open".to_string()]).unwrap();
+        let dispatchable: Vec<_> =
+            got.iter().map(|i| (i.identifier.as_str(), i.dispatchable)).collect();
+        assert_eq!(
+            dispatchable,
+            vec![("#1", true), ("#2", false), ("#3", true)],
+            "an assignee is neither needed nor sufficient; the unlabelled issue is reported, not \
+             dropped"
+        );
+        assert!(gh.queries()[0].contains("labels=agent&"), "the poll filters on the label");
+    }
+
+    #[test]
+    fn without_a_dispatch_label_any_assignee_is_still_the_signal() {
+        let clock = Arc::new(FakeClock::new());
+        let gh =
+            Github::new(clock.clone(), json!([issue(1, &["agent"], &[]), issue(2, &[], &["a"])]));
+        let t = app_tracker(clock, &gh).with_dispatch_rule(by_label(None));
+
+        let got = t.by_states(&["open".to_string()]).unwrap();
+        assert_eq!(got.iter().map(|i| i.dispatchable).collect::<Vec<_>>(), vec![false, true]);
+    }
+
+    #[test]
+    fn an_assignee_narrows_the_label_rule_and_is_never_required_by_it() {
+        let rule = DispatchRule { label: Some("agent".into()), assignee: Some("Crew-Bot".into()) };
+        let users = |names: &[&str]| -> Vec<GhUser> {
+            names.iter().map(|n| GhUser { login: n.to_string() }).collect()
+        };
+        let agent = ["agent".to_string()];
+        assert!(rule.dispatchable(&agent, &users(&["crew-bot"])));
+        assert!(!rule.dispatchable(&agent, &users(&["someone"])));
+        assert!(!rule.dispatchable(&[], &users(&["crew-bot"])));
+        assert!(by_label(Some("agent")).dispatchable(&agent, &[]));
     }
 }
 

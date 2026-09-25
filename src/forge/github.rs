@@ -20,6 +20,8 @@
 //! GitHub Actions is not the CI provider on this repo at all, which is why the job/log lookup
 //! only fires for a `details_url` shaped like an Actions job link and is skipped otherwise.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -28,6 +30,7 @@ use super::{
     CiFailure, CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review,
     ReviewComment,
 };
+use crate::credentials::{Credentials, StaticToken};
 use crate::tracker::github::{Http, HttpResponse};
 
 const API_BASE: &str = "https://api.github.com";
@@ -166,30 +169,50 @@ pub struct GithubForge<H: Http> {
     http: H,
     owner: String,
     repo: String,
-    token: String,
+    creds: Arc<dyn Credentials>,
 }
 
 impl<H: Http> GithubForge<H> {
     pub fn new(http: H, owner: &str, repo: &str, token: &str) -> Self {
-        Self { http, owner: owner.to_string(), repo: repo.to_string(), token: token.to_string() }
+        Self {
+            http,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            creds: Arc::new(StaticToken::new(token)),
+        }
     }
 
-    fn headers(&self) -> Vec<(&str, String)> {
-        vec![
-            ("Authorization", format!("Bearer {}", self.token)),
+    /// The installation token the pull request is authored with, asked for per request because
+    /// it expires within the hour (#64).
+    pub fn with_credentials(mut self, creds: Arc<dyn Credentials>) -> Self {
+        self.creds = creds;
+        self
+    }
+
+    fn headers(&self) -> Result<Vec<(&'static str, String)>, ForgeError> {
+        Ok(vec![
+            ("Authorization", format!("Bearer {}", self.creds.token()?)),
             ("Accept", "application/vnd.github+json".to_string()),
             ("X-GitHub-Api-Version", API_VERSION.to_string()),
             ("User-Agent", "crewd".to_string()),
-        ]
+        ])
+    }
+
+    /// A 401 here means the cached token is dead, not that the next one will be.
+    fn observe(&self, resp: HttpResponse) -> HttpResponse {
+        if resp.status == 401 {
+            self.creds.invalidate();
+        }
+        resp
     }
 
     /// One authenticated GET, classified onto [`ForgeError`].
     fn get(&self, url: &str) -> Result<HttpResponse, ForgeError> {
         let resp = self
             .http
-            .get(url, &self.headers())
+            .get(url, &self.headers()?)
             .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
-        classify(resp)
+        classify(self.observe(resp))
     }
 
     /// One authenticated JSON write, classified the same way a read is — a bad credential on a
@@ -199,9 +222,9 @@ impl<H: Http> GithubForge<H> {
         let payload = serde_json::to_vec(body).map_err(|e| ForgeError::Permanent(e.to_string()))?;
         let resp = self
             .http
-            .send_json(method, url, &self.headers(), &payload)
+            .send_json(method, url, &self.headers()?, &payload)
             .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
-        classify(resp)
+        classify(self.observe(resp))
     }
 
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ForgeError> {
@@ -212,7 +235,7 @@ impl<H: Http> GithubForge<H> {
     /// where a job or a log that cannot be fetched must leave `detail` with whatever was
     /// gathered so far rather than failing `ci_status` outright.
     fn get_best_effort(&self, url: &str) -> Option<HttpResponse> {
-        let resp = self.http.get(url, &self.headers()).ok()?;
+        let resp = self.http.get(url, &self.headers().ok()?).ok()?;
         if (200..300).contains(&resp.status) { Some(resp) } else { None }
     }
 
@@ -350,8 +373,9 @@ impl<H: Http> Forge for GithubForge<H> {
         let raw = serde_json::to_vec(&payload).map_err(|e| ForgeError::Permanent(e.to_string()))?;
         let resp = self
             .http
-            .send_json("POST", &url, &self.headers(), &raw)
+            .send_json("POST", &url, &self.headers()?, &raw)
             .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
+        let resp = self.observe(resp);
         // A run that committed nothing new is not a delivery failure — it is nothing to
         // deliver, and `ForgeError::NothingToDeliver` is what tells the scheduler the
         // difference. GitHub's only signal for that case is a 422 with this exact phrase in the

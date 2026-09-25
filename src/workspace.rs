@@ -9,7 +9,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
+use crate::credentials::Credentials;
 use crate::forge::{ForgeError, Published, Publisher};
 use crate::model::{looks_like_commit, worktree_key};
 
@@ -186,6 +188,77 @@ impl Workspace for DirWorkspace {
 pub struct GitWorktreeWorkspace {
     root: PathBuf,
     repo: PathBuf,
+    push_auth: Option<PushAuth>,
+}
+
+/// The credential `publish` pushes with when the orchestrator has an identity of its own (#64).
+/// Unset, the push rides the operator's ambient git credential, as it always has.
+struct PushAuth(Arc<dyn Credentials>);
+
+impl std::fmt::Debug for PushAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PushAuth(..)")
+    }
+}
+
+/// A `git credential-store` file holding one token for one push, in a private directory outside
+/// every worktree, deleted when dropped.
+///
+/// Each other route puts the token where the agent sharing this worktree can read it: a URL with
+/// the token in it lands in `.git/config`, `-c http.extraheader=` lands in argv (`ps`), and an
+/// environment variable is readable from the push's own process. The file is named in argv, not
+/// its contents, and lives only for the length of the push.
+struct PushCredentialFile {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl PushCredentialFile {
+    fn new(token: &str) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("crewd-push-{}-{n}", std::process::id()));
+        // A leftover from a crashed push of the same pid and counter holds nothing live.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let guard = Self { file: dir.join("credentials"), dir };
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&guard.file)?;
+        writeln!(f, "https://x-access-token:{token}@github.com")?;
+        Ok(guard)
+    }
+
+    /// Config for one `git` invocation. The empty `credential.helper` first clears every helper
+    /// configured anywhere else — the operator's keychain included, which would otherwise be
+    /// consulted first and, on success, be handed the installation token to store. The
+    /// `pushInsteadOf` pair sends an SSH remote over HTTPS for the push alone, since an SSH push
+    /// would be authored by the operator's key whatever this file says.
+    fn git_config(&self) -> Vec<String> {
+        [
+            "credential.helper=".to_string(),
+            format!("credential.helper=store --file={}", self.file.display()),
+            "url.https://github.com/.pushInsteadOf=git@github.com:".to_string(),
+            "url.https://github.com/.pushInsteadOf=ssh://git@github.com/".to_string(),
+        ]
+        .into_iter()
+        .flat_map(|c| ["-c".to_string(), c])
+        .collect()
+    }
+}
+
+impl Drop for PushCredentialFile {
+    fn drop(&mut self) {
+        // Best-effort: a directory the OS will not let go of still holds a token that expires
+        // within the hour.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 impl GitWorktreeWorkspace {
@@ -242,7 +315,34 @@ impl GitWorktreeWorkspace {
             }
         }
 
-        Ok(Self { root, repo })
+        Ok(Self { root, repo, push_auth: None })
+    }
+
+    /// Push as the orchestrator's own identity rather than the operator's ambient one.
+    pub fn with_push_credentials(mut self, creds: Arc<dyn Credentials>) -> Self {
+        self.push_auth = Some(PushAuth(creds));
+        self
+    }
+
+    /// The token-bearing file, when there is one, is created here and dropped by the caller
+    /// once the push has returned.
+    fn push_args(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<(Vec<String>, Option<PushCredentialFile>), ForgeError> {
+        let file = match &self.push_auth {
+            Some(PushAuth(creds)) => Some(
+                PushCredentialFile::new(&creds.token()?)
+                    .map_err(|e| ForgeError::Transient(format!("writing push credential: {e}")))?,
+            ),
+            None => None,
+        };
+        let mut args = file.as_ref().map(PushCredentialFile::git_config).unwrap_or_default();
+        args.extend(
+            ["push", "--force-with-lease", "--set-upstream", remote, branch].map(str::to_string),
+        );
+        Ok((args, file))
     }
 
     pub fn root(&self) -> &Path {
@@ -572,26 +672,29 @@ impl Publisher for GitWorktreeWorkspace {
         // because the branch is the orchestrator's own; the lease is what keeps that apart from
         // forcing over somebody else's — it expects the remote ref to be what this repository
         // last saw of it, and a remote that has moved since is refused, not overwritten.
-        Self::git(worktree, &["push", "--force-with-lease", "--set-upstream", remote, branch])
-            .map_err(|e| {
-                let text = e.to_string();
-                if text.contains("stale info") {
-                    // The lease failed: the remote branch carries something this repository
-                    // never pushed. A real conflict, and the one case forcing must not resolve.
-                    ForgeError::Permanent(format!(
-                        "{remote}/{branch} has moved since it was last fetched; refusing to \
+        let (args, credential) = self.push_args(remote, branch)?;
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let pushed = Self::git(worktree, &args);
+        drop(credential);
+        pushed.map_err(|e| {
+            let text = e.to_string();
+            if text.contains("stale info") {
+                // The lease failed: the remote branch carries something this repository
+                // never pushed. A real conflict, and the one case forcing must not resolve.
+                ForgeError::Permanent(format!(
+                    "{remote}/{branch} has moved since it was last fetched; refusing to \
                          force over work this orchestrator did not push: {text}"
-                    ))
-                } else if text.contains("rejected")
-                    || text.contains("permission")
-                    || text.contains("denied")
-                {
-                    // Any other rejection will be rejected again; the rest is the network.
-                    ForgeError::Permanent(text)
-                } else {
-                    ForgeError::Transient(text)
-                }
-            })?;
+                ))
+            } else if text.contains("rejected")
+                || text.contains("permission")
+                || text.contains("denied")
+            {
+                // Any other rejection will be rejected again; the rest is the network.
+                ForgeError::Permanent(text)
+            } else {
+                ForgeError::Transient(text)
+            }
+        })?;
         let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
             .map_err(|e| ForgeError::Transient(e.to_string()))?;
 
@@ -1375,6 +1478,86 @@ mod tests {
         let again = ws.publish(&p.path, &branch, "origin", "main").unwrap();
         assert_eq!(again, published);
 
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// #64: the orchestrator's push token must not land anywhere the agent sharing the worktree
+    /// reads — its `.git/config`, the argv of the push, or a file that outlives the push.
+    #[test]
+    fn a_push_credential_reaches_git_without_touching_config_argv_or_a_lasting_file() {
+        const TOKEN: &str = "ghs_push_token_that_must_not_leak";
+        let root = tmp_root("wt-push-cred");
+        let (repo, bare) = repo_with_remote("wt-push-cred");
+        let ws = GitWorktreeWorkspace::new(&root, &repo)
+            .unwrap()
+            .with_push_credentials(Arc::new(crate::credentials::StaticToken::new(TOKEN)));
+
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        commit_in(&p.path, "a.txt", "a change");
+
+        let (args, file) = ws.push_args("origin", &branch).unwrap();
+        assert!(args.iter().all(|a| !a.contains(TOKEN)), "the token is in argv: {args:?}");
+        // What git itself resolves through exactly those arguments is the token, ahead of any
+        // helper the operator configured.
+        let config: Vec<&str> =
+            args.iter().take_while(|a| *a != "push").map(String::as_str).collect();
+        let mut fill = Command::new("git")
+            .arg("-C")
+            .arg(&p.path)
+            .args(&config)
+            .args(["credential", "fill"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            fill.stdin.take().unwrap().write_all(b"protocol=https\nhost=github.com\n\n").unwrap();
+        }
+        let out = String::from_utf8(fill.wait_with_output().unwrap().stdout).unwrap();
+        assert!(out.contains(&format!("password={TOKEN}")), "{out}");
+        let file = file.unwrap();
+        let (dir, path) = (file.dir.clone(), file.file.clone());
+        assert!(!dir.starts_with(&root) && !dir.starts_with(&repo), "outside every worktree");
+        drop(file);
+        assert!(!path.exists() && !dir.exists(), "the file lives only as long as the push");
+
+        let published = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(
+            git_out(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).unwrap(),
+            published.head_sha
+        );
+        let common = git_out(&p.path, &["rev-parse", "--git-common-dir"]).unwrap();
+        let common = p.path.join(common);
+        for config in [common.join("config"), p.path.join(".git")] {
+            let text = std::fs::read_to_string(&config).unwrap_or_default();
+            assert!(!text.contains(TOKEN), "{} holds the token", config.display());
+        }
+        let leftover = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("crewd-push-"))
+            .filter_map(|e| std::fs::read_to_string(e.path().join("credentials")).ok())
+            .any(|text| text.contains(TOKEN));
+        assert!(!leftover, "a credential file outlived its push");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn without_push_credentials_the_push_is_the_plain_one_it_always_was() {
+        let root = tmp_root("wt-push-plain");
+        let (repo, bare) = repo_with_remote("wt-push-plain");
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
+        let (args, file) = ws.push_args("origin", "crew/x").unwrap();
+        assert!(file.is_none());
+        assert_eq!(args, ["push", "--force-with-lease", "--set-upstream", "origin", "crew/x"]);
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&bare).ok();
