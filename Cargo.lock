@@ -339,6 +339,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crewctl"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crewd",
+ "libcrew",
+ "rusqlite",
+ "tokio",
+]
+
+[[package]]
 name = "crewd"
 version = "0.1.0"
 dependencies = [
@@ -348,6 +359,7 @@ dependencies = [
  "crossterm",
  "insta",
  "libc",
+ "libcrew",
  "ratatui",
  "rusqlite",
  "serde",
@@ -855,6 +867,15 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libcrew"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "libm"

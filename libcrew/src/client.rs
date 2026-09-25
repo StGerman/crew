@@ -1,4 +1,4 @@
-//! The other end of [the ops API](super), behind `symphony-cc status`.
+//! The other end of `crewd`'s ops API, behind `crewctl status`.
 //!
 //! The API landed before this did, and in the window between the two it was not reached for
 //! once — diagnosing a live run meant tailing a block-buffered log file hours behind the
@@ -12,7 +12,7 @@
 //! * **It reads the published API only.** No `Store`, no `~/.claude/tasks`, no git. The same
 //!   rule that keeps the TUI from becoming load-bearing, for the same reason — and the same
 //!   consequence, which is that a question this cannot answer is a missing `Snapshot` field
-//!   rather than a reason to open the database here. [`crate::sched::Row::branch`] was added
+//!   rather than a reason to open the database here. [`crate::Row::branch`] was added
 //!   under exactly that rule.
 //! * **It shares the wire types with the server.** [`Snapshot`] and [`Row`] are serialised by
 //!   one and deserialised by the other, so a field renamed on the scheduler breaks this at
@@ -22,15 +22,17 @@
 //! the daemon without being told where it is ([`endpoint`]), and saying something useful when
 //! it is not there ([`StatusError`]).
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::{API_MARKER_HEADER, API_MARKER_VERSION};
-use crate::config::{ApiConfig, DEFAULT_API_BIND};
-use crate::sched::{Row, Snapshot};
+use crate::api::{
+    API_MARKER_HEADER, API_MARKER_VERSION, ApiConfig, DEFAULT_API_BIND, normalize_bind,
+};
+use crate::{Row, Snapshot};
 
 /// A status query is a question about right now, so it fails fast rather than hanging on a
 /// daemon that accepted the connection and then wedged. Generous next to a loopback round
@@ -71,12 +73,12 @@ pub struct Endpoint {
 ///
 /// `--api`, then the config's `[api] bind`, then [`DEFAULT_API_BIND`] — the same order of
 /// precedence `main` uses when it decides where to *serve*, so the client looks where the
-/// daemon was told to listen. Both of the first two are run through [`super::normalize_bind`],
-/// the same trim [`super::bind`] applies before parsing — a `--api` flag or a `[api] bind` with
+/// daemon was told to listen. Both of the first two are run through [`normalize_bind`],
+/// the same trim the daemon's `api::bind` applies before parsing — a `--api` flag or a `[api] bind` with
 /// incidental surrounding whitespace must not bind successfully on the server side and build an
 /// unreachable URL on this one.
 pub fn endpoint(explicit: Option<&str>, config_path: &Path) -> Endpoint {
-    if let Some(addr) = explicit.map(super::normalize_bind).filter(|a| !a.is_empty()) {
+    if let Some(addr) = explicit.map(normalize_bind).filter(|a| !a.is_empty()) {
         return Endpoint { addr: addr.to_string(), source: Source::Flag };
     }
     match bind_in(config_path) {
@@ -87,14 +89,14 @@ pub fn endpoint(explicit: Option<&str>, config_path: &Path) -> Endpoint {
 
 /// Read `[api] bind` out of a config, forgivingly.
 ///
-/// Deliberately not [`crate::config::Config::load`]: that runs `preflight`, which gates
+/// Deliberately not the daemon's `Config::load`: that runs `preflight`, which gates
 /// *dispatch*. A missing `tracker.owner` is a real problem for the daemon and none at all for
 /// a client asking what the daemon is doing — refusing to print status over it would be the
 /// same class of mistake as validating `api.bind` in preflight. Anything unreadable falls
 /// through to the default, where a wrong guess costs one clearly-labelled connection refusal.
 ///
-/// The value is normalised with [`super::normalize_bind`] before it is handed back — the same
-/// trim [`super::bind`] applies server-side — so `bind = " 127.0.0.1:8787 "` binds the daemon
+/// The value is normalised with [`normalize_bind`] before it is handed back — the same
+/// trim the daemon's `api::bind` applies server-side — so `bind = " 127.0.0.1:8787 "` binds the daemon
 /// and reaches it from here, rather than binding the daemon while this builds an invalid URL.
 fn bind_in(config_path: &Path) -> Option<String> {
     #[derive(Deserialize)]
@@ -103,7 +105,7 @@ fn bind_in(config_path: &Path) -> Option<String> {
     }
     let text = std::fs::read_to_string(config_path).ok()?;
     let parsed: JustApi = toml::from_str(&text).ok()?;
-    Some(super::normalize_bind(&parsed.api.bind).to_string())
+    Some(normalize_bind(&parsed.api.bind).to_string())
 }
 
 /// Why a status query did not produce a snapshot.
@@ -172,20 +174,11 @@ fn issue_path(key: &str) -> String {
 /// A daemon's published state, read over the API it publishes it on.
 pub struct Client {
     endpoint: Endpoint,
-    agent: ureq::Agent,
 }
 
 impl Client {
     pub fn new(endpoint: Endpoint) -> Self {
-        // The same reason `UreqHttp` does it: a non-2xx has to arrive as an ordinary response,
-        // because the body carries the message this client shows the operator. Turned into an
-        // `Err` it would be a bare status code.
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(TIMEOUT))
-            .build()
-            .into();
-        Self { endpoint, agent }
+        Self { endpoint }
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -226,18 +219,19 @@ impl Client {
     }
 
     fn fetch(&self, path: &str) -> Result<(u16, String), StatusError> {
-        let url = format!("http://{}{path}", self.endpoint.addr);
-        let response = self.agent.get(&url).call().map_err(|e| self.classify(e))?;
+        let reply = self.exchange(path)?;
+        let Some(response) = Response::parse(&reply) else {
+            return Err(StatusError::Unrecognised {
+                endpoint: self.endpoint.clone(),
+                why: "its reply is not valid HTTP".into(),
+            });
+        };
 
-        let status = response.status().as_u16();
-
-        // Settled before either the status or the body is trusted, and before the body is even
-        // read: a status code and a JSON body are exactly what an unrelated service on this
-        // port could also produce (a 404 from nginx reads just like this API's own 404, and a
-        // 200 would previously have been handed straight through by the `--json` paths).
-        let marked = response.headers().get(API_MARKER_HEADER).and_then(|v| v.to_str().ok())
-            == Some(API_MARKER_VERSION);
-        if !marked {
+        // Settled before either the status or the body is trusted: a status code and a JSON body
+        // are exactly what an unrelated service on this port could also produce (a 404 from
+        // nginx reads just like this API's own 404, and a 200 would otherwise be handed straight
+        // through by the `--json` paths).
+        if response.header(API_MARKER_HEADER) != Some(API_MARKER_VERSION) {
             return Err(StatusError::Unrecognised {
                 endpoint: self.endpoint.clone(),
                 why: "it answered without this API's marker header — probably a different \
@@ -246,50 +240,145 @@ impl Client {
             });
         }
 
-        let body = response.into_body().read_to_string().map_err(|e| StatusError::Unreachable {
+        let body = response.body.ok_or_else(|| StatusError::Unreachable {
             endpoint: self.endpoint.clone(),
-            why: format!("the response head arrived but its body did not ({e})"),
+            why: "the response head arrived but its body did not".into(),
         })?;
-
-        if status == 200 {
-            return Ok((status, body));
+        if response.status == 200 {
+            return Ok((response.status, body));
         }
         Err(StatusError::Refused {
             endpoint: self.endpoint.clone(),
-            status,
+            status: response.status,
             detail: message_in(&body),
         })
     }
 
-    /// Turn a transport failure into the distinction an operator needs.
+    /// One GET, read to the end: the ops API answers every request with `Connection: close`,
+    /// so end-of-stream is where its response ends.
     ///
-    /// `ConnectionRefused` is the whole point: on loopback it means the port is closed, which
-    /// is "no daemon" and never "busy daemon". `ConnectionFailed` is `ureq`'s fallback for a
-    /// connector that produced nothing and no reason, and on a loopback address a refusal is
-    /// overwhelmingly what that is, so it lands the same way rather than in a vaguer bucket.
-    fn classify(&self, e: ureq::Error) -> StatusError {
-        let endpoint = self.endpoint.clone();
-        match e {
-            ureq::Error::Io(io) if io.kind() == ErrorKind::ConnectionRefused => {
-                StatusError::NotListening { endpoint }
+    /// Hand-written over `std::net` rather than an HTTP crate so this client links no HTTP
+    /// stack at all (#45). What it keeps from the crate it replaced is the one distinction that
+    /// matters to an operator: a refused connection on a loopback address is "no daemon", never
+    /// "busy daemon", so it is [`StatusError::NotListening`] and nothing vaguer.
+    fn exchange(&self, path: &str) -> Result<Vec<u8>, StatusError> {
+        let endpoint = || self.endpoint.clone();
+        let addrs: Vec<SocketAddr> = match self.endpoint.addr.to_socket_addrs() {
+            Ok(a) => a.collect(),
+            Err(e) => {
+                return Err(StatusError::Unreachable {
+                    endpoint: endpoint(),
+                    why: format!("that is not a usable address ({e})"),
+                });
             }
-            ureq::Error::ConnectionFailed => StatusError::NotListening { endpoint },
-            ureq::Error::Timeout(_) => {
-                StatusError::Unreachable { endpoint, why: "it did not answer in time".into() }
-            }
-            ureq::Error::HostNotFound => {
-                StatusError::Unreachable { endpoint, why: "the host does not resolve".into() }
-            }
-            ureq::Error::BadUri(why) => StatusError::Unreachable {
-                endpoint,
-                why: format!("that is not a usable address ({why})"),
-            },
-            ureq::Error::Protocol(why) => StatusError::Unrecognised {
-                endpoint,
-                why: format!("its reply is not valid HTTP ({why})"),
-            },
-            other => StatusError::Unreachable { endpoint, why: other.to_string() },
+        };
+        if addrs.is_empty() {
+            return Err(StatusError::Unreachable {
+                endpoint: endpoint(),
+                why: "the host does not resolve".into(),
+            });
         }
+
+        let mut last = None;
+        let mut stream = None;
+        for addr in &addrs {
+            match TcpStream::connect_timeout(addr, TIMEOUT) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        let Some(mut stream) = stream else {
+            return Err(match last {
+                Some(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                    StatusError::NotListening { endpoint: endpoint() }
+                }
+                Some(e) if timed_out(&e) => StatusError::Unreachable {
+                    endpoint: endpoint(),
+                    why: "it did not answer in time".into(),
+                },
+                Some(e) => StatusError::Unreachable { endpoint: endpoint(), why: e.to_string() },
+                None => StatusError::NotListening { endpoint: endpoint() },
+            });
+        };
+
+        let io = |e: std::io::Error| StatusError::Unreachable {
+            endpoint: endpoint(),
+            why: if timed_out(&e) { "it did not answer in time".into() } else { e.to_string() },
+        };
+        stream.set_read_timeout(Some(TIMEOUT)).map_err(io)?;
+        stream.set_write_timeout(Some(TIMEOUT)).map_err(io)?;
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\n\
+             Connection: close\r\n\r\n",
+            self.endpoint.addr
+        );
+        stream.write_all(request.as_bytes()).map_err(io)?;
+
+        let mut reply = Vec::new();
+        stream.take(MAX_REPLY_BYTES + 1).read_to_end(&mut reply).map_err(io)?;
+        if reply.len() as u64 > MAX_REPLY_BYTES {
+            return Err(StatusError::Unrecognised {
+                endpoint: endpoint(),
+                why: format!("its reply is larger than {MAX_REPLY_BYTES} bytes"),
+            });
+        }
+        Ok(reply)
+    }
+}
+
+/// A socket timeout surfaces as `WouldBlock` on some platforms and `TimedOut` on others.
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+}
+
+/// A snapshot of a busy daemon is tens of kilobytes; this only stops something that is not the
+/// ops API from filling memory.
+const MAX_REPLY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// A parsed HTTP/1.1 response. `body` is `None` when the head promised more bytes than arrived,
+/// or the body is not UTF-8.
+struct Response {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+}
+
+impl Response {
+    fn parse(reply: &[u8]) -> Option<Self> {
+        let split = reply.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = std::str::from_utf8(&reply[..split]).ok()?;
+        let mut lines = head.split("\r\n");
+        let mut status_line = lines.next()?.splitn(3, ' ');
+        if !status_line.next()?.starts_with("HTTP/1.") {
+            return None;
+        }
+        let status = status_line.next()?.parse().ok()?;
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+
+        let mut body = &reply[split + 4..];
+        let declared = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.parse::<usize>().ok());
+        let body = match declared {
+            Some(n) if body.len() < n => None,
+            Some(n) => {
+                body = &body[..n];
+                String::from_utf8(body.to_vec()).ok()
+            }
+            None => String::from_utf8(body.to_vec()).ok(),
+        };
+        Some(Self { status, headers, body })
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 }
 
@@ -352,22 +441,6 @@ mod tests {
         assert_eq!(missing.addr, DEFAULT_API_BIND);
         assert_eq!(missing.source, Source::Default);
 
-        std::fs::remove_file(&cfg).ok();
-    }
-
-    #[test]
-    fn a_config_the_daemon_would_reject_still_yields_an_address() {
-        // `Config::load` refuses this — no `tracker.kind`, no `active_states`. Preflight gates
-        // dispatch, and a client asking what is running has no stake in it; failing here would
-        // make an unrelated typo look like the daemon being unreachable.
-        let cfg = write_config(
-            "unloadable",
-            "[tracker]\nkind = \"\"\n[api]\nbind = \"127.0.0.1:9100\"\n",
-        );
-        assert!(crate::config::Config::load(&cfg).is_err(), "the daemon must still reject this");
-
-        let e = endpoint(None, &cfg);
-        assert_eq!(e.addr, "127.0.0.1:9100");
         std::fs::remove_file(&cfg).ok();
     }
 

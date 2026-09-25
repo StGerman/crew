@@ -1,4 +1,4 @@
-//! Plain text for [`Snapshot`] and [`Row`], for `symphony-cc status`.
+//! Plain text for [`Snapshot`] and [`Row`], for `crewctl status`.
 //!
 //! The acceptance criterion is "readable without `jq`", and the thing that makes a CLI fail it
 //! is not missing data — it is a wall of it. So the table carries what an operator scans for
@@ -14,11 +14,8 @@
 //! width probing — output that survives a pipe into `grep` is worth more here than output that
 //! looks its best in a wide window.
 
-use crate::model::Phase;
-use crate::sched::{Row, Snapshot};
-use crate::store::RunRecord;
-use crate::tui::{fmt_count, fmt_ms};
-use crate::worker::TokenUsage;
+use crate::fmt::{fmt_count, fmt_ms};
+use crate::{Phase, Row, RunRecord, Snapshot, TokenUsage};
 
 /// What a missing value prints as, everywhere. The same mark the dashboard's table uses, and
 /// never `0` — an unreported cost is unknown, not free.
@@ -358,8 +355,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sched::RateLimitPause;
-    use crate::worker::TokenUsage;
+    use crate::RateLimitPause;
 
     /// The whole point of a transcript is that it is readable after the run is over, so the
     /// surface an operator actually types has to name it — a path that only reaches `--json`

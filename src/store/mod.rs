@@ -50,52 +50,7 @@ impl IssueState {
     }
 }
 
-/// One dispatched run, as the published snapshot carries it.
-///
-/// `ended_at` and `outcome` are `None` while the run is in flight — and stay `None` for a run
-/// whose process was killed with the orchestrator, until the next startup's `recover()` closes
-/// it. `turns` is checkpointed while the run is in flight (`Store::record_progress`, once per
-/// tick) and made final by `finish_run`, so a run that died with its process reports what it
-/// had reached at the last tick rather than zero. The token columns have no such checkpoint —
-/// the CLI reports a total once, at the end, or never.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunRecord {
-    pub run_id: String,
-    pub issue_id: String,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
-    pub outcome: Option<String>,
-    pub session_id: Option<String>,
-    pub turns: u32,
-    /// `None` when the run ended without the CLI reporting a total — killed,
-    /// crashed, or cut off by the session turn budget. Not zero: unknown.
-    pub in_tok: Option<u64>,
-    pub out_tok: Option<u64>,
-    /// Path to this run's raw event stream, when one was written. How an operator gets from
-    /// "run X went wrong" to the bytes it produced, without knowing where transcripts are kept.
-    pub transcript: Option<String>,
-    /// The `--model` this run was dispatched with; `None` when none was passed. Strings rather
-    /// than [`ModelChoice`] because a recorded level must stay readable after the CLI, and so
-    /// [`Effort`](crate::worker::Effort), stops offering it.
-    pub model: Option<String>,
-    pub effort: Option<String>,
-}
-
-impl RunRecord {
-    /// `model/effort`, for every observer that shows a run. A field dispatched with no flag reads
-    /// `default` rather than naming today's default, which is exactly the value the run may not
-    /// have had.
-    pub fn model_label(&self) -> String {
-        match (&self.model, &self.effort) {
-            (None, None) => "cli default".into(),
-            (m, e) => format!(
-                "{}/{}",
-                m.as_deref().unwrap_or("default"),
-                e.as_deref().unwrap_or("default")
-            ),
-        }
-    }
-}
+pub use libcrew::RunRecord;
 
 /// What [`Store::start_run`] records about a run before its worker exists.
 pub struct RunStart<'a> {

@@ -20,10 +20,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
-use crew::api::client::{Client, endpoint};
+use clap::Parser;
 use crew::api::mcp::OpsMcp;
-use crew::api::{Api, Command, render};
+use crew::api::{Api, Command};
 use crew::broker::fake::FakeWrites;
 use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use crew::clock::{Clock, SystemClock};
@@ -49,9 +48,8 @@ use tokio::sync::{mpsc, watch};
 #[derive(Parser, Debug)]
 #[command(name = "symphony-cc", about = "Tracker-driven orchestrator for coding agents")]
 struct Args {
-    /// Path to the TOML config. Global, so `status` can read `[api] bind` out of the same
-    /// file the daemon was started with, written on either side of the subcommand.
-    #[arg(short, long, default_value = "symphony.toml", global = true)]
+    /// Path to the TOML config.
+    #[arg(short, long, default_value = "symphony.toml")]
     config: PathBuf,
 
     /// Show the terminal dashboard. Without it the service runs headless and logs.
@@ -63,9 +61,8 @@ struct Args {
     max_ticks: Option<u64>,
 
     /// Serve the ops HTTP API on this address, overriding `[api]` in the config. A
-    /// non-loopback address still needs `api.allow_public`. Under `status`, the address to
-    /// query instead of the one to serve.
-    #[arg(long, value_name = "ADDR", global = true)]
+    /// non-loopback address still needs `api.allow_public`.
+    #[arg(long, value_name = "ADDR")]
     api: Option<String>,
 
     /// Serve the ops API as MCP tools on this address, for the agent supervising this daemon,
@@ -73,26 +70,6 @@ struct Args {
     /// address to a dispatched worker — see `api::mcp`.
     #[arg(long, value_name = "ADDR")]
     mcp: Option<String>,
-
-    #[command(subcommand)]
-    command: Option<Cmd>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Cmd {
-    /// Print what a running daemon is doing, read from its ops API.
-    Status(StatusArgs),
-}
-
-#[derive(clap::Args, Debug)]
-struct StatusArgs {
-    /// One issue in full, by dispatch id or tracker identifier. Omit for every issue.
-    #[arg(value_name = "ISSUE")]
-    issue: Option<String>,
-
-    /// Print the API's JSON verbatim. For a script; the rendered form is for a person.
-    #[arg(long)]
-    json: bool,
 }
 
 #[tokio::main]
@@ -107,12 +84,6 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "crew=info".into()),
         )
         .init();
-
-    // Before the config is even loaded: `status` is a client, and a daemon-side preflight
-    // failure is not its business to report.
-    if let Some(Cmd::Status(status)) = &args.command {
-        std::process::exit(run_status(&args, status));
-    }
 
     let cfg = Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
@@ -432,41 +403,6 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.join();
     }
     Ok(())
-}
-
-/// `symphony-cc status`: ask a running daemon what it is doing, and say so plainly.
-///
-/// Returns a process exit code rather than a `Result`, because the two failures an operator
-/// cares about are not the same event. "No daemon is listening" is the answer to a question a
-/// script may legitimately be asking; rendering it through `anyhow` would bury a message
-/// written to be read in a `Error:` chain written to be debugged.
-///
-/// `1` for anything that stopped this from printing a snapshot. The message on stderr is what
-/// distinguishes the cases; see `StatusError`.
-fn run_status(args: &Args, status: &StatusArgs) -> i32 {
-    let client = Client::new(endpoint(args.api.as_deref(), &args.config));
-    let addr = client.endpoint().addr.clone();
-
-    let rendered = match (&status.issue, status.json) {
-        (None, false) => client.snapshot().map(|s| render::snapshot(&s, &addr)),
-        (Some(key), false) => client.issue(key).map(|r| render::issue(&r)),
-        (None, true) => client.raw_snapshot(),
-        (Some(key), true) => client.raw_issue(key),
-    };
-
-    match rendered {
-        Ok(text) => {
-            print!("{}", text);
-            if !text.ends_with('\n') {
-                println!();
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            1
-        }
-    }
 }
 
 /// Bind the broker's loopback listener and start serving.

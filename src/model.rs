@@ -47,38 +47,7 @@ impl Issue {
     }
 }
 
-/// The orchestrator's claim state for an issue. Distinct from tracker state.
-///
-/// The serde spelling is pinned to [`Phase::label`], which is also what the store writes into
-/// its `phase` column and what the dashboard prints. One word per phase everywhere it is
-/// visible means an operator reading the HTTP API, the database and the TUI side by side never
-/// has to translate between three vocabularies for the same thing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Phase {
-    #[serde(rename = "queued")]
-    Queued,
-    #[serde(rename = "running")]
-    Running,
-    #[serde(rename = "retry")]
-    RetryQueued,
-    #[serde(rename = "quarantine")]
-    Quarantined,
-    #[default]
-    #[serde(rename = "released")]
-    Released,
-}
-
-impl Phase {
-    pub fn label(self) -> &'static str {
-        match self {
-            Phase::Queued => "queued",
-            Phase::Running => "running",
-            Phase::RetryQueued => "retry",
-            Phase::Quarantined => "quarantine",
-            Phase::Released => "released",
-        }
-    }
-}
+pub use libcrew::Phase;
 
 /// What a worker reports when its run ends. An explicit verdict, never inferred from exit status.
 #[derive(Debug, Clone, PartialEq, Eq)]

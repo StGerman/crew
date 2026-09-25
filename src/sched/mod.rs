@@ -27,7 +27,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::broker::{Broker, BrokerSession};
-use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
@@ -40,7 +39,7 @@ use crate::project::{ProjectedIssue, Projector};
 use crate::store::{RunRecord, RunStart, Store};
 use crate::tracker::{Tracker, TrackerError};
 use crate::transcript::Transcripts;
-use crate::worker::{Progress, RunHandle, Session, Spawn, TokenUsage, Worker};
+use crate::worker::{Progress, RunHandle, Session, Spawn, Worker};
 use crate::workspace::Workspace;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
@@ -101,85 +100,7 @@ struct Gating {
     started: Mono,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Row {
-    pub issue_id: String,
-    pub identifier: String,
-    pub title: String,
-    pub url: Option<String>,
-    pub tracker_state: String,
-    pub phase: Phase,
-    pub attempt: u32,
-    pub turns: u32,
-    /// The current run's totals, once its `result` event has supplied them. `None` while it is
-    /// in flight and for every row that is not running.
-    pub tokens: Option<TokenUsage>,
-    pub age_ms: u64,
-    pub retry_in_ms: Option<i64>,
-    pub quarantined: bool,
-    pub last_error: Option<String>,
-    pub last_event: Option<String>,
-    pub workspace: Option<String>,
-    /// The branch this issue's most recent dispatch actually checked out, recorded at that
-    /// call rather than recomputed from `identifier` — see `Store::set_branch`.
-    ///
-    /// Outlives `workspace`, and deliberately: the worktree directory is scratch that cleanup
-    /// deletes, while the branch is what a finished run leaves behind for a reviewer to find.
-    /// `None` for an issue never dispatched — naming a branch that was never written would
-    /// send that reviewer after nothing — for a [`crate::workspace::DirWorkspace`] deployment,
-    /// which has no branches at all, and once cleanup deletes a branch that turned out to carry
-    /// nothing new: `None` here is always either of those, never a ref that is already gone.
-    pub branch: Option<String>,
-    /// This issue's most recent runs, newest first, at most [`RUNS_PER_ISSUE`].
-    pub runs: Vec<RunRecord>,
-    /// The most recent run's transcript, so "show me what this issue did" is one path away
-    /// from the dashboard rather than a layout someone has to know.
-    pub transcript: Option<String>,
-    /// Where the branch is on its way to a mergeable pull request, once a run has reported
-    /// done with delivery on. `None` before that, and always for a deployment without a forge.
-    pub delivery: Option<DeliveryView>,
-}
-
-/// Immutable view published to observers. The TUI renders this and never touches the store,
-/// and neither does the HTTP API ([`crate::api`]), which is what keeps either from becoming
-/// load-bearing.
-///
-/// It follows that this type is the *whole* published view: an observer that needs something
-/// it does not carry does not get a `Store`, it gets a new field here. That is why run history
-/// lives on [`Row`] rather than being read back out of the database by whoever wants it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub generated_at: i64,
-    pub rows: Vec<Row>,
-    pub running: usize,
-    pub limit: usize,
-    pub retrying: usize,
-    pub quarantined: usize,
-    /// Summed over every run that reported a total.
-    pub tokens: TokenUsage,
-    /// Finished runs that reported none — killed, crashed, or budget-cut. Shown next to the sum
-    /// so it reads as the lower bound it is.
-    pub uncounted_runs: u64,
-    pub ticks: u64,
-    pub last_tick_at: Option<i64>,
-    pub last_error: Option<String>,
-    /// Set while dispatch is paused for an account-wide rate limit the agent CLI itself
-    /// reported (#37). `None` when dispatch is not paused for this reason — which is not the
-    /// same as "nothing is wrong"; see `last_error` for an ordinary failure.
-    pub rate_limit_pause: Option<RateLimitPause>,
-}
-
-/// An account-wide dispatch pause, published so an operator sees *why* nothing is running
-/// rather than an idle daemon with no explanation (#37).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RateLimitPause {
-    /// Whatever the CLI named the exhausted window — `"five_hour"`, `"seven_day"`, or a name
-    /// this crate has never seen.
-    pub kind: String,
-    /// Wall-clock milliseconds — the same units as [`Snapshot::generated_at`] — at which
-    /// dispatch resumes.
-    pub resets_at: i64,
-}
+pub use libcrew::{RateLimitPause, Row, Snapshot};
 
 pub struct Scheduler {
     pub cfg: Config,
