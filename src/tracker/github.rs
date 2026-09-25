@@ -233,10 +233,9 @@ fn parse_created_at(s: &str) -> Option<i64> {
     OffsetDateTime::parse(s, &Rfc3339).ok().map(|t| t.unix_timestamp() * 1000)
 }
 
-/// Trimmed, lowercased, blanks dropped, duplicates removed, first occurrence kept: the same
-/// shape `Config::normalize` gives `tracker.required_labels`, so `Scheduler::routable` can
-/// compare with plain equality. GitHub returns a label in whatever casing it was created with,
-/// so an issue labelled `Agent` never matched a configured `agent` (#70).
+/// Without this an issue labelled `Agent` never matches a configured `agent` and is never
+/// dispatched (#70): `routable` compares with plain equality against `required_labels`, which
+/// `Config::normalize` has already given this same shape.
 fn normalize_labels(labels: Vec<GhLabel>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for label in labels {
@@ -329,9 +328,8 @@ impl<H: Http> GithubTracker<H> {
         })
     }
 
-    /// One issue as GitHub returned it, labels in their original casing, or `None` when it is
-    /// not visible to this tracker. `by_ids` normalizes what it gets from here; `set_state` does
-    /// not, because it writes the labels back and must not rename the operator's own.
+    /// Labels normalized here would be renamed on GitHub by the next `set_state`, which writes
+    /// them back (#70), so this returns GitHub's own names and `by_ids` normalizes them itself.
     fn fetch_issue(&self, id: &str) -> Result<Option<GhIssue>, TrackerError> {
         // An id this tracker never issued (wrong owner/repo, or malformed) cannot be
         // "visible" to it — omit rather than error, same as a clean 404 below.
@@ -483,8 +481,7 @@ impl<H: Http> TrackerWrites for GithubTracker<H> {
         // not sent back is removed, and `required_labels` (the `agent` label this repo
         // dispatches on) living in that set means a blind write would make the issue
         // undispatchable.
-        // Raw, not through `by_ids`: these names are sent back, and a normalized copy would
-        // rename every label the operator created with capitals.
+        // Through `by_ids`, this would rename the operator's labels on every state change (#70).
         let current = self
             .fetch_issue(issue_id)?
             .ok_or_else(|| TrackerError::Status(format!("{issue_id} is not visible")))?;
@@ -789,8 +786,7 @@ mod tests {
         assert_eq!(derive_state(false, &[]), "open");
     }
 
-    /// #70: GitHub hands labels back in whatever casing they were created with, and the
-    /// scheduler compares them with plain equality against a lowercased `required_labels`.
+    /// Guards dispatch against label casing (#70).
     #[test]
     fn labels_are_normalized_at_the_adapter_boundary() {
         let http = FakeHttp::new();
@@ -805,8 +801,7 @@ mod tests {
         );
     }
 
-    /// The other half of the boundary: an issue whose only label is `Agent` satisfies the same
-    /// `required_labels = ["agent"]` a config normalizes to, by the equality `routable` uses.
+    /// Guards dispatch against label casing (#70), by the equality `routable` uses.
     #[test]
     fn a_mixed_case_required_label_satisfies_the_normalized_config() {
         let http = FakeHttp::new();
@@ -879,9 +874,8 @@ mod tests {
         assert!(!labels.contains(&"state:in-progress".to_string()), "the old state must go");
     }
 
-    /// `set_state` writes the whole label set back, so it must send GitHub's own names: the
-    /// normalized copy `by_ids` returns would rename every label the operator created with
-    /// capitals. A capitalised `State:` label is still recognised as the old state and dropped.
+    /// Guards the operator's labels against being renamed by a state change (#70), and a
+    /// capitalised `State:` label against surviving as a second state.
     #[test]
     fn set_state_writes_labels_back_in_their_original_casing() {
         let http = FakeHttp::new();
