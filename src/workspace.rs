@@ -208,6 +208,11 @@ impl std::fmt::Debug for PushAuth {
 /// the token in it lands in `.git/config`, `-c http.extraheader=` lands in argv (`ps`), and an
 /// environment variable is readable from the push's own process. The file is named in argv, not
 /// its contents, and lives only for the length of the push.
+///
+/// This keeps the token out of the places an agent reads by accident, not out of reach of one
+/// that goes looking: a worker runs as the same user, and the App's private key, from which any
+/// number of tokens can be minted, is a file that user can read for the daemon's whole life.
+/// Only a separate uid would change that, the same limit the broker's module doc records.
 struct PushCredentialFile {
     dir: PathBuf,
     file: PathBuf,

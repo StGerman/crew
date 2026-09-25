@@ -134,7 +134,9 @@ and branch push is then authored by the App. The token is a *source*, not a `Str
 injected clock and re-mints `REFRESH_MARGIN_MS` before expiry. The push reaches it through a
 `git credential-store` file `publish` creates in a private temp directory and deletes after one
 push (`PushCredentialFile` in `src/workspace.rs`) — never a URL (lands in `.git/config`), an
-`http.extraheader` (lands in argv) or an environment variable. `Config::load` loads the file
+`http.extraheader` (lands in argv) or an environment variable. That keeps the token out of what an agent
+reads by accident, not out of reach of one that goes looking: it runs as the same user as the
+key file, which is the limit **Constraints for the worker and broker** already records. `Config::load` loads the file
 and the key once (`check_github_app`, not the per-tick `preflight`), so a half-configured App is
 refused by name at startup. It is commented out in `crew.github.toml`
 until `~/.crewd/github-app.toml` exists on the host; an uncommented key with no file there
