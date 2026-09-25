@@ -95,6 +95,7 @@ fn harness_full(
             required_labels: vec![],
             owner: String::new(),
             repo: String::new(),
+            ..Default::default()
         },
         polling: PollingConfig { interval_ms: 30_000 },
         workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },

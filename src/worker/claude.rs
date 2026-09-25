@@ -1297,6 +1297,18 @@ mod tests {
         std::fs::remove_dir_all(&ws).ok();
     }
 
+    /// #64: the App's key and its installation tokens never enter this process's environment at
+    /// all, so what keeps them from the child is that the allowlist names no credential either.
+    #[test]
+    fn the_default_allowlist_names_no_credential_variable() {
+        for name in DEFAULT_ENV_ALLOWLIST {
+            let upper = name.to_ascii_uppercase();
+            for marker in ["TOKEN", "KEY", "SECRET", "GITHUB", "GH_", "CREW"] {
+                assert!(!upper.contains(marker), "{name} could carry a credential");
+            }
+        }
+    }
+
     #[test]
     fn no_tracker_credential_reaches_the_child_environment() {
         let ws = tmp_workspace("env-leak");

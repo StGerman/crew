@@ -9,6 +9,7 @@ pub mod api;
 pub mod broker;
 pub mod clock;
 pub mod config;
+pub mod credentials;
 pub mod forge;
 pub mod gate;
 pub mod model;

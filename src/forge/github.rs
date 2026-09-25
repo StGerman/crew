@@ -20,6 +20,8 @@
 //! GitHub Actions is not the CI provider on this repo at all, which is why the job/log lookup
 //! only fires for a `details_url` shaped like an Actions job link and is skipped otherwise.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -28,7 +30,8 @@ use super::{
     CiFailure, CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review,
     ReviewComment,
 };
-use crate::tracker::github::{Http, HttpResponse};
+use crate::credentials::{Credentials, StaticToken};
+use crate::tracker::github::{Http, HttpResponse, HttpTransportError};
 
 const API_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
@@ -166,30 +169,56 @@ pub struct GithubForge<H: Http> {
     http: H,
     owner: String,
     repo: String,
-    token: String,
+    creds: Arc<dyn Credentials>,
 }
 
 impl<H: Http> GithubForge<H> {
     pub fn new(http: H, owner: &str, repo: &str, token: &str) -> Self {
-        Self { http, owner: owner.to_string(), repo: repo.to_string(), token: token.to_string() }
+        Self {
+            http,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            creds: Arc::new(StaticToken::new(token)),
+        }
     }
 
-    fn headers(&self) -> Vec<(&str, String)> {
-        vec![
-            ("Authorization", format!("Bearer {}", self.token)),
+    /// The installation token the pull request is authored with, asked for per request because
+    /// it expires within the hour (#64).
+    pub fn with_credentials(mut self, creds: Arc<dyn Credentials>) -> Self {
+        self.creds = creds;
+        self
+    }
+
+    fn headers(&self) -> Result<Vec<(&'static str, String)>, ForgeError> {
+        Ok(vec![
+            ("Authorization", format!("Bearer {}", self.creds.token()?)),
             ("Accept", "application/vnd.github+json".to_string()),
             ("X-GitHub-Api-Version", API_VERSION.to_string()),
             ("User-Agent", "crewd".to_string()),
-        ]
+        ])
+    }
+
+    /// Sends once, and once more with a fresh token if the first was refused with a 401: an
+    /// installation token revoked before its expiry would otherwise read as a permanent auth
+    /// failure and hand delivery off, though the next mint would have worked. A refused request
+    /// was not applied, so repeating it is safe; a second 401 is the credential really being
+    /// wrong, and stands.
+    fn authed(
+        &self,
+        send: impl Fn(&[(&str, String)]) -> Result<HttpResponse, HttpTransportError>,
+    ) -> Result<HttpResponse, ForgeError> {
+        let transport =
+            |e: HttpTransportError| ForgeError::Transient(format!("transport error: {}", e.0));
+        let resp = send(&self.headers()?).map_err(transport)?;
+        if resp.status == 401 && self.creds.invalidate() {
+            return send(&self.headers()?).map_err(transport);
+        }
+        Ok(resp)
     }
 
     /// One authenticated GET, classified onto [`ForgeError`].
     fn get(&self, url: &str) -> Result<HttpResponse, ForgeError> {
-        let resp = self
-            .http
-            .get(url, &self.headers())
-            .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
-        classify(resp)
+        classify(self.authed(|h| self.http.get(url, h))?)
     }
 
     /// One authenticated JSON write, classified the same way a read is — a bad credential on a
@@ -197,11 +226,7 @@ impl<H: Http> GithubForge<H> {
     /// retryable/permanent split stops meaning the same thing on both paths.
     fn send_json(&self, method: &str, url: &str, body: &Value) -> Result<HttpResponse, ForgeError> {
         let payload = serde_json::to_vec(body).map_err(|e| ForgeError::Permanent(e.to_string()))?;
-        let resp = self
-            .http
-            .send_json(method, url, &self.headers(), &payload)
-            .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
-        classify(resp)
+        classify(self.authed(|h| self.http.send_json(method, url, h, &payload))?)
     }
 
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ForgeError> {
@@ -212,7 +237,7 @@ impl<H: Http> GithubForge<H> {
     /// where a job or a log that cannot be fetched must leave `detail` with whatever was
     /// gathered so far rather than failing `ci_status` outright.
     fn get_best_effort(&self, url: &str) -> Option<HttpResponse> {
-        let resp = self.http.get(url, &self.headers()).ok()?;
+        let resp = self.authed(|h| self.http.get(url, h)).ok()?;
         if (200..300).contains(&resp.status) { Some(resp) } else { None }
     }
 
@@ -348,10 +373,7 @@ impl<H: Http> Forge for GithubForge<H> {
             "base": spec.base,
         });
         let raw = serde_json::to_vec(&payload).map_err(|e| ForgeError::Permanent(e.to_string()))?;
-        let resp = self
-            .http
-            .send_json("POST", &url, &self.headers(), &raw)
-            .map_err(|e| ForgeError::Transient(format!("transport error: {}", e.0)))?;
+        let resp = self.authed(|h| self.http.send_json("POST", &url, h, &raw))?;
         // A run that committed nothing new is not a delivery failure — it is nothing to
         // deliver, and `ForgeError::NothingToDeliver` is what tells the scheduler the
         // difference. GitHub's only signal for that case is a 422 with this exact phrase in the
@@ -985,5 +1007,127 @@ mod tests {
         assert_eq!(got.len(), PER_PAGE as usize + 1);
         assert!(f.http.gets()[0].contains("page=1"));
         assert!(f.http.gets()[1].contains("page=2"));
+    }
+}
+
+/// #64: a 401 on an App token re-mints and retries once, on every path that sends.
+#[cfg(test)]
+mod reauth_tests {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::credentials::CredentialError;
+
+    /// Hands out `tok-N`, moving to the next only once invalidated, as `GithubApp` would.
+    #[derive(Default)]
+    struct Rotating(AtomicU32);
+
+    impl Credentials for Rotating {
+        fn token(&self) -> Result<String, CredentialError> {
+            Ok(format!("tok-{}", self.0.load(Ordering::SeqCst)))
+        }
+
+        fn invalidate(&self) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// Answers 401 to any bearer but `accept`; otherwise the next scripted body.
+    struct Github {
+        accept: &'static str,
+        bodies: Mutex<VecDeque<(u16, Value)>>,
+        sent: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Github {
+        fn new(accept: &'static str, bodies: Vec<(u16, Value)>) -> Arc<Self> {
+            Arc::new(Self { accept, bodies: Mutex::new(bodies.into()), sent: Mutex::default() })
+        }
+
+        fn answer(&self, what: String, headers: &[(&str, String)]) -> HttpResponse {
+            let bearer = headers.iter().find(|(k, _)| *k == "Authorization").unwrap().1.clone();
+            self.sent.lock().push((what, bearer.clone()));
+            let (status, body) = if bearer == format!("Bearer {}", self.accept) {
+                self.bodies.lock().pop_front().expect("scripted")
+            } else {
+                (401, json!({ "message": "Bad credentials" }))
+            };
+            HttpResponse { status, headers: HashMap::new(), body: body.to_string().into_bytes() }
+        }
+    }
+
+    impl Http for Arc<Github> {
+        fn get(
+            &self,
+            url: &str,
+            headers: &[(&str, String)],
+        ) -> Result<HttpResponse, HttpTransportError> {
+            Ok(self.answer(format!("GET {url}"), headers))
+        }
+
+        fn send_json(
+            &self,
+            method: &str,
+            url: &str,
+            headers: &[(&str, String)],
+            _body: &[u8],
+        ) -> Result<HttpResponse, HttpTransportError> {
+            Ok(self.answer(format!("{method} {url}"), headers))
+        }
+    }
+
+    fn forge(gh: &Arc<Github>) -> GithubForge<Arc<Github>> {
+        GithubForge::new(gh.clone(), "o", "r", "unused")
+            .with_credentials(Arc::new(Rotating::default()))
+    }
+
+    #[test]
+    fn a_token_revoked_before_its_expiry_is_replaced_and_the_pull_request_still_opens() {
+        let pr = json!({
+            "number": 9,
+            "html_url": "https://github.com/o/r/pull/9",
+            "head": { "sha": "abc" },
+            "base": { "ref": "master" },
+            "state": "open",
+        });
+        // `tok-0` was revoked; only the re-minted `tok-1` is accepted.
+        let gh = Github::new("tok-1", vec![(200, json!([])), (201, pr)]);
+        let spec = PullRequestSpec {
+            title: "t".into(),
+            body: "b".into(),
+            head: "crew/x".into(),
+            base: "master".into(),
+        };
+
+        let opened = forge(&gh).open_pull_request(&spec).expect("delivery is not handed off");
+        assert_eq!(opened.number, 9);
+        let sent = gh.sent.lock().clone();
+        assert_eq!(
+            sent.iter()
+                .map(|(w, b)| (w.split(' ').next().unwrap(), b.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("GET", "Bearer tok-0"), ("GET", "Bearer tok-1"), ("POST", "Bearer tok-1")],
+            "one retry on the refused read, and the write goes out with the fresh token"
+        );
+    }
+
+    #[test]
+    fn a_credential_refused_twice_is_permanent_after_exactly_one_retry() {
+        let gh = Github::new("never", vec![]);
+        let err = forge(&gh).ci_status("abc").unwrap_err();
+        assert!(matches!(err, ForgeError::Permanent(_)), "got {err:?}");
+        assert_eq!(gh.sent.lock().len(), 2, "one retry, not a loop");
+    }
+
+    #[test]
+    fn a_static_token_is_not_retried_since_a_second_try_would_send_the_same_one() {
+        let gh = Github::new("never", vec![]);
+        let f = GithubForge::new(gh.clone(), "o", "r", "tok");
+        assert!(matches!(f.ci_status("abc"), Err(ForgeError::Permanent(_))));
+        assert_eq!(gh.sent.lock().len(), 1);
     }
 }

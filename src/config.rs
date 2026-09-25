@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::credentials::GithubAppFile;
 use crate::worker::{Effort, ModelChoice};
 
 fn d_interval() -> u64 {
@@ -364,12 +365,26 @@ pub struct TrackerConfig {
     pub terminal_states: Vec<String>,
     #[serde(default)]
     pub required_labels: Vec<String>,
-    /// `kind = "github"` only: the repository owner and name to poll. The token comes from
-    /// `GITHUB_TOKEN` in the environment, never from this file.
+    /// `kind = "github"` only: the repository owner and name to poll. The credential comes from
+    /// `github_app` when set and from `GITHUB_TOKEN` otherwise, never from this file.
     #[serde(default)]
     pub owner: String,
     #[serde(default)]
     pub repo: String,
+    /// `kind = "github"` only: a file naming the App every write is authored by — `app_id`,
+    /// `installation_id`, `private_key_path` (#64). A path to a file rather than the three keys
+    /// inline, because it is the same file `crewd init` writes (#65) and it points at a key that
+    /// must never be checked in beside this one.
+    #[serde(default)]
+    pub github_app: Option<PathBuf>,
+    /// The label that marks an issue as ready for Crew. Set, carrying it is the whole signal;
+    /// unset, any assignee is, as before this key existed. See `DispatchRule`.
+    #[serde(default)]
+    pub dispatch_label: Option<String>,
+    /// An optional further narrowing to issues assigned to this login. Never required: a
+    /// read-only marker account is only possible on an organization-owned repository.
+    #[serde(default)]
+    pub assignee: Option<String>,
 }
 
 /// The tracker a config selects; see [`WorkerKind`] for why this is parsed.
@@ -485,7 +500,22 @@ impl Config {
             .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
         cfg.normalize();
         cfg.preflight()?;
+        cfg.check_github_app()?;
         Ok(cfg)
+    }
+
+    /// Once, at load, and not in `preflight`: preflight runs every tick, and a key file briefly
+    /// replaced on disk must not stop dispatch while the key `main` already loaded is still the
+    /// one in use. A half-configured App would otherwise surface as a 401 on the first poll,
+    /// naming none of the pieces actually missing. The fake tracker never reads the file.
+    pub fn check_github_app(&self) -> Result<(), ConfigError> {
+        let Some(path) = &self.tracker.github_app else { return Ok(()) };
+        if self.tracker.kind()? != TrackerKind::Github {
+            return Ok(());
+        }
+        GithubAppFile::load(path)
+            .and_then(|file| file.load_key().map(drop))
+            .map_err(|e| ConfigError::Invalid(format!("tracker.github_app: {e}")))
     }
 
     /// Lowercase every state used for comparison, so provider spelling never leaks into lookups.
@@ -496,6 +526,13 @@ impl Config {
         self.tracker.active_states = norm(&self.tracker.active_states);
         self.tracker.terminal_states = norm(&self.tracker.terminal_states);
         self.tracker.required_labels = norm(&self.tracker.required_labels);
+        // The same shape the adapter gives an issue's labels, or `Agent` would never match.
+        self.tracker.dispatch_label = self
+            .tracker
+            .dispatch_label
+            .as_deref()
+            .map(|l| l.trim().to_lowercase())
+            .filter(|l| !l.is_empty());
 
         self.agent.max_concurrent_by_state = self
             .agent
@@ -665,6 +702,7 @@ mod tests {
                 required_labels: vec![],
                 owner: String::new(),
                 repo: String::new(),
+                ..Default::default()
             },
             polling: Default::default(),
             workspace: Default::default(),
@@ -678,6 +716,61 @@ mod tests {
         };
         c.normalize();
         c
+    }
+
+    /// #64: each half-configured App names its missing piece instead of reaching the first poll
+    /// as a 401.
+    #[test]
+    fn a_half_configured_github_app_is_refused_naming_the_missing_piece() {
+        let dir = std::env::temp_dir().join(format!("crew-cfg-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = dir.join("github-app.toml");
+        let mut c = base();
+        c.tracker.kind = "github".into();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        let refused = |c: &Config| match c.check_github_app() {
+            Err(ConfigError::Invalid(m)) => m,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        c.tracker.github_app = Some(dir.join("absent.toml"));
+        assert!(refused(&c).contains("cannot read"), "{}", refused(&c));
+
+        c.tracker.github_app = Some(app.clone());
+        std::fs::write(&app, "installation_id = 2\nprivate_key_path = \"k.pem\"").unwrap();
+        assert!(refused(&c).ends_with("has no app_id"), "{}", refused(&c));
+        std::fs::write(&app, "app_id = 1\nprivate_key_path = \"k.pem\"").unwrap();
+        assert!(refused(&c).ends_with("has no installation_id"), "{}", refused(&c));
+        std::fs::write(&app, "app_id = 1\ninstallation_id = 2").unwrap();
+        assert!(refused(&c).ends_with("has no private_key_path"), "{}", refused(&c));
+
+        std::fs::write(&app, "app_id = 1\ninstallation_id = 2\nprivate_key_path = \"k.pem\"")
+            .unwrap();
+        assert!(refused(&c).contains("not readable"), "{}", refused(&c));
+        std::fs::write(dir.join("k.pem"), "garbage").unwrap();
+        assert!(refused(&c).contains("not an RSA private key"), "{}", refused(&c));
+
+        crate::credentials::tests::throwaway_key(&dir);
+        std::fs::rename(dir.join("app.pem"), dir.join("k.pem")).unwrap();
+        c.check_github_app().expect("a complete App passes");
+        c.preflight().expect("and the per-tick preflight never reads the file");
+        std::fs::remove_file(dir.join("k.pem")).unwrap();
+        c.preflight().expect("a key replaced after load does not stop dispatch");
+        c.tracker.kind = "fake".into();
+        c.check_github_app().expect("the fake tracker never reads the App file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dispatch_label_is_normalized_like_the_labels_it_is_compared_with() {
+        let mut c = base();
+        c.tracker.dispatch_label = Some(" Agent ".into());
+        c.normalize();
+        assert_eq!(c.tracker.dispatch_label.as_deref(), Some("agent"));
+        c.tracker.dispatch_label = Some("  ".into());
+        c.normalize();
+        assert_eq!(c.tracker.dispatch_label, None, "blank is unset, not a label nothing carries");
     }
 
     #[test]

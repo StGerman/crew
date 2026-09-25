@@ -6,10 +6,10 @@ description: Triage this repo's GitHub Issues into the milestone/`agent`-label s
 # Issue triage
 
 The backlog is this repository's GitHub Issues. The daemon reads it directly: an open issue
-that is labelled `agent` **and** has an assignee is work a real agent will pick up and spend
-tokens on. The label is `tracker.required_labels`; the assignee is `GithubTracker`'s
-`dispatchable` rule (`to_issue` in `src/tracker/github.rs`). Both must hold, so re-read that
-function if the rule may have moved. Triage
+labelled `agent` is work a real agent will pick up and spend tokens on. The label is
+`tracker.dispatch_label` in `crew.github.toml`, and carrying it is the whole rule — an assignee
+is neither needed nor sufficient (`DispatchRule` in `src/tracker/github.rs`; re-read it if the
+rule may have moved). Triage
 is therefore the decision point between "someone wrote this down" and "an agent works this" —
 treat it as the gate it is.
 
@@ -22,10 +22,10 @@ state.
 |---|---|---|
 | **Inbox** | no milestone | Nobody has looked at it yet. The default for every new issue. |
 | **Backlog** | milestone **"Worth doing, not scheduled"** | Triaged and accepted, with no date. |
-| **Dispatchable** | current milestone, labelled `agent`, **and** at least one assignee | The daemon will pick it up. |
+| **Dispatchable** | current milestone, labelled `agent` | The daemon will pick it up. |
 | **Planned** | any other `M<n>` milestone | Committed. The milestone *is* the priority. |
 
-A current-milestone issue missing either `agent` or an assignee is **Planned**, not
+A current-milestone issue without `agent` is **Planned**, not
 Dispatchable: report it that way, because the daemon will never run it. An issue triage decides
 against leaves the set: it is closed as *not planned* with a one-line reason.
 
@@ -45,10 +45,9 @@ gh api repos/{owner}/{repo}/milestones --jq '.[] | "\(.number)\t\(.title)\t\(.op
 
 ## Making an issue dispatchable is a human decision
 
-Adding `agent` and an assignee together is what turns an issue into a spawned `claude -p`
-process with `bypassPermissions` against a real worktree. They are one decision made in one
-edit — the assignee is the operator (`--add-assignee @me`) — added only in triage, only by the
-operator or on their explicit say-so, and only to an issue that is:
+Adding `agent` is what turns an issue into a spawned `claude -p` process with
+`bypassPermissions` against a real worktree. It is added only in triage, only by the operator or
+on their explicit say-so, and only to an issue that is:
 
 - **in the current milestone** — `agent` is how the milestone order reaches the daemon, so it
   sits on the current milestone's issues and nowhere else;
@@ -59,7 +58,7 @@ operator or on their explicit say-so, and only to an issue that is:
   description (see below) before the issue is made dispatchable.
 
 When you file an issue yourself (found a bug mid-task, split out follow-up work), leave it in
-the Inbox with no milestone, no `agent` label and no assignee, and say in the body what triggered it.
+the Inbox with no milestone and no `agent` label, and say in the body what triggered it.
 Placing it is triage's job, not the author's.
 
 ## Decisions go into the description
@@ -126,14 +125,14 @@ Run through these in order. Triage is done when every step's criterion holds.
    ```
    Read each issue in full (`gh issue view <n> --comments`) and place it with the rule above.
    Done when the inbox list is empty.
-2. **Stale dispatch.** Every open `agent` issue should be in the current milestone and have an
-   assignee; fix any that is not. Then check each has a linked PR or recent progress:
+2. **Stale dispatch.** Every open `agent` issue should be in the current milestone; fix any
+   that is not. Then check each has a linked PR or recent progress:
    ```bash
    gh issue list --state open --label agent --json number,title,milestone,assignees,updatedAt
    gh pr list --state open --json number,title,headRefName
    ```
    An `agent` issue open more than 7 days with no PR is either under-specified (tighten it)
-   or blocked (remove `agent` and the assignee, say why). Done when each one has a PR, a fresh update, or a
+   or blocked (remove `agent`, say why). Done when each one has a PR, a fresh update, or a
    comment explaining the hold.
 3. **Resolved but open.** An issue whose fix has merged (check the invariant table and recent
    PRs) is closed with a comment naming the PR. Done when no merged fix is left open.
@@ -149,7 +148,7 @@ When a milestone closes:
    while planning into its issue's description. If the result has issues
    that must land in a particular order, split it before going on.
 3. Update the description's list.
-4. Add `agent` and the assignee to its issues that meet the bar — this is the moment they
+4. Add `agent` to its issues that meet the bar — this is the moment they
    become dispatchable.
 
 ## Acting versus proposing
@@ -157,6 +156,6 @@ When a milestone closes:
 Moving issues, labelling and closing are writes to a shared tracker under the operator's
 credential. Present the full set of proposed changes as one table — issue, from-state,
 to-state, labels, reason — and apply it only after the operator confirms. When confirmed,
-apply with `gh issue edit <n> --milestone "<title>" --add-label agent --add-assignee @me` and `gh issue close
+apply with `gh issue edit <n> --milestone "<title>" --add-label agent` and `gh issue close
 <n> --reason "not planned" --comment "<why>"`, and batch the calls: the GitHub API budget is
 shared with the running daemon.
