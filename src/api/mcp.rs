@@ -1,6 +1,6 @@
 //! The ops API as MCP tools, for the agent supervising this daemon.
 //!
-//! `symphony-cc status` closed the gap between the HTTP API and a person (#24). An agent
+//! `crewctl status` closed the gap between the HTTP API and a person (#24). An agent
 //! supervising the daemon — one driving a dogfooding session, a watchdog later — was still on
 //! the wrong side of it: it had to spawn the CLI and parse a rendering that reuses `fmt_count`,
 //! `fmt_ms` and `Phase::label` precisely so it reads well to a human, and so changes whenever
@@ -77,10 +77,10 @@ use super::{Api, Response};
 use crate::broker::McpService;
 use crate::config::ApiConfig;
 
-/// The MCP server name. Tools reach the supervising agent as `mcp__symphony_ops__<tool>`.
+/// The MCP server name. Tools reach the supervising agent as `mcp__crew_ops__<tool>`.
 /// Distinct from the broker's [`SERVER_NAME`](crate::broker::SERVER_NAME) so a transcript
 /// shows at a glance which surface a call went to.
-pub const SERVER_NAME: &str = "symphony_ops";
+pub const SERVER_NAME: &str = "crew_ops";
 
 /// The one path this server answers. Fixed rather than tokened: the authority here is
 /// the address, which is why the address is loopback and its own port.

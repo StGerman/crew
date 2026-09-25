@@ -663,7 +663,7 @@ impl Scheduler {
                 _ => acc,
             });
         body.push_str(&format!(
-            "\n## Provenance\n\nOpened by symphony-cc from {} run{} of {} ({} turns, {} tokens in / {} \
+            "\n## Provenance\n\nOpened by crewd from {} run{} of {} ({} turns, {} tokens in / {} \
              out{}). The verdict on each review comment is recorded as a reply on its thread; \
              merging is left to a human.\n",
             runs.len(),

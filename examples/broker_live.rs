@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         title: "Broker smoke test".into(),
         body: Some(
             "Do not read or modify any files, and do not run any commands. Call the \
-             mcp__symphony__comment tool exactly once with the body 'live broker check', then \
+             mcp__crew__comment tool exactly once with the body 'live broker check', then \
              stop and report what it returned."
                 .into(),
         ),

@@ -314,7 +314,7 @@ impl GitWorktreeWorkspace {
     ///
     /// Built in a scratch index so the worktree's own index — which the agent may have staged
     /// into deliberately — is never touched, and compared against HEAD's tree so a clean
-    /// worktree creates no ref and an ordinary finish gains no noise. Authored as `symphony-cc`
+    /// worktree creates no ref and an ordinary finish gains no noise. Authored as `crewd`
     /// so it cannot be mistaken for the agent's own commit.
     fn snapshot(path: &Path, prefix: &str) -> Result<Option<String>, WorkspaceError> {
         let index = Self::git(path, &["rev-parse", "--git-path", "symphony-wip-index"])?;
@@ -322,10 +322,10 @@ impl GitWorktreeWorkspace {
         let _ = std::fs::remove_file(&index);
         let env: [(&str, &std::ffi::OsStr); 5] = [
             ("GIT_INDEX_FILE", index.as_os_str()),
-            ("GIT_AUTHOR_NAME", "symphony-cc".as_ref()),
-            ("GIT_AUTHOR_EMAIL", "symphony-cc@localhost".as_ref()),
-            ("GIT_COMMITTER_NAME", "symphony-cc".as_ref()),
-            ("GIT_COMMITTER_EMAIL", "symphony-cc@localhost".as_ref()),
+            ("GIT_AUTHOR_NAME", "crewd".as_ref()),
+            ("GIT_AUTHOR_EMAIL", "crewd@localhost".as_ref()),
+            ("GIT_COMMITTER_NAME", "crewd".as_ref()),
+            ("GIT_COMMITTER_EMAIL", "crewd@localhost".as_ref()),
         ];
         let result = (|| {
             // Seeded from the worktree's own index, not from HEAD: a path the agent staged past
@@ -340,7 +340,7 @@ impl GitWorktreeWorkspace {
             if tree == Self::git(path, &["rev-parse", "HEAD^{tree}"])? {
                 return Ok(None);
             }
-            let msg = "symphony-cc: uncommitted work at removal\n\nSnapshot of the worktree as \
+            let msg = "crewd: uncommitted work at removal\n\nSnapshot of the worktree as \
                        its run left it, parented on the branch head. Not on any branch; apply \
                        with `git cherry-pick --no-commit <ref>`.";
             let commit =
@@ -1072,7 +1072,7 @@ mod tests {
         );
         assert_eq!(
             git_stdout(&repo, &["log", "-1", "--format=%an", wip]).as_deref(),
-            Some("symphony-cc"),
+            Some("crewd"),
             "and the snapshot must be distinguishable from the agent's commits"
         );
 
@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn the_branch_the_snapshot_publishes_is_the_one_prepare_checks_out() {
         // `Workspace::branch_for` is what reaches an operator, through the snapshot and
-        // `symphony-cc status`; `Prepared.branch` is what the run actually commits on. Letting
+        // `crewctl status`; `Prepared.branch` is what the run actually commits on. Letting
         // those two drift would send a reviewer looking for a ref that was never written —
         // the exact failure the published branch exists to prevent.
         let root = tmp_root("wt-published-branch");

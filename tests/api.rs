@@ -631,10 +631,7 @@ async fn every_response_the_ops_api_writes_carries_its_marker_header() {
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await.unwrap();
         let text = String::from_utf8(raw).unwrap();
-        assert!(
-            text.contains("X-Symphony-Ops-Api"),
-            "missing the marker header for {path}:\n{text}"
-        );
+        assert!(text.contains("X-Crew-Ops-Api"), "missing the marker header for {path}:\n{text}");
     }
 }
 

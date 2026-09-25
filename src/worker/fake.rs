@@ -182,7 +182,7 @@ impl Worker for FakeWorker {
         if let Some(mut t) = transcript {
             t.write_line(
                 &serde_json::json!({
-                    "type": "symphony_run_start",
+                    "type": "crew_run_start",
                     "issue": issue.identifier,
                     "issue_id": issue.id,
                     "session": session.id(),
@@ -204,7 +204,7 @@ impl Worker for FakeWorker {
             }
             t.write_line(
                 &serde_json::json!({
-                    "type": "symphony_run_end",
+                    "type": "crew_run_end",
                     "scripted_outcome": script.outcome.label(),
                     // Totals arrive once, on the terminal event, the way the real CLI reports
                     // them — a fixture that put them on every turn would model the very

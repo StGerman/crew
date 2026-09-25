@@ -76,7 +76,7 @@ impl Default for ApiConfig {
 /// a body field: the body is [`crate::Snapshot`]/[`crate::Row`] JSON, handed back to an operator verbatim by
 /// the client's `--json` paths, and a marker key inside it would leak into output meant to be
 /// piped into `jq`.
-pub const API_MARKER_HEADER: &str = "X-Symphony-Ops-Api";
+pub const API_MARKER_HEADER: &str = "X-Crew-Ops-Api";
 /// A version rather than a bare flag, so a wire-incompatible future change has somewhere to say
 /// so. Today the client only checks that this equals what it expects.
 pub const API_MARKER_VERSION: &str = "1";

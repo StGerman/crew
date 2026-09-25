@@ -160,15 +160,15 @@ fn a_dispatched_run_is_handed_a_broker_endpoint_scoped_to_its_own_issue() {
     let endpoints = h.worker.endpoints_for("iss-1");
     assert_eq!(endpoints.len(), 1);
     let ep = endpoints[0].as_ref().expect("a broker was attached, so the run gets tools");
-    assert_eq!(ep.server, "symphony");
+    assert_eq!(ep.server, "crew");
     assert!(ep.config_path.exists(), "the worker needs a file to pass to --mcp-config");
-    assert_eq!(ep.qualified("comment"), "mcp__symphony__comment");
+    assert_eq!(ep.qualified("comment"), "mcp__crew__comment");
 
     // The endpoint is only useful if the token inside it reaches this issue and no other. Read
     // it back the way the agent would, rather than trusting the scheduler's bookkeeping.
     let cfg: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ep.config_path).unwrap()).unwrap();
-    let url = cfg["mcpServers"]["symphony"]["url"].as_str().unwrap();
+    let url = cfg["mcpServers"]["crew"]["url"].as_str().unwrap();
     let token = url.rsplit('/').next().unwrap();
 
     broker.call(token, "comment", &serde_json::json!({ "body": "from the agent" })).unwrap();
@@ -200,7 +200,7 @@ fn a_run_that_ends_takes_its_broker_authority_with_it() {
     let ep = h.worker.endpoints_for("iss-1")[0].clone().unwrap();
     let cfg: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ep.config_path).unwrap()).unwrap();
-    let url = cfg["mcpServers"]["symphony"]["url"].as_str().unwrap().to_string();
+    let url = cfg["mcpServers"]["crew"]["url"].as_str().unwrap().to_string();
     let token = url.rsplit('/').next().unwrap().to_string();
     assert_eq!(broker.open_sessions(), 1);
 
@@ -2085,7 +2085,7 @@ fn a_completed_run_leaves_a_readable_transcript_reachable_from_its_run_record() 
     let path = PathBuf::from(runs[0].transcript.clone().expect("the run recorded a transcript"));
 
     let text = std::fs::read_to_string(&path).expect("and the transcript is readable");
-    assert!(text.contains("symphony_run_start"), "got: {text}");
+    assert!(text.contains("crew_run_start"), "got: {text}");
     assert!(text.contains("iss-1"));
     assert!(text.lines().count() > 1, "a transcript with only a header records nothing");
 }
@@ -2258,7 +2258,7 @@ fn a_run_that_finishes_leaves_an_open_pull_request_not_only_a_branch() {
         "the body lists the branch's commits: {}",
         spec.body
     );
-    assert!(spec.body.contains("symphony-cc"), "and says who opened it: {}", spec.body);
+    assert!(spec.body.contains("crewd"), "and says who opened it: {}", spec.body);
 
     // The push comes before the pull request, and the snapshot carries both.
     assert!(matches!(forge.ops()[0], Op::Publish { .. }));

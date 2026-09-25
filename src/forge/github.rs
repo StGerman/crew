@@ -179,7 +179,7 @@ impl<H: Http> GithubForge<H> {
             ("Authorization", format!("Bearer {}", self.token)),
             ("Accept", "application/vnd.github+json".to_string()),
             ("X-GitHub-Api-Version", API_VERSION.to_string()),
-            ("User-Agent", "symphony-cc".to_string()),
+            ("User-Agent", "crewd".to_string()),
         ]
     }
 

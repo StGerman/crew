@@ -25,10 +25,7 @@ const NONE: &str = "-";
 pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!(
-        "symphony-cc @ {addr}  —  {} running / {} limit",
-        snap.running, snap.limit
-    ));
+    out.push_str(&format!("crewd @ {addr}  —  {} running / {} limit", snap.running, snap.limit));
     if snap.retrying > 0 {
         out.push_str(&format!(", {} retrying", snap.retrying));
     }

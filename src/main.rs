@@ -1,4 +1,4 @@
-//! symphony-cc entry point.
+//! crewd entry point.
 //!
 //! Headless is the default; `--tui` opts into the dashboard. That asymmetry is deliberate —
 //! it keeps the UI a client of the same snapshot an operator could curl, rather than a
@@ -46,7 +46,7 @@ use crew::workspace::GitWorktreeWorkspace;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
-#[command(name = "symphony-cc", about = "Tracker-driven orchestrator for coding agents")]
+#[command(name = "crewd", about = "Tracker-driven orchestrator for coding agents")]
 struct Args {
     /// Path to the TOML config.
     #[arg(short, long, default_value = "symphony.toml")]

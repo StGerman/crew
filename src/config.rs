@@ -410,7 +410,7 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub root: Option<PathBuf>,
     /// The git repository worktrees are created from. Defaults to the current directory, which
-    /// is the shape dogfooding takes: symphony-cc run from inside the repo it dispatches
+    /// is the shape dogfooding takes: crewd run from inside the repo it dispatches
     /// against.
     #[serde(default)]
     pub repo: Option<PathBuf>,
