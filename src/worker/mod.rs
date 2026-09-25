@@ -190,11 +190,12 @@ pub struct Spawn<'a> {
     /// convention and live in one module. It reaches the agent through the prompt and nothing
     /// else, so a worker that ignores it is degraded, not wrong.
     pub feedback: Option<&'a Feedback>,
-    /// Uncommitted work an earlier run of this issue left behind when its worktree was removed.
-    /// Separate from `feedback` because the two are independent — a gate-sent continuation can
-    /// also have a snapshot — and, like it, reaches the agent only through the prompt: the
-    /// worktree it is handed is clean, and applying the snapshot is the agent's call.
-    pub wip: Option<&'a WipSnapshot>,
+    /// Uncommitted work earlier runs of this issue left behind when their worktrees were
+    /// removed, oldest first. Separate from `feedback` because the two are independent — a
+    /// gate-sent continuation can also have a snapshot — and, like it, reaches the agent only
+    /// through the prompt: the worktree it is handed is clean, and applying a snapshot is the
+    /// agent's call.
+    pub wip: &'a [WipSnapshot],
 }
 
 impl<'a> Spawn<'a> {
@@ -207,7 +208,7 @@ impl<'a> Spawn<'a> {
             tools: None,
             transcript: None,
             feedback: None,
-            wip: None,
+            wip: &[],
         }
     }
 }

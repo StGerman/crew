@@ -104,7 +104,7 @@ pub struct FakeWorker {
     /// its tests need to see.
     feedback: Mutex<HashMap<String, Vec<Option<Feedback>>>>,
     /// The work-in-progress snapshot each spawn was told about, for the same reason.
-    wips: Mutex<HashMap<String, Vec<Option<WipSnapshot>>>>,
+    wips: Mutex<HashMap<String, Vec<Vec<WipSnapshot>>>>,
 }
 
 impl FakeWorker {
@@ -145,7 +145,7 @@ impl FakeWorker {
     }
 
     /// The work-in-progress snapshot each spawn for this issue was handed, oldest first.
-    pub fn wips_for(&self, issue_id: &str) -> Vec<Option<WipSnapshot>> {
+    pub fn wips_for(&self, issue_id: &str) -> Vec<Vec<WipSnapshot>> {
         self.wips.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
     }
 }
@@ -156,7 +156,7 @@ impl Worker for FakeWorker {
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
         self.endpoints.lock().unwrap().entry(issue.id.clone()).or_default().push(tools.cloned());
         self.feedback.lock().unwrap().entry(issue.id.clone()).or_default().push(feedback.cloned());
-        self.wips.lock().unwrap().entry(issue.id.clone()).or_default().push(wip.cloned());
+        self.wips.lock().unwrap().entry(issue.id.clone()).or_default().push(wip.to_vec());
 
         let script = self
             .scripts

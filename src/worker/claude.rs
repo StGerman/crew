@@ -622,7 +622,7 @@ fn build_continuation_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
     feedback: Option<&Feedback>,
-    wip: Option<&WipSnapshot>,
+    wip: &[WipSnapshot],
 ) -> String {
     let mut p = format!(
         "Continue working on {}. Your previous session on this issue ended before the work was \
@@ -647,7 +647,7 @@ fn build_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
     feedback: Option<&Feedback>,
-    wip: Option<&WipSnapshot>,
+    wip: &[WipSnapshot],
 ) -> String {
     let mut p = format!("You are working on issue {}: {}\n\n", issue.identifier, issue.title);
     if let Some(url) = &issue.url {
@@ -742,23 +742,26 @@ fn feedback_help(feedback: Option<&Feedback>) -> String {
     s
 }
 
-/// Names the snapshot an earlier removal took of this issue's uncommitted work (#22).
+/// Names every snapshot earlier removals took of this issue's uncommitted work (#22).
 ///
-/// Without this the snapshot is saved and never found: the worktree the agent is handed is
+/// Without this the snapshots are saved and never found: the worktree the agent is handed is
 /// clean, and nothing else in it points at a ref outside `refs/heads/`. Told, not applied,
-/// because the snapshot may predate commits made since and only the agent can judge a conflict.
-fn wip_help(wip: Option<&WipSnapshot>) -> String {
-    let Some(w) = wip else { return String::new() };
-    format!(
-        "\nAn earlier run on this issue was stopped with uncommitted work, and the orchestrator \
-         saved it to `{r}` (a commit on top of the branch head it was taken from; not on your \
-         branch). What it changes:\n{stat}\n\
-         Decide whether it is still useful. To apply it: `git cherry-pick --no-commit {r}`. \
-         Once you have applied or discarded it, delete it with `git update-ref -d {r}` so the \
-         next run is not told about it again.\n",
-        r = w.ref_name,
-        stat = w.diffstat.trim_end(),
-    )
+/// because a snapshot may predate commits made since and only the agent can judge a conflict.
+fn wip_help(wip: &[WipSnapshot]) -> String {
+    if wip.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\nEarlier runs on this issue were stopped with uncommitted work, and the orchestrator \
+         saved it to the refs below, oldest first — each a commit on top of the branch head it \
+         was taken from, not on your branch. Decide whether each is still useful. To apply one: \
+         `git cherry-pick --no-commit <ref>`. Once you have applied or discarded it, delete it \
+         with `git update-ref -d <ref>` so the next run is not told about it again.\n",
+    );
+    for w in wip {
+        s.push_str(&format!("\n`{}`:\n{}\n", w.ref_name, w.diffstat.trim_end()));
+    }
+    s
 }
 
 /// Names the broker's tools in the prompt.
@@ -990,8 +993,8 @@ mod tests {
             }],
         };
         for prompt in [
-            build_prompt(&issue(), None, Some(&fb), None),
-            build_continuation_prompt(&issue(), None, Some(&fb), None),
+            build_prompt(&issue(), None, Some(&fb), &[]),
+            build_continuation_prompt(&issue(), None, Some(&fb), &[]),
         ] {
             assert!(prompt.contains("CI is red"), "{prompt}");
             assert!(prompt.contains("fmt + clippy + test"));
@@ -1001,7 +1004,7 @@ mod tests {
             );
             assert!(prompt.contains("https://github.com/o/r/pull/9"));
         }
-        assert!(!build_prompt(&issue(), None, None, None).contains("CI is red"));
+        assert!(!build_prompt(&issue(), None, None, &[]).contains("CI is red"));
     }
 
     #[test]
@@ -1011,13 +1014,13 @@ mod tests {
             diffstat: " half.txt | 1 +\n 1 file changed, 1 insertion(+)".into(),
         };
         for prompt in [
-            build_prompt(&issue(), None, None, Some(&wip)),
-            build_continuation_prompt(&issue(), None, None, Some(&wip)),
+            build_prompt(&issue(), None, None, std::slice::from_ref(&wip)),
+            build_continuation_prompt(&issue(), None, None, std::slice::from_ref(&wip)),
         ] {
-            assert!(prompt.contains("git cherry-pick --no-commit refs/symphony/wip/MT-1-abc"));
+            assert!(prompt.contains("`refs/symphony/wip/MT-1-abc`"), "{prompt}");
             assert!(prompt.contains("half.txt | 1 +"), "{prompt}");
         }
-        assert!(!build_prompt(&issue(), None, None, None).contains("refs/symphony/wip"));
+        assert!(!build_prompt(&issue(), None, None, &[]).contains("refs/symphony/wip"));
     }
 
     #[test]
@@ -1034,7 +1037,7 @@ mod tests {
             }],
             unanswered_before: vec!["4059939600".into()],
         };
-        let prompt = build_prompt(&issue(), None, Some(&fb), None);
+        let prompt = build_prompt(&issue(), None, Some(&fb), &[]);
         assert!(prompt.contains("[4059939692] src/config.rs:79 — Copilot"), "{prompt}");
         assert!(prompt.contains("missing `#[serde(default)]`"));
         assert!(prompt.contains(REVIEW_MARKER), "the agent must be told the marker to answer with");

@@ -1434,7 +1434,7 @@ impl Scheduler {
             tools: broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
             feedback: feedback.as_ref(),
-            wip: prepared.wip.as_ref(),
+            wip: &prepared.wip,
             ..Spawn::new(issue, &prepared.path, attempt, &session)
         });
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
@@ -1453,7 +1453,7 @@ impl Scheduler {
             resumed = session.is_resume(),
             tools = broker_session.is_some(),
             feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
-            wip = prepared.wip.as_ref().map(|w| w.ref_name.as_str()).unwrap_or("-"),
+            wip = prepared.wip.len(),
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
             "dispatched"
         );

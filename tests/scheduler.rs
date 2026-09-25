@@ -1504,7 +1504,9 @@ fn a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspac
     assert_eq!(h.sched.running_count(), 0, "the run is killed");
     assert!(!ws.exists(), "and its worktree removed");
 
-    let wip = GitWorktreeWorkspace::wip_ref("iss-1", &issue(1, "In Progress", Some(1)).identifier);
+    let prefix = GitWorktreeWorkspace::wip_prefix("iss-1");
+    let refs = git_out(&repo, &["for-each-ref", "--format=%(refname)", &prefix]).unwrap();
+    let wip = refs.lines().next().expect("a snapshot ref must exist").to_string();
     assert_eq!(
         git_out(&repo, &["show", &format!("{wip}:half.txt")]).as_deref(),
         Some("not yet committed"),
@@ -1518,8 +1520,8 @@ fn a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspac
     assert_eq!(h.sched.running_count(), 1);
     assert!(!ws.join("half.txt").exists(), "nothing is applied to the new worktree");
     let told = h.worker.wips_for("iss-1");
-    assert_eq!(told.first(), Some(&None), "the first run had no snapshot to be told about");
-    let last = told.last().unwrap().as_ref().expect("the next run must be told about it");
+    assert_eq!(told.first(), Some(&vec![]), "the first run had no snapshot to be told about");
+    let [last] = told.last().unwrap().as_slice() else { panic!("the next run must be told") };
     assert_eq!(last.ref_name, wip);
     assert!(last.diffstat.contains("half.txt"), "diffstat: {}", last.diffstat);
 

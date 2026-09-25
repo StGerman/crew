@@ -223,9 +223,11 @@ trusted as an already-prepared worktree. The branch, not the directory, is what 
 behind: `remove` deletes the worktree but only deletes the branch when git's own merged check
 says it carries nothing `repo`'s HEAD does not already have, and `prepare` attaches to an
 existing branch that does carry commits rather than `-B`-resetting it. What the agent had *not* committed when
-its run was stopped is snapshotted by `remove` to `refs/symphony/wip/<key>` — a side ref, so the
-gate, delivery and the merged check see only the agent's own commits — and the next run is told
-the ref and its diffstat rather than handed it applied (#22). Every removal path goes through
+its run was stopped is snapshotted by `remove` to a new ref under `refs/symphony/wip/<issue key>/`
+— keyed on the issue id, not the renameable identifier, one ref per snapshot so a second stop
+cannot orphan the first, and outside `refs/heads/` so the gate, delivery and the merged check
+see only the agent's own commits — and the next run is told every such ref and its diffstat
+rather than handed them applied (#22). Every removal path goes through
 `remove` after `kill` has confirmed the stop; `shutdown()` removes nothing, and the worktree it
 leaves is snapshotted whenever a later cleanup finally removes it. Cleanup is triggered by
 a ticket reaching a terminal state, and closing a ticket is not a decision to throw away the
@@ -573,7 +575,7 @@ reading — check that the named test is still meaningful, not just still green.
 | One tracker blip cannot kill a run | `refresh_miss_grace`, reset on reappearance | `one_invisible_refresh_is_survivable_but_two_are_not` |
 | A workspace path cannot escape its root | `guard()` on **both** `prepare` and `remove` | `hostile_identifiers_stay_inside_the_root` |
 | Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
-| Cleanup cannot discard an agent's *uncommitted* work | `remove` snapshots a dirty tree to `refs/symphony/wip/<key>` (never the branch) before deleting it, failing closed; `prepare` reports the ref and the next prompt names it | `a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref`, `a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed` |
+| Cleanup cannot discard an agent's *uncommitted* work | `remove` snapshots a dirty tree to a new ref under `refs/symphony/wip/<issue key>/` (never the branch, never overwriting an earlier snapshot) before deleting it, failing closed; `prepare` reports every such ref and the next prompt names them | `a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref`, `a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed` |
 | A dead session cannot strand an issue | drop the session name after a run with zero turns | `a_run_that_took_no_turns_is_not_retried_into_the_same_conversation` |
 | A hard kill cannot strand a claim | startup `recover()`: a claim with no live run is stale, because `running` cannot cross a process boundary | `a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup` |
 | A hard kill cannot zero an in-flight run's progress | `observe_progress` checkpoints `run.turns` once per tick when the count moved, and `close_open_runs` keeps it and charges it to `cumulative_turns` in one transaction | `a_run_interrupted_by_a_hard_kill_reports_its_last_known_turn_count_after_restart` |
