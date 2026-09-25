@@ -161,13 +161,17 @@ this file.
 | Crate | Role in this repository | Note |
 | :---- | :---- | :---- |
 | `anyhow` | Error context at the binary boundary: `main.rs`, `tui`, `api`, `sched`, `project` | Never inside a domain trait |
+| `base64` | URL-safe encoding of the GitHub App JWT | Already in the tree under `ureq` |
 | `blake3` | Collision-proof suffix for `worktree_key`, derivation of `session_id` | Deterministic on purpose, see `src/model.rs` |
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
 | `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |
 | `libc` | Process-group signals in `src/worker/claude.rs` | Leaves with #50 |
+| `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
+| `ring` | RS256 signature on the GitHub App JWT (#64) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
 | `rusqlite` (bundled) | The store | Bundled so no system SQLite is needed |
+| `rustls-pki-types` | PEM parsing of the GitHub App private key | Already in the tree under `rustls` |
 | `serde`, `serde_json` | Config, `stream-json`, MCP framing, GitHub payloads | |
 | `thiserror` | Typed errors in library modules | |
 | `time` | RFC 3339 parsing of GitHub timestamps | The only date parsing in the crate |
