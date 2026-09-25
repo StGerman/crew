@@ -547,7 +547,7 @@ over the App's own JWT. It writes `~/.crewd/github-app.pem` (600) and `~/.crewd/
 `tracker.github_app` names — and never edits the daemon's config or overwrites either file.
 Each operator registers their own App because the key is the App owner's; `GITHUB_TOKEN` and
 a hand-registered App written into the same file stay supported. The listener reuses the broker
-transport's `read_request` and `Limits`, not its MCP service: it binds loopback, answers only
+transport's `read_request`, `Limits` and `ConnSlot` cap, not its MCP service: it binds loopback, answers only
 its own `Host`, and is joined shut once a callback carrying a code arrives. The GitHub calls go
 over the tracker's `Http` seam, so the whole flow is tested against a fake GitHub over a real
 socket; the real two-click run is the operator's. The conversion response is the one place in
@@ -697,7 +697,8 @@ reading — check that the named test is still meaningful, not just still green.
 | The init listener does not outlive its one callback | `await_callback` stops and joins the accept thread before returning, whatever the callback's outcome | `init_ends_with_a_600_key_a_settings_file_naming_it_and_an_installed_app_after_two_clicks` |
 | The App's key and client secret never reach a log | the key is held in a redacting `Pem`, the secrets are never deserialized, and no error quotes a successful conversion body | `neither_the_key_nor_the_client_secret_reaches_the_log_at_any_level` |
 | `init` never overwrites a key | both files checked before GitHub is asked anything, then created with `create_new` at mode 600 | `an_existing_key_or_settings_file_is_refused_by_name_before_github_is_asked_anything` |
-| The created App has exactly the permissions asked for | one `PERMISSIONS` table builds the manifest and is compared against `GET /app`, read with the App's own JWT | `an_app_created_with_other_permissions_than_the_manifest_fails_the_run_over_its_own_jwt` |
+| The created App has exactly the permissions asked for, and is not offered for install otherwise | one `PERMISSIONS` table builds the manifest and is compared against `GET /app`, read with the App's own JWT, while the callback is still open — only a pass redirects the browser to *Install* | `an_app_created_with_other_permissions_than_the_manifest_fails_the_run_over_its_own_jwt` |
+| The init listener cannot be made to hold threads without bound | `ConnSlot::take` against `Limits::max_connections` before a connection's thread exists; past the cap the socket is closed | `connections_past_the_cap_are_refused_rather_than_each_given_a_thread` |
 
 The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
 way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop
