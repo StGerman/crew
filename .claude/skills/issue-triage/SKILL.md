@@ -54,12 +54,33 @@ operator or on their explicit say-so, and only to an issue that is:
   sits on the current milestone's issues and nowhere else;
 - **well-specified** — the issue states the failure and what done looks like, so an agent does
   not spend its turn budget discovering the question;
-- **free of an open design choice** — anything that needs a decision (an ADR, "option 1 or 2")
-  goes to the operator first; the implementation issues that follow from it can be made dispatchable.
+- **free of an open design choice** — anything that needs a decision (an ADR, "option 1 or 2",
+  an "Open" section in the body) goes to the operator first, and the answer is written into the
+  description (see below) before the issue is made dispatchable.
 
 When you file an issue yourself (found a bug mid-task, split out follow-up work), leave it in
 the Inbox with no milestone, no `agent` label and no assignee, and say in the body what triggered it.
 Placing it is triage's job, not the author's.
+
+## Decisions go into the description
+
+A dispatched agent's prompt is built from the issue **body** alone. Comments never reach it
+(`src/worker/claude.rs`, where the prompt is assembled). So every decision made in triage or
+grooming that changes how the work is done — an approach chosen, a default picked, scope cut,
+an open question settled, work folded into another issue — is written into that issue's
+description the moment it is made, not left in a comment or in this conversation:
+
+- Append a `## Decisions (<where>, <YYYY-MM-DD>)` section, e.g. `(backlog grooming, 2026-09-25)`,
+  opening with one line saying it overrides anything above that contradicts it.
+- Strike through (`~~...~~`) each acceptance criterion or paragraph a decision supersedes,
+  pointing to its replacement, and write replacement criteria in the Decisions section. Two
+  live, conflicting criteria lists leave the agent to guess which one holds.
+- Scope cut out of an issue becomes a new Inbox issue, linked from the Decisions section.
+- Edit with `gh issue view <n> --json body --jq .body > <file>`, change the file, then
+  `gh issue edit <n> --body-file <file>`, so the rest of the body survives byte for byte.
+
+An issue whose body still has an unanswered question is not ready to be made dispatchable,
+whatever its milestone.
 
 ## Placing an issue
 
@@ -124,7 +145,8 @@ Run through these in order. Triage is done when every step's criterion holds.
 When a milestone closes:
 
 1. The milestone with the next `M<n>` becomes current. Check its name still states the outcome.
-2. Promote from Backlog whatever serves that outcome; leave the rest. If the result has issues
+2. Promote from Backlog whatever serves that outcome; leave the rest. Write each decision taken
+   while planning into its issue's description. If the result has issues
    that must land in a particular order, split it before going on.
 3. Update the description's list.
 4. Add `agent` and the assignee to its issues that meet the bar — this is the moment they
