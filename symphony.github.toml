@@ -94,11 +94,12 @@ max_calls_per_issue = 40
 [api]
 enabled = true
 bind = "127.0.0.1:8787"
-# Off here even though the API is on: this config dispatches real workers, and the ops tools —
-# `unquarantine` above all — are the one surface a worker must never be able to reach
-# (src/api/mcp.rs). Turn it on with `--mcp 127.0.0.1:8788` for the session supervising a run,
-# and register it in that session's local scope only, never user scope.
-mcp_enabled = false
+# On, for the session supervising this daemon. The ops tools — `unquarantine` above all — are the
+# one surface a worker must never be able to reach (src/api/mcp.rs), and what keeps them out of
+# reach is wiring, not this switch: their own listener, never passed to the broker. The one thing
+# wiring cannot stop is configuration, so register the server in the supervising session's local
+# scope only, never user scope — workers inherit user-scope MCP servers.
+mcp_enabled = true
 mcp_bind = "127.0.0.1:8788"
 # Per-run transcripts (src/transcript.rs). Worth more here than against the demo tracker: this
 # is the config that dispatches real agents, and the run you need to explain afterwards is the
