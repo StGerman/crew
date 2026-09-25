@@ -212,9 +212,6 @@ pub struct Scheduler {
     /// Runs between the agent's `Done` and the verdict the gate turns it into. Disjoint from
     /// `running`; an issue is in at most one of the two.
     gating: HashMap<String, Gating>,
-    /// Consecutive gate failures, per issue. Reset by a pass, and by any verdict that ends the
-    /// issue's current line of work.
-    gate_failures: HashMap<String, u32>,
     /// Latest issue snapshot seen for each id, for display and routing checks.
     seen: HashMap<String, Issue>,
     /// Consecutive `Continue` verdicts with no tracker state change, per issue.
@@ -262,7 +259,6 @@ impl Scheduler {
             delivery_polled: HashMap::new(),
             running: HashMap::new(),
             gating: HashMap::new(),
-            gate_failures: HashMap::new(),
             seen: HashMap::new(),
             no_progress: HashMap::new(),
             recovered: false,
@@ -598,7 +594,7 @@ impl Scheduler {
             Outcome::Done => {
                 tracing::info!(issue_id, identifier = %r.issue.identifier, "run completed: done");
                 self.no_progress.remove(issue_id);
-                self.gate_failures.remove(issue_id);
+                self.store.clear_gate_failures(issue_id)?;
                 self.store.release(self.clock.as_ref(), issue_id)?;
                 self.park_here(issue_id, r)?;
                 // After the park, so the issue is in the state delivery polls it in. Delivery
@@ -608,7 +604,7 @@ impl Scheduler {
             Outcome::Blocked { why } => {
                 tracing::info!(issue_id, identifier = %r.issue.identifier, why, "run blocked; parking");
                 self.no_progress.remove(issue_id);
-                self.gate_failures.remove(issue_id);
+                self.store.clear_gate_failures(issue_id)?;
                 // The one verdict that ends with a human needing to act, so the reason has to
                 // reach the dashboard and not just the log.
                 self.store.set_note(self.clock.as_ref(), issue_id, &why)?;
@@ -784,7 +780,7 @@ impl Scheduler {
 
         for (issue_id, verdict) in ready {
             let g = self.gating.remove(&issue_id).expect("just listed");
-            let outcome = self.gate_outcome(&issue_id, &g.run, verdict);
+            let outcome = self.gate_outcome(&issue_id, &g.run, verdict)?;
             // The run row closes with the verdict the gate produced, not the one the agent
             // claimed: an operator reading `continue` on a run whose agent said done is reading
             // the fact that matters.
@@ -808,9 +804,14 @@ impl Scheduler {
     /// gets `max_failures` consecutive tries: without that bound a suite the agent cannot make
     /// pass would be re-dispatched until the turn budget ran out, which is the runaway the
     /// verdict-plus-budget design exists to prevent, arriving by a new route.
-    fn gate_outcome(&mut self, issue_id: &str, r: &Running, verdict: Verdict) -> Outcome {
+    fn gate_outcome(
+        &self,
+        issue_id: &str,
+        r: &Running,
+        verdict: Verdict,
+    ) -> anyhow::Result<Outcome> {
         let identifier = r.issue.identifier.as_str();
-        match verdict {
+        Ok(match verdict {
             Verdict::NoCommits => {
                 tracing::info!(
                     issue_id,
@@ -840,11 +841,7 @@ impl Scheduler {
                 }
             }
             Verdict::Failed { step, output, on_base } => {
-                let n = {
-                    let e = self.gate_failures.entry(issue_id.to_string()).or_insert(0);
-                    *e += 1;
-                    *e
-                };
+                let n = self.store.bump_gate_failures(issue_id)?;
                 let max = self.cfg.gate.max_failures;
                 if n >= max {
                     tracing::warn!(
@@ -886,7 +883,7 @@ impl Scheduler {
                     }
                 }
             }
-        }
+        })
     }
 
     fn detect_stalls(&mut self) -> anyhow::Result<()> {
@@ -1101,7 +1098,7 @@ impl Scheduler {
             // the same rule — confirmed dead before the worktree it runs in may be touched.
             let outcome = g.handle.kill(KILL_GRACE_MS);
             tracing::debug!(issue_id, ?outcome, "gate stopped");
-            self.gate_failures.remove(issue_id);
+            self.store.clear_gate_failures(issue_id)?;
             g.run
         } else {
             return Ok(());
