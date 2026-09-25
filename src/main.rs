@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crew::api::mcp::OpsMcp;
 use crew::api::{Api, Command};
 use crew::broker::fake::FakeWrites;
@@ -30,6 +30,7 @@ use crew::forge::fake::FakeForge;
 use crew::forge::github::GithubForge;
 use crew::forge::{Forge, Publisher};
 use crew::gate::{Gate, GitGate};
+use crew::init;
 use crew::project::{NoopProjector, Projector, TasksProjector, derive_session_id};
 use crew::sched::{Scheduler, Snapshot};
 use crew::store::Store;
@@ -47,6 +48,9 @@ use tokio::sync::{mpsc, watch};
 #[derive(Parser, Debug)]
 #[command(name = "crewd", about = "Tracker-driven orchestrator for coding agents")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
     /// Path to the TOML config.
     #[arg(short, long, default_value = "crew.toml")]
     config: PathBuf,
@@ -71,6 +75,24 @@ struct Args {
     mcp: Option<String>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Register this operator's own GitHub App and write ~/.crewd/github-app.toml naming it.
+    /// Two clicks in a browser — create, install — and nothing typed.
+    Init {
+        /// The App's name. Defaults to `crew-<your GitHub login>`; GitHub requires it to be
+        /// unique across all of GitHub.
+        #[arg(long)]
+        app_name: Option<String>,
+        /// Register the App under this organization rather than your own account.
+        #[arg(long)]
+        org: Option<String>,
+        /// Where to write the settings file and key. Defaults to `~/.crewd`.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -83,6 +105,12 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "crew=info".into()),
         )
         .init();
+
+    // Before the config is loaded: `init` is what produces the file a config names, so it must
+    // not need one to exist.
+    if let Some(Cmd::Init { app_name, org, dir }) = args.command {
+        return tokio::task::spawn_blocking(move || run_init(app_name, org, dir)).await?;
+    }
 
     let cfg = Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
@@ -508,4 +536,71 @@ fn seed_demo_scripts(w: &FakeWorker) {
             .with_outcome(Outcome::Blocked { why: "needs product decision".into() }),
     );
     w.script("iss-006", Script::stalls_after(6_000));
+}
+
+fn run_init(
+    app_name: Option<String>,
+    org: Option<String>,
+    dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let dir = match dir {
+        Some(d) => d,
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set; pass --dir")?)
+            .join(".crewd"),
+    };
+    let app_name = match app_name {
+        Some(n) => n,
+        None => {
+            init::manifest::default_app_name(github_login().as_deref(), &init::random_suffix()?)
+        }
+    };
+    let opts = init::Options {
+        dir,
+        app_name,
+        org,
+        limits: broker::server::Limits::default(),
+        // Ten minutes at three seconds a read: long enough to choose repositories, short enough
+        // that an abandoned run ends.
+        install_polls: 200,
+    };
+    let registered =
+        init::run(&UreqHttp::default(), &SystemClock::new(), &mut TerminalOperator, &opts)?;
+    println!(
+        "\nApp {} (id {}) is installed (installation {}).\n  key:      {}\n  settings: {}\n\n\
+         Name the settings from the daemon's config:\n\n  [tracker]\n  github_app = \"{}\"",
+        registered.slug,
+        registered.app_id,
+        registered.installation_id,
+        registered.key.display(),
+        registered.settings.display(),
+        registered.settings.display(),
+    );
+    Ok(())
+}
+
+/// The operator's login for the default App name, from `gh` if it is there. Nothing else is
+/// asked for: the point of `init` is that a machine with no prior setup still types nothing.
+fn github_login() -> Option<String> {
+    let out = std::process::Command::new("gh").args(["api", "user", "--jq", ".login"]).output();
+    let out = out.ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|l| !l.is_empty())
+}
+
+struct TerminalOperator;
+
+impl init::Operator for TerminalOperator {
+    fn show(&mut self, what: &str, url: &str) {
+        println!("{what}:\n\n  {url}\n");
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        // Best-effort: the URL is printed either way, and a headless host has no browser.
+        let _ = std::process::Command::new(opener)
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn wait(&mut self) {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
 }

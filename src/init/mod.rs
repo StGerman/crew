@@ -201,6 +201,12 @@ pub fn run(
     Ok(Registered { app_id: created.app_id, installation_id, slug: created.slug, settings, key })
 }
 
+/// A suffix for the default App name when there is no login to put there: unique enough that two
+/// operators without `gh` do not collide on `crew-`.
+pub fn random_suffix() -> Result<String, InitError> {
+    Ok(nonce()?[..6].to_string())
+}
+
 /// 128 bits from the OS, per run: the only thing standing between a page the operator happens to
 /// have open and the conversion of a code into a key.
 fn nonce() -> Result<String, InitError> {
