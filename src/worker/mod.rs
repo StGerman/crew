@@ -128,6 +128,41 @@ pub struct RateLimitSignal {
     pub resets_at: Option<i64>,
 }
 
+/// The model and effort a worker passes its agent, and what the scheduler records on each run
+/// it starts (#36). `None` in either field means no flag is passed and the agent runs on
+/// whatever the operator's own CLI defaults to — which is also what gets recorded, as an
+/// absence, rather than a guess at what that default was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+}
+
+/// `--effort`'s levels, as `claude --help` lists them. An enum rather than a string because the
+/// CLI answers an unknown level with a warning on stderr and the default effort — a silent
+/// fallback that would make the recorded value a lie — so a typo has to fail at config load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+}
+
 /// A run in flight. Dropping the handle does not stop the work — call [`RunHandle::kill`].
 pub trait RunHandle: Send + Sync {
     fn progress(&self) -> Progress;
@@ -215,4 +250,12 @@ impl<'a> Spawn<'a> {
 
 pub trait Worker: Send + Sync {
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle>;
+
+    /// What every [`Worker::spawn`] on this worker passes the agent. The scheduler records it on
+    /// the run row before spawning, so asking the worker — not the config — is what keeps the
+    /// record equal to what the child was actually given. Defaulted for a worker that has no
+    /// model to choose.
+    fn model(&self) -> ModelChoice {
+        ModelChoice::default()
+    }
 }

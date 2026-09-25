@@ -97,8 +97,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{
-    KillResult, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage, ToolEndpoint,
-    Worker,
+    KillResult, ModelChoice, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage,
+    ToolEndpoint, Worker,
 };
 use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict, looks_like_commit,
@@ -151,6 +151,7 @@ pub struct ClaudeWorker {
     bin: PathBuf,
     env_allowlist: Vec<String>,
     max_turns_per_session: u32,
+    model: ModelChoice,
 }
 
 impl ClaudeWorker {
@@ -159,7 +160,13 @@ impl ClaudeWorker {
         env_allowlist: Vec<String>,
         max_turns_per_session: u32,
     ) -> Self {
-        Self { bin: bin.into(), env_allowlist, max_turns_per_session }
+        Self { bin: bin.into(), env_allowlist, max_turns_per_session, model: ModelChoice::default() }
+    }
+
+    /// Unset fields pass no flag, which is exactly the behaviour before `worker.model` existed.
+    pub fn with_model(mut self, model: ModelChoice) -> Self {
+        self.model = model;
+        self
     }
 }
 
@@ -276,6 +283,15 @@ impl Worker for ClaudeWorker {
             ])
             .args([flag, session.id()]);
 
+        // Passed on `--resume` as well, so a continuation runs on the model its run row records
+        // whether or not the CLI would have carried the session's model over on its own.
+        if let Some(m) = &self.model.model {
+            cmd.args(["--model", m]);
+        }
+        if let Some(e) = self.model.effort {
+            cmd.args(["--effort", e.as_str()]);
+        }
+
         // Last, and nothing non-flag may follow it: `--mcp-config` is variadic.
         if let Some(t) = tools {
             cmd.args([std::ffi::OsStr::new("--mcp-config"), t.config_path.as_os_str()]);
@@ -295,6 +311,8 @@ impl Worker for ClaudeWorker {
                     "resumed": session.is_resume(),
                     "workspace": workspace.display().to_string(),
                     "tools": tools.is_some(),
+                    "model": self.model.model,
+                    "effort": self.model.effort,
                 })
                 .to_string(),
             );
@@ -364,6 +382,10 @@ impl Worker for ClaudeWorker {
 
         Arc::new(ClaudeRun { state, pid, sent_term: AtomicBool::new(false) })
     }
+
+    fn model(&self) -> ModelChoice {
+        self.model.clone()
+    }
 }
 
 /// Runs on its own thread for the life of one attempt. Reads stdout, copies every line to the
@@ -384,6 +406,9 @@ fn run_reader(
     let mut turns = 0u32;
     let mut saw_any_line = false;
     let mut saw_valid_line = false;
+    // The CLI's own classification of a failed request, which it puts on the synthetic
+    // `assistant` event and not on `result` — the only place an unknown `--model` is named.
+    let mut api_error: Option<String> = None;
 
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
@@ -419,6 +444,9 @@ fn run_reader(
         match value.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
                 turns += 1;
+                if let Some(e) = value.get("error").and_then(|e| e.as_str()) {
+                    api_error = Some(e.to_string());
+                }
                 let last_event = extract_text(&value);
                 let mut g = state.0.lock().unwrap();
                 g.progress.turns = turns;
@@ -453,7 +481,7 @@ fn run_reader(
                 g.verdicts = extract_verdicts(
                     value.get("result").and_then(|x| x.as_str()).unwrap_or_default(),
                 );
-                g.outcome = Some(interpret_result(&value));
+                g.outcome = Some(interpret_result(&value, api_error.as_deref()));
                 drop(g);
                 break;
             }
@@ -508,12 +536,20 @@ fn drain_capped(r: impl Read) -> String {
     String::from_utf8_lossy(&buf).trim().to_string()
 }
 
-fn interpret_result(v: &serde_json::Value) -> Outcome {
+fn interpret_result(v: &serde_json::Value, api_error: Option<&str>) -> Outcome {
     let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(true);
     let text = v.get("result").and_then(|x| x.as_str()).unwrap_or_default();
 
     if is_error {
-        return Outcome::Failed { class: ErrorClass::AgentCrash, msg: truncate(text, 500) };
+        // Confirmed against `claude 2.1.282`: an unknown `--model` is not refused at startup.
+        // The process runs, reports `model_not_found` on a synthetic turn and exits 0 with an
+        // error `result` — so read as a crash, it would be retried identically until the
+        // identical-failure streak caught it.
+        let class = match api_error {
+            Some("model_not_found") => ErrorClass::ModelNotFound,
+            _ => ErrorClass::AgentCrash,
+        };
+        return Outcome::Failed { class, msg: truncate(text, 500) };
     }
     if let Some(why) = extract_marker(text, "continue") {
         return Outcome::Continue { why };
