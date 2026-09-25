@@ -258,6 +258,12 @@ impl PushCredentialFile {
     }
 }
 
+/// What git prints when the remote refused the credential it sent: `Authentication failed` is
+/// git's own wording for a 401 over HTTPS, and `Invalid username or token` is GitHub's.
+fn is_auth_refusal(stderr: &str) -> bool {
+    stderr.contains("Authentication failed") || stderr.contains("Invalid username or token")
+}
+
 impl Drop for PushCredentialFile {
     fn drop(&mut self) {
         // Best-effort: a directory the OS will not let go of still holds a token that expires
@@ -321,6 +327,23 @@ impl GitWorktreeWorkspace {
         }
 
         Ok(Self { root, repo, push_auth: None })
+    }
+
+    /// Pushes once, and once more on a fresh token if git reports the first refused for
+    /// authentication — an installation token revoked before its expiry would otherwise be
+    /// handed to every delivery poll until the refresh margin, most of an hour. Only with an App
+    /// credential: a second push on the operator's ambient credential would fail the same way.
+    fn retry_on_auth(
+        &self,
+        push: impl Fn() -> Result<Result<String, WorkspaceError>, ForgeError>,
+    ) -> Result<Result<String, WorkspaceError>, ForgeError> {
+        let first = push()?;
+        let refused =
+            matches!(&first, Err(WorkspaceError::Git { stderr, .. }) if is_auth_refusal(stderr));
+        match &self.push_auth {
+            Some(PushAuth(creds)) if refused && creds.invalidate() => push(),
+            _ => Ok(first),
+        }
     }
 
     /// Push as the orchestrator's own identity rather than the operator's ambient one.
@@ -677,11 +700,14 @@ impl Publisher for GitWorktreeWorkspace {
         // because the branch is the orchestrator's own; the lease is what keeps that apart from
         // forcing over somebody else's — it expects the remote ref to be what this repository
         // last saw of it, and a remote that has moved since is refused, not overwritten.
-        let (args, credential) = self.push_args(remote, branch)?;
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let pushed = Self::git(worktree, &args);
-        drop(credential);
-        pushed.map_err(|e| {
+        let push = || {
+            let (args, credential) = self.push_args(remote, branch)?;
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let pushed = Self::git(worktree, &args);
+            drop(credential);
+            Ok(pushed)
+        };
+        self.retry_on_auth(push)?.map_err(|e| {
             let text = e.to_string();
             if text.contains("stale info") {
                 // The lease failed: the remote branch carries something this repository
@@ -1549,6 +1575,62 @@ mod tests {
             .filter_map(|e| std::fs::read_to_string(e.path().join("credentials")).ok())
             .any(|text| text.contains(TOKEN));
         assert!(!leftover, "a credential file outlived its push");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn a_push_refused_for_authentication_is_retried_once_on_a_fresh_token() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Rotating(AtomicU32);
+        impl Credentials for Rotating {
+            fn token(&self) -> Result<String, crate::credentials::CredentialError> {
+                Ok(format!("tok-{}", self.0.load(Ordering::SeqCst)))
+            }
+            fn invalidate(&self) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+
+        let root = tmp_root("wt-push-reauth");
+        let (repo, bare) = repo_with_remote("wt-push-reauth");
+        let creds = Arc::new(Rotating(AtomicU32::new(0)));
+        let ws =
+            GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(creds.clone());
+        let refused = || WorkspaceError::Git {
+            args: "push".into(),
+            stderr: "fatal: Authentication failed for 'https://github.com/o/r.git/'".into(),
+        };
+
+        // Revoked early: the retry goes out on the re-minted token and succeeds.
+        let attempts = AtomicU32::new(0);
+        let pushed = ws.retry_on_auth(|| {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            let token = creds.token().unwrap();
+            Ok(if token == "tok-1" { Ok(format!("pushed on attempt {n}")) } else { Err(refused()) })
+        });
+        assert_eq!(pushed.unwrap().unwrap(), "pushed on attempt 1");
+
+        // Refused again: exactly one retry, and the refusal is what comes back.
+        let attempts = AtomicU32::new(0);
+        let pushed = ws.retry_on_auth(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(Err(refused()))
+        });
+        assert!(pushed.unwrap().is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "one retry, not a loop");
+
+        // Anything but an authentication refusal is not retried.
+        let attempts = AtomicU32::new(0);
+        let _ = ws.retry_on_auth(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(Err(WorkspaceError::Git { args: "push".into(), stderr: "stale info".into() }))
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&repo).ok();
