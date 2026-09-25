@@ -42,6 +42,12 @@ pub enum Op {
         comment_id: String,
         body: String,
     },
+    /// Recorded for every call, including one on a thread already resolved, so a test can
+    /// count attempts as well as outcomes.
+    Resolve {
+        number: u64,
+        comment_id: String,
+    },
 }
 
 struct PrRecord {
@@ -76,6 +82,10 @@ struct Inner {
     /// Makes `reply` alone fail: the network dropping exactly the write that carries a verdict
     /// to its reviewer, while every read still answers.
     fail_reply: Option<ForgeError>,
+    /// Makes `resolve_thread` alone fail.
+    fail_resolve: Option<ForgeError>,
+    /// `(number, comment_id)` of every thread resolved.
+    resolved: HashSet<(u64, String)>,
     ops: Vec<Op>,
     stacked_on: Option<String>,
 }
@@ -173,6 +183,15 @@ impl FakeForge {
     /// Make only `reply` fail until cleared.
     pub fn fail_reply_with(&self, e: Option<ForgeError>) {
         self.inner.lock().unwrap().fail_reply = e;
+    }
+
+    /// Make only `resolve_thread` fail until cleared.
+    pub fn fail_resolve_with(&self, e: Option<ForgeError>) {
+        self.inner.lock().unwrap().fail_resolve = e;
+    }
+
+    pub fn is_resolved(&self, number: u64, comment_id: &str) -> bool {
+        self.inner.lock().unwrap().resolved.contains(&(number, comment_id.to_string()))
     }
 
     /// A reviewer leaves a comment. Returns its id.
@@ -385,6 +404,17 @@ impl Forge for FakeForge {
             return Err(e.clone());
         }
         g.ops.push(Op::Reply { number, comment_id: comment_id.into(), body: body.into() });
+        Ok(())
+    }
+
+    fn resolve_thread(&self, number: u64, comment_id: &str) -> Result<(), ForgeError> {
+        let mut g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        g.ops.push(Op::Resolve { number, comment_id: comment_id.into() });
+        if let Some(e) = &g.fail_resolve {
+            return Err(e.clone());
+        }
+        g.resolved.insert((number, comment_id.to_string()));
         Ok(())
     }
 }

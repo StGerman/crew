@@ -2488,6 +2488,107 @@ fn a_verdict_is_not_settled_by_a_reply_that_did_not_land() {
     assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and it cost no agent run");
 }
 
+/// #89: a verdict replied to and recorded left its thread open on the provider, so a pull
+/// request delivery called ready still read as unfinished work to the person merging it.
+#[test]
+fn a_settled_review_comment_has_its_thread_resolved() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let fixed = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    let declined = forge.add_comment(pr, "Copilot", "src/store/mod.rs", "rename this");
+    let ignored = forge.add_comment(pr, "Copilot", "src/main.rs", "and this");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert!(!forge.is_resolved(pr, &fixed), "nothing is resolved before it is settled");
+
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![
+        ReviewVerdict {
+            comment_id: fixed.clone(),
+            verdict: Verdict::Accepted,
+            detail: "abc1234".into(),
+        },
+        ReviewVerdict {
+            comment_id: declined.clone(),
+            verdict: Verdict::Rejected,
+            detail: "the name is the one the spec uses".into(),
+        },
+    ]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(forge.replies_to(pr, &fixed).len(), 1);
+    assert_eq!(forge.replies_to(pr, &declined).len(), 1);
+    assert!(forge.is_resolved(pr, &fixed), "an accepted comment's thread is resolved");
+    assert!(forge.is_resolved(pr, &declined), "and so is a rejected one's");
+    assert!(!forge.is_resolved(pr, &ignored), "a comment with no verdict is never resolved");
+    assert!(
+        forge
+            .ops()
+            .iter()
+            .all(|o| !matches!(o, Op::Resolve { comment_id, .. } if *comment_id == ignored)),
+        "not even attempted: {:?}",
+        forge.ops()
+    );
+
+    // Resolved once: a later poll does not ask again.
+    let resolves =
+        |forge: &FakeForge| forge.ops().iter().filter(|o| matches!(o, Op::Resolve { .. })).count();
+    let before = resolves(&forge);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(resolves(&forge), before);
+}
+
+/// #89: resolving is its own idempotent step, so a resolve the provider refuses costs a poll —
+/// never the verdict, never a second reply, and never the pull request's readiness.
+#[test]
+fn a_failed_resolve_is_retried_and_never_re_replies() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c.clone(),
+        verdict: Verdict::Rejected,
+        detail: "the default is set two lines below".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    forge.fail_resolve_with(Some(ForgeError::Transient("connection reset".into())));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(forge.replies_to(pr, &c).len(), 1);
+    assert!(h.sched.store().verdicts_for("iss-1").unwrap().contains_key(&c), "the verdict stands");
+    assert!(!forge.is_resolved(pr, &c));
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Ready,
+        "readiness is the verdict table's, not the provider's isResolved"
+    );
+
+    forge.fail_resolve_with(None);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert!(forge.is_resolved(pr, &c), "the next poll resolves it");
+    assert_eq!(forge.replies_to(pr, &c).len(), 1, "without replying a second time");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and resolving opened no round");
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
+}
+
 /// Finding 4 on #47, end to end: the reviewer approves the first head, CI sends the issue round,
 /// and the fix lands as a second head on the same pull request. Nobody had asked the reviewer
 /// again, so `Ready` was reached on a head no one had looked at.

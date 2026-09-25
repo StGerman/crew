@@ -354,6 +354,8 @@ impl Scheduler {
             })?;
         }
 
+        self.resolve_settled_threads(issue_id, number)?;
+
         if !d.review_requested && !self.cfg.delivery.reviewers.is_empty() {
             for r in &self.cfg.delivery.reviewers {
                 forge.request_review(number, r)?;
@@ -563,6 +565,30 @@ impl Scheduler {
             Some(e) => Err(e.into()),
             None => Ok(()),
         }
+    }
+
+    /// Resolve the thread of every comment on this pull request whose verdict is recorded and
+    /// whose thread is not yet resolved (#89) — accepted and rejected alike, since a rejection's
+    /// reason stays visible on a resolved thread and an open one reads as unfinished work.
+    ///
+    /// A step of its own, after `apply_verdicts` rather than inside it, so a verdict is still
+    /// settled by its reply alone: a resolve that fails is logged and retried on the next poll,
+    /// and costs no second reply, no round and no hold on readiness, which stays computed from
+    /// the verdict table and never from the provider's `isResolved`.
+    fn resolve_settled_threads(&mut self, issue_id: &str, number: u64) -> Result<(), StepError> {
+        let forge = self.forge.clone().expect("checked by delivery_on");
+        for comment in self.store.unresolved_verdicts(issue_id, number)? {
+            match forge.resolve_thread(number, &comment) {
+                Ok(()) => {
+                    self.store.mark_thread_resolved(self.clock.as_ref(), issue_id, &comment)?;
+                    tracing::info!(issue_id, pr = number, comment, "review thread resolved");
+                }
+                Err(e) => {
+                    tracing::warn!(issue_id, pr = number, comment, error = %e, "resolving a settled thread failed; retried next poll");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The run's verdicts as delivery will apply them: every acceptance that names a commit the

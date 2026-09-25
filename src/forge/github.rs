@@ -163,6 +163,92 @@ struct GhReviewComment {
     in_reply_to_id: Option<u64>,
 }
 
+// ---- GitHub's GraphQL shape, for review threads alone ------------------
+
+/// Review threads and their resolution exist only in GraphQL; REST has neither.
+const GRAPHQL_URL: &str = "https://api.github.com/graphql";
+
+const THREADS_QUERY: &str =
+    "query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id isResolved comments(first: 1) { nodes { databaseId } } }
+      }
+    }
+  }
+}";
+
+const RESOLVE_MUTATION: &str = "mutation($id: ID!) {
+  resolveReviewThread(input: { threadId: $id }) { thread { id isResolved } }
+}";
+
+/// GraphQL answers `200` for a query it refused, with the reason in `errors`.
+#[derive(Debug, Deserialize)]
+struct GqlResponse<T> {
+    data: Option<T>,
+    #[serde(default)]
+    errors: Vec<GqlError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlError {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlThreadsData {
+    repository: Option<GqlRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlRepository {
+    pull_request: Option<GqlPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPullRequest {
+    review_threads: GqlThreadPage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlThreadPage {
+    page_info: GqlPageInfo,
+    nodes: Vec<GqlThread>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlThread {
+    id: String,
+    is_resolved: bool,
+    comments: GqlCommentPage,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlCommentPage {
+    nodes: Vec<GqlComment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlComment {
+    database_id: Option<u64>,
+}
+
 // ---- the forge ---------------------------------------------------------
 
 pub struct GithubForge<H: Http> {
@@ -227,6 +313,27 @@ impl<H: Http> GithubForge<H> {
     fn send_json(&self, method: &str, url: &str, body: &Value) -> Result<HttpResponse, ForgeError> {
         let payload = serde_json::to_vec(body).map_err(|e| ForgeError::Permanent(e.to_string()))?;
         classify(self.authed(|h| self.http.send_json(method, url, h, &payload))?)
+    }
+
+    /// One GraphQL request over the same credential path as every REST call. A refusal GraphQL
+    /// reports in `errors` is classified like the REST status it stands for: rate limiting is
+    /// transient, anything else will not change on a retry.
+    fn graphql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<T, ForgeError> {
+        let resp = self.send_json(
+            "POST",
+            GRAPHQL_URL,
+            &json!({ "query": query, "variables": variables }),
+        )?;
+        let gql: GqlResponse<T> = parse(&resp)?;
+        if let Some(e) = gql.errors.first() {
+            let msg = format!("graphql: {}", e.message);
+            return Err(if e.kind.as_deref() == Some("RATE_LIMITED") {
+                ForgeError::Transient(msg)
+            } else {
+                ForgeError::Permanent(msg)
+            });
+        }
+        gql.data.ok_or_else(|| ForgeError::Permanent("graphql: a response with no data".into()))
     }
 
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ForgeError> {
@@ -495,6 +602,45 @@ impl<H: Http> Forge for GithubForge<H> {
         );
         self.send_json("POST", &url, &json!({ "body": body }))?;
         Ok(())
+    }
+
+    /// Finds the thread whose root comment is `comment_id` — a thread has no REST id, only
+    /// its root's `databaseId` joins the two APIs — then resolves it, unless it already is.
+    fn resolve_thread(&self, number: u64, comment_id: &str) -> Result<(), ForgeError> {
+        let id: u64 = comment_id.parse().map_err(|_| {
+            ForgeError::Permanent(format!("comment id {comment_id} is not numeric"))
+        })?;
+        let mut after: Option<String> = None;
+        let thread = loop {
+            let data: GqlThreadsData = self.graphql(
+                THREADS_QUERY,
+                json!({ "owner": self.owner, "repo": self.repo, "number": number, "after": after }),
+            )?;
+            let page = data
+                .repository
+                .and_then(|r| r.pull_request)
+                .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))?
+                .review_threads;
+            if let Some(t) = page
+                .nodes
+                .into_iter()
+                .find(|t| t.comments.nodes.first().and_then(|c| c.database_id) == Some(id))
+            {
+                break Some(t);
+            }
+            match page.page_info.end_cursor {
+                Some(cursor) if page.page_info.has_next_page => after = Some(cursor),
+                _ => break None,
+            }
+        };
+        match thread {
+            Some(t) if !t.is_resolved => {
+                let _: Value = self.graphql(RESOLVE_MUTATION, json!({ "id": t.id }))?;
+                Ok(())
+            }
+            // Already resolved, or its root comment is gone: nothing left to do either way.
+            _ => Ok(()),
+        }
     }
 }
 
