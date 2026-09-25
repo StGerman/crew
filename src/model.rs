@@ -124,6 +124,10 @@ pub enum ErrorClass {
     TemplateRender,
     ConfigInvalid,
     AgentNotFound,
+    /// The CLI refused the configured `worker.model` (#36). Permanent rather than retried: every
+    /// attempt passes the same name, and the alternative the CLI offers — dropping the flag —
+    /// would run the issue on a model the run row does not name.
+    ModelNotFound,
     WorkspaceOutsideRoot,
     AuthFailed,
 }
@@ -143,6 +147,7 @@ impl ErrorClass {
             ErrorClass::TemplateRender
             | ErrorClass::ConfigInvalid
             | ErrorClass::AgentNotFound
+            | ErrorClass::ModelNotFound
             | ErrorClass::WorkspaceOutsideRoot
             | ErrorClass::AuthFailed => false,
         }
@@ -160,6 +165,7 @@ impl ErrorClass {
             ErrorClass::TemplateRender => "template_render",
             ErrorClass::ConfigInvalid => "config_invalid",
             ErrorClass::AgentNotFound => "agent_not_found",
+            ErrorClass::ModelNotFound => "model_not_found",
             ErrorClass::WorkspaceOutsideRoot => "workspace_outside_root",
             ErrorClass::AuthFailed => "auth_failed",
         }
@@ -177,6 +183,7 @@ impl ErrorClass {
             "template_render" => ErrorClass::TemplateRender,
             "config_invalid" => ErrorClass::ConfigInvalid,
             "agent_not_found" => ErrorClass::AgentNotFound,
+            "model_not_found" => ErrorClass::ModelNotFound,
             "workspace_outside_root" => ErrorClass::WorkspaceOutsideRoot,
             "auth_failed" => ErrorClass::AuthFailed,
             _ => return None,
@@ -352,6 +359,7 @@ mod tests {
             ErrorClass::TemplateRender,
             ErrorClass::ConfigInvalid,
             ErrorClass::AgentNotFound,
+            ErrorClass::ModelNotFound,
             ErrorClass::WorkspaceOutsideRoot,
             ErrorClass::AuthFailed,
         ];

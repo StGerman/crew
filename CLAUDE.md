@@ -36,7 +36,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 239 unit + 93 integration
+cargo test                                 # 250 unit + 97 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -283,7 +283,12 @@ self-enforced — the reader thread counts `assistant` events and sends `SIGTERM
 reaches `max_turns_per_session`, reporting `Outcome::Continue` itself; and `--bare` needs
 `ANTHROPIC_API_KEY`, which an OAuth-authenticated operator (this dev machine included) does not
 have, so it is not passed by default — the worker inherits whatever hooks and MCP servers the
-operator's own `claude` config has until a dedicated API key changes that trade-off. `Outcome`
+operator's own `claude` config has until a dedicated API key changes that trade-off. The model is
+not inherited that way: `worker.model` and `worker.effort` become `--model` and `--effort` on
+every attempt, a resumed one included, and each run row records what it was given (#36). Both
+unset passes neither flag, which is the old behaviour exactly; `symphony.github.toml` pins them.
+`--fallback-model` is deliberately never passed — it would make the recorded model possibly
+wrong. `Outcome`
 beyond done/failed — `Continue`, `Blocked` — has no structural signal from the CLI to key off,
 so the worker's prompt asks the agent to end its final message with `SYMPHONY_OUTCOME:
 continue: <reason>` or `SYMPHONY_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
@@ -621,6 +626,8 @@ reading — check that the named test is still meaningful, not just still green.
 | An account-wide rate limit is not any one issue's failure | a rejected `rate_limit_event` releases the claim (`Store::release_for_rate_limit`, not `release`) without charging an attempt or the identical-failure streak, and pauses dispatch itself until `resets_at` rather than scheduling a per-issue retry | `a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupted` |
 | A rate limit cannot stop dispatch on a clock the host disagrees with | a `resets_at` that is missing or already behind the clock falls through to the ordinary `Failed` path instead of pausing on a value that would never lift | `a_rate_limit_with_no_usable_resets_at_degrades_to_ordinary_backoff` |
 | A misspelled `tracker.kind` or `worker.kind` cannot silently run the fake | both parse into `TrackerKind`/`WorkerKind` in `preflight`, naming the value and the supported set, and `main.rs` matches on the enum with no `else` fallthrough; an empty `worker.kind` is `fake` on purpose | `a_misspelled_tracker_kind_is_rejected_rather_than_running_the_demo`, `a_misspelled_worker_kind_is_rejected_rather_than_running_the_fake` |
+| A run names the model that did its work, not today's setting | the scheduler records `Worker::model()` — the value the worker builds `--model`/`--effort` from — on the run row at `start_run`, and never updates it | `a_run_records_the_model_it_was_dispatched_with_rather_than_the_current_default` |
+| A model the CLI refuses is not silently replaced by the default | `model_not_found` on the stream is `ErrorClass::ModelNotFound`, permanent; an unknown `effort`, which the CLI would ignore with a warning, fails config load | `a_model_the_cli_refuses_quarantines_the_issue_instead_of_retrying_it`, `a_model_setting_the_cli_would_silently_ignore_is_refused_at_load` |
 
 The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
 way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop

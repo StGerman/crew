@@ -153,6 +153,15 @@ pub(super) const MIGRATIONS: &[&str] = &[
     -- case both most in need of the bound and most likely to outlive a restart.
     ALTER TABLE issue_state ADD COLUMN gate_failures INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v8
+    r#"
+    -- The model and effort a run was dispatched with (#36), written when the run starts and
+    -- never updated: they are history, not a view of the current config, so a run keeps naming
+    -- what did its work after `worker.model` changes. NULL means no flag was passed and the run
+    -- got whatever the operator's CLI defaulted to — recorded as unknown rather than guessed.
+    ALTER TABLE run ADD COLUMN model TEXT;
+    ALTER TABLE run ADD COLUMN effort TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -209,5 +218,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(leftover, 0, "nor leave the half it did finish behind for the next startup");
+    }
+
+    /// A released migration is never edited: a store that already applied it records only the
+    /// version number, so anything added to that entry afterwards is skipped for good. v7 is
+    /// written out as it shipped (#46) rather than read from `MIGRATIONS`, so the test still
+    /// fails if a later change is folded back into it.
+    #[test]
+    fn a_store_already_at_v7_gains_the_run_model_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..6] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "ALTER TABLE issue_state ADD COLUMN gate_failures INTEGER NOT NULL DEFAULT 0;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+
+        migrate(&conn).unwrap();
+
+        conn.prepare("SELECT model, effort FROM run").expect("v8 must add the model columns");
     }
 }

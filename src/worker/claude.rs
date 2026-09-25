@@ -9,6 +9,10 @@
 //! hangs the run until the stall timeout kills it anyway, which is strictly worse than the
 //! bypass.
 //!
+//! `--model` and `--effort` follow when [`ModelChoice`] sets them, and nothing when it does not,
+//! so an unset `worker.model` is the command line from before it existed. `--fallback-model` is
+//! never passed: a run the CLI moved to another model would contradict its own run row (#36).
+//!
 //! Three things confirmed against a real install (`claude 2.1.268`, and the session handling
 //! below against `2.1.278`) rather than assumed, because guessing them wrong would have meant a
 //! worker that silently never worked:
@@ -97,8 +101,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{
-    KillResult, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage, ToolEndpoint,
-    Worker,
+    KillResult, ModelChoice, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage,
+    ToolEndpoint, Worker,
 };
 use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict, looks_like_commit,
@@ -151,6 +155,7 @@ pub struct ClaudeWorker {
     bin: PathBuf,
     env_allowlist: Vec<String>,
     max_turns_per_session: u32,
+    model: ModelChoice,
 }
 
 impl ClaudeWorker {
@@ -159,7 +164,18 @@ impl ClaudeWorker {
         env_allowlist: Vec<String>,
         max_turns_per_session: u32,
     ) -> Self {
-        Self { bin: bin.into(), env_allowlist, max_turns_per_session }
+        Self {
+            bin: bin.into(),
+            env_allowlist,
+            max_turns_per_session,
+            model: ModelChoice::default(),
+        }
+    }
+
+    /// Unset fields pass no flag, which is exactly the behaviour before `worker.model` existed.
+    pub fn with_model(mut self, model: ModelChoice) -> Self {
+        self.model = model;
+        self
     }
 }
 
@@ -276,6 +292,15 @@ impl Worker for ClaudeWorker {
             ])
             .args([flag, session.id()]);
 
+        // Passed on `--resume` as well, so a continuation runs on the model its run row records
+        // whether or not the CLI would have carried the session's model over on its own.
+        if let Some(m) = &self.model.model {
+            cmd.args(["--model", m]);
+        }
+        if let Some(e) = self.model.effort {
+            cmd.args(["--effort", e.as_str()]);
+        }
+
         // Last, and nothing non-flag may follow it: `--mcp-config` is variadic.
         if let Some(t) = tools {
             cmd.args([std::ffi::OsStr::new("--mcp-config"), t.config_path.as_os_str()]);
@@ -295,6 +320,8 @@ impl Worker for ClaudeWorker {
                     "resumed": session.is_resume(),
                     "workspace": workspace.display().to_string(),
                     "tools": tools.is_some(),
+                    "model": self.model.model,
+                    "effort": self.model.effort,
                 })
                 .to_string(),
             );
@@ -364,6 +391,10 @@ impl Worker for ClaudeWorker {
 
         Arc::new(ClaudeRun { state, pid, sent_term: AtomicBool::new(false) })
     }
+
+    fn model(&self) -> ModelChoice {
+        self.model.clone()
+    }
 }
 
 /// Runs on its own thread for the life of one attempt. Reads stdout, copies every line to the
@@ -384,6 +415,9 @@ fn run_reader(
     let mut turns = 0u32;
     let mut saw_any_line = false;
     let mut saw_valid_line = false;
+    // The CLI's own classification of a failed request, which it puts on the synthetic
+    // `assistant` event and not on `result` — the only place an unknown `--model` is named.
+    let mut api_error: Option<String> = None;
 
     for line in BufReader::new(stdout).lines() {
         let Ok(raw) = line else { break };
@@ -418,6 +452,13 @@ fn run_reader(
 
         match value.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
+                // A failed request's synthetic turn is not a turn: counted, it could trip the
+                // session budget below and read as `Continue` before the error `result` that
+                // follows it is ever seen — a refused model retried instead of quarantined.
+                if let Some(e) = value.get("error").and_then(|e| e.as_str()) {
+                    api_error = Some(e.to_string());
+                    continue;
+                }
                 turns += 1;
                 let last_event = extract_text(&value);
                 let mut g = state.0.lock().unwrap();
@@ -453,7 +494,7 @@ fn run_reader(
                 g.verdicts = extract_verdicts(
                     value.get("result").and_then(|x| x.as_str()).unwrap_or_default(),
                 );
-                g.outcome = Some(interpret_result(&value));
+                g.outcome = Some(interpret_result(&value, api_error.as_deref()));
                 drop(g);
                 break;
             }
@@ -508,12 +549,20 @@ fn drain_capped(r: impl Read) -> String {
     String::from_utf8_lossy(&buf).trim().to_string()
 }
 
-fn interpret_result(v: &serde_json::Value) -> Outcome {
+fn interpret_result(v: &serde_json::Value, api_error: Option<&str>) -> Outcome {
     let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(true);
     let text = v.get("result").and_then(|x| x.as_str()).unwrap_or_default();
 
     if is_error {
-        return Outcome::Failed { class: ErrorClass::AgentCrash, msg: truncate(text, 500) };
+        // Confirmed against `claude 2.1.282`: an unknown `--model` is not refused at startup.
+        // The process runs, reports `model_not_found` on a synthetic turn and exits 0 with an
+        // error `result` — so read as a crash, it would be retried identically until the
+        // identical-failure streak caught it.
+        let class = match api_error {
+            Some("model_not_found") => ErrorClass::ModelNotFound,
+            _ => ErrorClass::AgentCrash,
+        };
+        return Outcome::Failed { class, msg: truncate(text, 500) };
     }
     if let Some(why) = extract_marker(text, "continue") {
         return Outcome::Continue { why };
@@ -1192,6 +1241,60 @@ mod tests {
             );
             std::fs::remove_dir_all(&ws).ok();
         }
+    }
+
+    fn argv_of(w: &ClaudeWorker, session: &Session, tag: &str) -> Vec<String> {
+        let ws = tmp_workspace(tag);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, session));
+        wait_for_finish(&h);
+        let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
+        std::fs::remove_dir_all(&ws).ok();
+        dump.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_configured_model_and_effort_reach_every_attempt_and_unset_passes_neither_flag() {
+        let pinned = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0).with_model(
+            ModelChoice {
+                model: Some("claude-opus-5-5".into()),
+                effort: Some(crate::worker::Effort::Medium),
+            },
+        );
+        // A continuation included: a flag passed only on the first attempt would leave every
+        // resumed one on whatever the CLI chose, under a run row naming the pinned model.
+        for session in [Session::New("s-new".into()), Session::Resume("s-old".into())] {
+            let argv = argv_of(&pinned, &session, "model-pinned");
+            let after = |flag: &str| {
+                argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1)).cloned()
+            };
+            assert_eq!(after("--model").as_deref(), Some("claude-opus-5-5"), "{argv:?}");
+            assert_eq!(after("--effort").as_deref(), Some("medium"), "{argv:?}");
+        }
+
+        let unset = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
+        let argv = argv_of(&unset, &Session::New("s-new".into()), "model-unset");
+        assert!(
+            !argv.iter().any(|a| a == "--model" || a == "--effort"),
+            "an operator who sets neither must get exactly the old command line: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_fails_on_a_permanent_class_rather_than_reading_as_a_crash() {
+        let ws = tmp_workspace("unknown-model");
+        // A budget of one: the smallest valid one, and the one that would cut the run off on the
+        // synthetic turn if it counted.
+        let w = ClaudeWorker::new(fixture("unknown_model.sh"), vec!["PATH".into()], 1);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+        let outcome = wait_for_finish(&h);
+        match outcome {
+            Outcome::Failed { class, .. } => {
+                assert_eq!(class, ErrorClass::ModelNotFound);
+                assert!(!class.retryable(), "every retry would pass the same name");
+            }
+            other => panic!("expected a permanent failure, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]

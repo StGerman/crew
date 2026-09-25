@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    KillResult, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage, ToolEndpoint,
-    Worker,
+    KillResult, ModelChoice, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage,
+    ToolEndpoint, Worker,
 };
 use crate::clock::{Clock, Mono};
 use crate::model::{ErrorClass, Feedback, Outcome, ReviewVerdict};
@@ -105,6 +105,9 @@ pub struct FakeWorker {
     feedback: Mutex<HashMap<String, Vec<Option<Feedback>>>>,
     /// The work-in-progress snapshot each spawn was told about, for the same reason.
     wips: Mutex<HashMap<String, Vec<Vec<WipSnapshot>>>>,
+    /// Mutable so a test can change it between dispatches, which is how a config change looks
+    /// to the scheduler across a restart.
+    model: Mutex<ModelChoice>,
 }
 
 impl FakeWorker {
@@ -117,12 +120,17 @@ impl FakeWorker {
             endpoints: Mutex::new(HashMap::new()),
             feedback: Mutex::new(HashMap::new()),
             wips: Mutex::new(HashMap::new()),
+            model: Mutex::new(ModelChoice::default()),
         }
     }
 
     /// Script a specific issue. Later spawns for the same issue reuse it unless replaced.
     pub fn script(&self, issue_id: &str, s: Script) {
         self.scripts.lock().unwrap().insert(issue_id.to_string(), s);
+    }
+
+    pub fn set_model(&self, m: ModelChoice) {
+        *self.model.lock().unwrap() = m;
     }
 
     pub fn set_default(&self, s: Script) {
@@ -217,6 +225,10 @@ impl Worker for FakeWorker {
             killed: AtomicBool::new(false),
             forced: AtomicBool::new(false),
         })
+    }
+
+    fn model(&self) -> ModelChoice {
+        self.model.lock().unwrap().clone()
     }
 }
 

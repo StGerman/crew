@@ -269,13 +269,14 @@ fn run_line(run: &RunRecord) -> String {
         _ => NONE.to_string(),
     };
     format!(
-        "{}  started {}  ended {}  turns {:<4}  outcome {:<9}  tokens {}",
+        "{}  started {}  ended {}  turns {:<4}  outcome {:<9}  tokens {}  model {}",
         run.run_id,
         timestamp(run.started_at),
         ended,
         run.turns,
         run.outcome.as_deref().unwrap_or(NONE),
-        cost
+        cost,
+        run.model_label()
     )
 }
 
@@ -550,6 +551,8 @@ mod tests {
                     in_tok: None,
                     out_tok: None,
                     transcript: None,
+                    model: None,
+                    effort: None,
                 },
                 RunRecord {
                     run_id: "run-1".into(),
@@ -562,6 +565,8 @@ mod tests {
                     in_tok: Some(9_000),
                     out_tok: Some(1_500),
                     transcript: None,
+                    model: None,
+                    effort: None,
                 },
             ],
             ..row("MT-7", Phase::Released)
@@ -605,6 +610,8 @@ mod tests {
                     in_tok: None,
                     out_tok: None,
                     transcript: None,
+                    model: None,
+                    effort: None,
                 },
                 RunRecord {
                     run_id: "run-8".into(),
@@ -617,6 +624,8 @@ mod tests {
                     in_tok: Some(130_400),
                     out_tok: Some(5_110),
                     transcript: None,
+                    model: None,
+                    effort: None,
                 },
             ],
             ..row("MT-1", Phase::Running)

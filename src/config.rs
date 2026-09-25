@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::worker::{Effort, ModelChoice};
+
 fn d_interval() -> u64 {
     30_000
 }
@@ -373,6 +375,21 @@ pub struct WorkerConfig {
     /// credentials away.
     #[serde(default)]
     pub env_allowlist: Option<Vec<String>>,
+    /// Passed as `--model`, an alias (`opus`) or a full name. Unset passes no flag and the agent
+    /// runs on the operator's CLI default, as it did before this setting existed. Not checked
+    /// against a list: the CLI is the authority on which names exist, and one it refuses fails
+    /// the dispatch as [`ErrorClass::ModelNotFound`](crate::model::ErrorClass::ModelNotFound).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Passed as `--effort`. Unset passes no flag.
+    #[serde(default)]
+    pub effort: Option<Effort>,
+}
+
+impl WorkerConfig {
+    pub fn model_choice(&self) -> ModelChoice {
+        ModelChoice { model: self.model.clone(), effort: self.effort }
+    }
 }
 
 /// The worker a config selects. Parsed rather than compared as a string, so a misspelling is
@@ -577,6 +594,13 @@ impl Config {
         if self.agent.max_turns_per_session == 0 || self.agent.max_turns_per_issue == 0 {
             return Err(ConfigError::Invalid("turn budgets must be > 0".into()));
         }
+        // A blank name would reach the child as `--model ""`, which the CLI refuses on every
+        // attempt — one quarantine per issue for a typo that belongs here.
+        if self.worker.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(ConfigError::Invalid(
+                "worker.model must not be blank; leave it unset for the CLI default".into(),
+            ));
+        }
         if self.polling.interval_ms == 0 {
             return Err(ConfigError::Invalid("polling.interval_ms must be > 0".into()));
         }
@@ -763,6 +787,28 @@ mod tests {
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(!cfg.delivery.enabled);
         assert_eq!(cfg.delivery.base, "master");
+    }
+
+    #[test]
+    fn a_model_setting_the_cli_would_silently_ignore_is_refused_at_load() {
+        let with = |worker: &str| {
+            toml::from_str::<Config>(&format!(
+                "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\nterminal_states = [\"closed\"]\n[worker]\n{worker}"
+            ))
+        };
+        // The CLI answers an unknown `--effort` with a stderr warning and the default effort,
+        // so a typo that got this far would run on a level the run row does not name.
+        assert!(with("effort = \"meduim\"").is_err());
+        let cfg = with("model = \"claude-opus-5-5\"\neffort = \"xhigh\"").unwrap();
+        assert_eq!(cfg.worker.model_choice().effort, Some(Effort::Xhigh));
+        assert!(cfg.preflight().is_ok());
+
+        let unset = with("").unwrap();
+        assert_eq!(unset.worker.model_choice(), ModelChoice::default());
+
+        let mut blank = unset;
+        blank.worker.model = Some("  ".into());
+        assert!(blank.preflight().is_err(), "a blank name would reach the child as --model ''");
     }
 
     #[test]
