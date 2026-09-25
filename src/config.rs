@@ -500,7 +500,22 @@ impl Config {
             .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
         cfg.normalize();
         cfg.preflight()?;
+        cfg.check_github_app()?;
         Ok(cfg)
+    }
+
+    /// Once, at load, and not in `preflight`: preflight runs every tick, and a key file briefly
+    /// replaced on disk must not stop dispatch while the key `main` already loaded is still the
+    /// one in use. A half-configured App would otherwise surface as a 401 on the first poll,
+    /// naming none of the pieces actually missing. The fake tracker never reads the file.
+    pub fn check_github_app(&self) -> Result<(), ConfigError> {
+        let Some(path) = &self.tracker.github_app else { return Ok(()) };
+        if self.tracker.kind()? != TrackerKind::Github {
+            return Ok(());
+        }
+        GithubAppFile::load(path)
+            .and_then(|file| file.load_key().map(drop))
+            .map_err(|e| ConfigError::Invalid(format!("tracker.github_app: {e}")))
     }
 
     /// Lowercase every state used for comparison, so provider spelling never leaks into lookups.
@@ -537,13 +552,6 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "tracker.owner and tracker.repo are required when tracker.kind = \"github\"".into(),
             ));
-        }
-        // A half-configured App would otherwise surface as a 401 on the first poll, naming none
-        // of the pieces that are actually missing.
-        if let Some(path) = &self.tracker.github_app {
-            GithubAppFile::load(path)
-                .and_then(|file| file.load_key().map(drop))
-                .map_err(|e| ConfigError::Invalid(format!("tracker.github_app: {e}")))?;
         }
         // The spec omits this, so a service with no active states polls forever, dispatches
         // nothing, logs nothing, and looks perfectly healthy.
@@ -718,7 +726,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let app = dir.join("github-app.toml");
         let mut c = base();
-        let refused = |c: &Config| match c.preflight() {
+        c.tracker.kind = "github".into();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        let refused = |c: &Config| match c.check_github_app() {
             Err(ConfigError::Invalid(m)) => m,
             other => panic!("expected a refusal, got {other:?}"),
         };
@@ -742,7 +753,12 @@ mod tests {
 
         crate::credentials::tests::throwaway_key(&dir);
         std::fs::rename(dir.join("app.pem"), dir.join("k.pem")).unwrap();
-        c.preflight().expect("a complete App passes");
+        c.check_github_app().expect("a complete App passes");
+        c.preflight().expect("and the per-tick preflight never reads the file");
+        std::fs::remove_file(dir.join("k.pem")).unwrap();
+        c.preflight().expect("a key replaced after load does not stop dispatch");
+        c.tracker.kind = "fake".into();
+        c.check_github_app().expect("the fake tracker never reads the App file");
         std::fs::remove_dir_all(&dir).ok();
     }
 

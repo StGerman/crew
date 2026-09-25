@@ -21,7 +21,7 @@ dispatch_label = "agent"
 # Every write — comments, `state:*` labels, pull requests, pushes — authored by the Crew GitHub
 # App rather than by whoever's GITHUB_TOKEN this is. Uncomment once ~/.crewd/github-app.toml
 # exists (app_id, installation_id, private_key_path): with the key set and the file absent,
-# preflight refuses and every dispatch stops.
+# the daemon refuses to start.
 # github_app = "~/.crewd/github-app.toml"
 
 # A poll costs one `by_states` request plus one `by_ids` per running issue, so the hourly cost
