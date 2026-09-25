@@ -9,6 +9,10 @@
 //! hangs the run until the stall timeout kills it anyway, which is strictly worse than the
 //! bypass.
 //!
+//! `--model` and `--effort` follow when [`ModelChoice`] sets them, and nothing when it does not,
+//! so an unset `worker.model` is the command line from before it existed. `--fallback-model` is
+//! never passed: a run the CLI moved to another model would contradict its own run row (#36).
+//!
 //! Three things confirmed against a real install (`claude 2.1.268`, and the session handling
 //! below against `2.1.278`) rather than assumed, because guessing them wrong would have meant a
 //! worker that silently never worked:
