@@ -214,10 +214,10 @@ pub fn serve_with<S: McpService>(service: Arc<S>, listener: TcpListener, limits:
 /// [`BrokerSession`](super::BrokerSession) is: a path that ends the connection without
 /// releasing the slot — an early `?`, a panic in a tool — leaks a slot permanently, and a
 /// server that has leaked every slot refuses everyone while doing nothing.
-struct ConnSlot(Arc<AtomicUsize>);
+pub(crate) struct ConnSlot(Arc<AtomicUsize>);
 
 impl ConnSlot {
-    fn take(live: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+    pub(crate) fn take(live: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
         live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
             .ok()?;
         Some(Self(Arc::clone(live)))

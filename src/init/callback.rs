@@ -16,11 +16,11 @@
 use std::io::{BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::broker::server::{Limits, Request, read_request};
+use crate::broker::server::{ConnSlot, Limits, Request, read_request};
 
 use super::InitError;
 
@@ -145,6 +145,7 @@ fn spawn_acceptor(
     // Logs from these threads reach whatever the caller logs to, so a test capturing output sees
     // the whole run and not only the half on its own thread.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let live = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("crewd-init-accept".into())
         .spawn(move || {
@@ -154,10 +155,21 @@ fn spawn_acceptor(
                         break;
                     }
                     let Ok(stream) = stream else { continue };
+                    // Checked before the thread exists, as the MCP transport does: a local
+                    // process opening sockets it never writes to would otherwise cost a thread
+                    // each for a full deadline, without bound.
+                    let Some(slot) = ConnSlot::take(&live, limits.max_connections) else {
+                        tracing::warn!(
+                            max = limits.max_connections,
+                            "refusing a connection: too many already in flight"
+                        );
+                        continue;
+                    };
                     let tx = tx.clone();
                     let dispatch = dispatch.clone();
                     let spawned = std::thread::Builder::new().name("crewd-init-conn".into()).spawn(
                         move || {
+                            let _slot = slot;
                             tracing::dispatcher::with_default(&dispatch, || {
                                 read_one(stream, tx, limits)
                             })
@@ -231,4 +243,59 @@ fn decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use super::*;
+
+    #[test]
+    fn connections_past_the_cap_are_refused_rather_than_each_given_a_thread() {
+        let listener = Listener::bind().unwrap();
+        let addr = listener.addr();
+        let limits = Limits {
+            idle: Duration::from_secs(2),
+            request: Duration::from_secs(2),
+            max_connections: 1,
+        };
+        let server = std::thread::spawn(move || {
+            await_callback(listener, "nonce", "page", limits).map(|_| ()).unwrap_err()
+        });
+
+        // Holds the only slot and says nothing, as a preconnecting browser does.
+        let _idle = TcpStream::connect(addr).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let mut refused = TcpStream::connect(addr).unwrap();
+        refused.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut buf = [0u8; 1];
+        // Closed at once, not held open until a read deadline: a timeout here means a thread
+        // is sitting on this socket.
+        let got = refused.read(&mut buf);
+        assert!(
+            matches!(&got, Ok(0))
+                || matches!(&got, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "a connection past the cap was served: {got:?}"
+        );
+
+        drop(_idle);
+        // The idle socket's deadline frees its slot; the next request is served.
+        let mut s = loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = format!("GET /callback?code=c&state=wrong HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+            if s.write_all(req.as_bytes()).is_ok() {
+                s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut peek = [0u8; 1];
+                if matches!(s.peek(&mut peek), Ok(n) if n > 0) {
+                    break s;
+                }
+            }
+        };
+        let mut raw = String::new();
+        let _ = s.read_to_string(&mut raw);
+        assert!(raw.starts_with("HTTP/1.1 400"), "{raw}");
+        assert!(matches!(server.join().unwrap(), InitError::StateMismatch));
+    }
 }
