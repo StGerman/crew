@@ -368,10 +368,14 @@ fn an_app_created_with_other_permissions_than_the_manifest_fails_the_run_over_it
     let mut perms = manifest::permissions();
     perms["administration"] = json!("write");
     let github = FakeGithub { permissions: perms, ..Default::default() };
-    let (result, github, _) = init(github, Script::default(), dir.clone());
+    let (result, github, seen) = init(github, Script::default(), dir.clone());
 
     let err = result.unwrap_err();
     assert!(matches!(err, InitError::Permissions { .. }), "{err}");
+    let seen = seen.lock().unwrap();
+    // The browser is never sent on to install an App this run rejected.
+    assert_eq!(seen.answers.last().unwrap().0, "HTTP/1.1 400 Bad Request");
+    assert_eq!(seen.shown.len(), 1, "the install URL was shown: {:?}", seen.shown);
     insta::assert_snapshot!(err.to_string());
     assert!(github.calls().contains(&format!("GET {}/app", github::API_BASE)));
     assert!(dir.join(KEY_FILE).exists(), "the key outlives a failed check: its code is spent");

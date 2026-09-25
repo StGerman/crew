@@ -168,13 +168,22 @@ pub fn run(
         cb.fail("crewd could not save the App's key. See the terminal.");
         return Err(e);
     }
+    tracing::info!(app_id = created.app_id, slug = %created.slug, key = %key.display(), "app created");
+
+    // Verified while the browser is still waiting on the callback: redirecting first would put
+    // the install button in front of the operator for an App this run is about to reject.
+    let verified = github::AppAuth::new(created.app_id, &created.pem)
+        .and_then(|auth| auth.verify(http, clock.wall()).map(|()| auth));
+    let auth = match verified {
+        Ok(auth) => auth,
+        Err(e) => {
+            cb.fail("The App GitHub created is not the one crewd asked for. See the terminal.");
+            return Err(e);
+        }
+    };
     let owner = opts.org.clone().unwrap_or_else(|| created.owner.clone());
     let install_url = format!("https://github.com/apps/{}/installations/new", created.slug);
     cb.redirect(&install_url, &manifest::installing(&install_url));
-    tracing::info!(app_id = created.app_id, slug = %created.slug, key = %key.display(), "app created");
-
-    let auth = github::AppAuth::new(created.app_id, &created.pem)?;
-    auth.verify(http, clock.wall())?;
     operator.show("Install the App on the repositories crewd should work on", &install_url);
 
     let mut installation_id = None;
