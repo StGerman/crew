@@ -1,0 +1,5 @@
+---
+source: src/init/tests.rs
+expression: err.to_string()
+---
+/home/op/.crewd/github-app.pem already exists, and crewd init never overwrites it. Move it aside to register a new App, or name the existing settings from the daemon's config

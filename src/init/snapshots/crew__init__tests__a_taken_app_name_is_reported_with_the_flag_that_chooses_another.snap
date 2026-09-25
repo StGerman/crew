@@ -1,0 +1,5 @@
+---
+source: src/init/tests.rs
+expression: err.to_string()
+---
+GitHub already has an App named `crew-octo`. Choose another with `crewd init --app-name <name>`

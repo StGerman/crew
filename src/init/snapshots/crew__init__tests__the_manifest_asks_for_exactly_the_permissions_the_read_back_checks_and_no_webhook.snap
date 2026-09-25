@@ -1,0 +1,5 @@
+---
+source: src/init/tests.rs
+expression: "manifest::permissions().to_string()"
+---
+{"checks":"read","contents":"write","issues":"write","metadata":"read","pull_requests":"write","statuses":"read"}
