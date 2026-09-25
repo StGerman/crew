@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Feedback, Issue, Outcome, ReviewVerdict};
 use crate::transcript::TranscriptWriter;
+use crate::workspace::WipSnapshot;
 
 /// Where this run's host-side tool broker is, when there is one.
 ///
@@ -180,6 +181,11 @@ pub trait Worker: Send + Sync {
     /// scheduler does not, because the prompt's wording and the verdict marker the worker
     /// parses back are one convention and live in one module. It reaches the agent through the
     /// prompt and nothing else, so a worker that ignores it is degraded, not wrong.
+    ///
+    /// `wip` names uncommitted work an earlier run of this issue left behind when its worktree
+    /// was removed. Separate from `feedback` because the two are independent — a gate-sent
+    /// continuation can also have a snapshot — and, like it, reaches the agent only through the
+    /// prompt: the worktree it is handed is clean, and applying the snapshot is the agent's call.
     #[allow(clippy::too_many_arguments)]
     fn spawn(
         &self,
@@ -190,5 +196,6 @@ pub trait Worker: Send + Sync {
         tools: Option<&ToolEndpoint>,
         transcript: Option<TranscriptWriter>,
         feedback: Option<&Feedback>,
+        wip: Option<&WipSnapshot>,
     ) -> Arc<dyn RunHandle>;
 }

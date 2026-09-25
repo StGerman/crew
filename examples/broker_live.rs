@@ -102,6 +102,7 @@ fn main() -> anyhow::Result<()> {
         Some(session.endpoint()),
         transcript,
         None,
+        None,
     );
 
     let deadline = Instant::now() + Duration::from_secs(180);

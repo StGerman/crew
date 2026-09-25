@@ -103,6 +103,7 @@ use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict, looks_like_commit,
 };
 use crate::transcript::TranscriptWriter;
+use crate::workspace::WipSnapshot;
 
 /// Env vars passed through to the child, explicitly — never inherit-and-scrub. Notably absent:
 /// any tracker credential and any API key. An operator on API-key auth adds `ANTHROPIC_API_KEY`
@@ -253,12 +254,15 @@ impl Worker for ClaudeWorker {
         tools: Option<&ToolEndpoint>,
         mut transcript: Option<TranscriptWriter>,
         feedback: Option<&Feedback>,
+        wip: Option<&WipSnapshot>,
     ) -> Arc<dyn RunHandle> {
         // `--resume` is passed with an explicit id, never bare: bare opens an interactive
         // picker, and there is no human here to answer it.
         let (prompt, flag) = match session {
-            Session::New(_) => (build_prompt(issue, tools, feedback), "--session-id"),
-            Session::Resume(_) => (build_continuation_prompt(issue, tools, feedback), "--resume"),
+            Session::New(_) => (build_prompt(issue, tools, feedback, wip), "--session-id"),
+            Session::Resume(_) => {
+                (build_continuation_prompt(issue, tools, feedback, wip), "--resume")
+            }
         };
 
         let mut cmd = Command::new(&self.bin);
@@ -625,6 +629,7 @@ fn build_continuation_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
     feedback: Option<&Feedback>,
+    wip: Option<&WipSnapshot>,
 ) -> String {
     let mut p = format!(
         "Continue working on {}. Your previous session on this issue ended before the work was \
@@ -640,6 +645,7 @@ fn build_continuation_prompt(
         issue.identifier
     );
     p.push_str(&feedback_help(feedback));
+    p.push_str(&wip_help(wip));
     p.push_str(&tool_help(tools));
     p
 }
@@ -648,6 +654,7 @@ fn build_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
     feedback: Option<&Feedback>,
+    wip: Option<&WipSnapshot>,
 ) -> String {
     let mut p = format!("You are working on issue {}: {}\n\n", issue.identifier, issue.title);
     if let Some(url) = &issue.url {
@@ -668,6 +675,7 @@ fn build_prompt(
          SYMPHONY_OUTCOME: blocked: <one-sentence reason>\n",
     );
     p.push_str(&feedback_help(feedback));
+    p.push_str(&wip_help(wip));
     p.push_str(&tool_help(tools));
     p
 }
@@ -739,6 +747,25 @@ fn feedback_help(feedback: Option<&Feedback>) -> String {
         }
     }
     s
+}
+
+/// Names the snapshot an earlier removal took of this issue's uncommitted work (#22).
+///
+/// Without this the snapshot is saved and never found: the worktree the agent is handed is
+/// clean, and nothing else in it points at a ref outside `refs/heads/`. Told, not applied,
+/// because the snapshot may predate commits made since and only the agent can judge a conflict.
+fn wip_help(wip: Option<&WipSnapshot>) -> String {
+    let Some(w) = wip else { return String::new() };
+    format!(
+        "\nAn earlier run on this issue was stopped with uncommitted work, and the orchestrator \
+         saved it to `{r}` (a commit on top of the branch head it was taken from; not on your \
+         branch). What it changes:\n{stat}\n\
+         Decide whether it is still useful. To apply it: `git cherry-pick --no-commit {r}`. \
+         Once you have applied or discarded it, delete it with `git update-ref -d {r}` so the \
+         next run is not told about it again.\n",
+        r = w.ref_name,
+        stat = w.diffstat.trim_end(),
+    )
 }
 
 /// Names the broker's tools in the prompt.
@@ -840,7 +867,7 @@ mod tests {
         // The two disagree on purpose, so this test can only pass by reading the right one.
         let ws = tmp_workspace("done");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let p = h.progress();
@@ -862,7 +889,7 @@ mod tests {
         // long tool call reads as silent.
         let ws = tmp_workspace("events");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -878,7 +905,7 @@ mod tests {
         // number; the number would be wrong by the turn count, so the honest report is none.
         let ws = tmp_workspace("no-total");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -892,7 +919,7 @@ mod tests {
     fn a_symphony_outcome_continue_marker_is_parsed_from_the_final_text() {
         let ws = tmp_workspace("continue");
         let w = ClaudeWorker::new(fixture("explicit_continue.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -907,7 +934,7 @@ mod tests {
     {
         let ws = tmp_workspace("verdicts");
         let w = ClaudeWorker::new(fixture("review_verdicts.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let v = h.verdicts();
@@ -952,7 +979,7 @@ mod tests {
     fn a_run_handed_no_review_reports_no_verdicts() {
         let ws = tmp_workspace("no-verdicts");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
         wait_for_finish(&h);
         assert!(h.verdicts().is_empty());
         std::fs::remove_dir_all(&ws).ok();
@@ -969,8 +996,8 @@ mod tests {
             }],
         };
         for prompt in [
-            build_prompt(&issue(), None, Some(&fb)),
-            build_continuation_prompt(&issue(), None, Some(&fb)),
+            build_prompt(&issue(), None, Some(&fb), None),
+            build_continuation_prompt(&issue(), None, Some(&fb), None),
         ] {
             assert!(prompt.contains("CI is red"), "{prompt}");
             assert!(prompt.contains("fmt + clippy + test"));
@@ -980,7 +1007,23 @@ mod tests {
             );
             assert!(prompt.contains("https://github.com/o/r/pull/9"));
         }
-        assert!(!build_prompt(&issue(), None, None).contains("CI is red"));
+        assert!(!build_prompt(&issue(), None, None, None).contains("CI is red"));
+    }
+
+    #[test]
+    fn a_snapshot_of_uncommitted_work_is_named_in_both_prompts_with_its_diffstat() {
+        let wip = WipSnapshot {
+            ref_name: "refs/symphony/wip/MT-1-abc".into(),
+            diffstat: " half.txt | 1 +\n 1 file changed, 1 insertion(+)".into(),
+        };
+        for prompt in [
+            build_prompt(&issue(), None, None, Some(&wip)),
+            build_continuation_prompt(&issue(), None, None, Some(&wip)),
+        ] {
+            assert!(prompt.contains("git cherry-pick --no-commit refs/symphony/wip/MT-1-abc"));
+            assert!(prompt.contains("half.txt | 1 +"), "{prompt}");
+        }
+        assert!(!build_prompt(&issue(), None, None, None).contains("refs/symphony/wip"));
     }
 
     #[test]
@@ -997,7 +1040,7 @@ mod tests {
             }],
             unanswered_before: vec!["4059939600".into()],
         };
-        let prompt = build_prompt(&issue(), None, Some(&fb));
+        let prompt = build_prompt(&issue(), None, Some(&fb), None);
         assert!(prompt.contains("[4059939692] src/config.rs:79 — Copilot"), "{prompt}");
         assert!(prompt.contains("missing `#[serde(default)]`"));
         assert!(prompt.contains(REVIEW_MARKER), "the agent must be told the marker to answer with");
@@ -1013,7 +1056,7 @@ mod tests {
     fn a_crash_with_no_result_event_fails_rather_than_hanging_or_inferring_done() {
         let ws = tmp_workspace("crash");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         let outcome = wait_for_finish(&h);
         assert!(
@@ -1031,7 +1074,7 @@ mod tests {
     fn a_rejected_rate_limit_is_reported_alongside_the_crash_it_causes() {
         let ws = tmp_workspace("rate-limited");
         let w = ClaudeWorker::new(fixture("rate_limited.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         let outcome = wait_for_finish(&h);
         assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }));
@@ -1080,7 +1123,7 @@ mod tests {
     fn a_partial_trailing_line_is_skipped_not_fatal_to_the_supervisor() {
         let ws = tmp_workspace("partial");
         let w = ClaudeWorker::new(fixture("partial_trailing_line.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         // The point under test is that a malformed final line does not panic or hang the
         // reader thread — it still reaches a verdict (Failed, since no result event arrived).
@@ -1094,7 +1137,7 @@ mod tests {
     fn killing_a_process_that_ignores_sigterm_forces_it_and_it_is_actually_gone() {
         let ws = tmp_workspace("silence");
         let w = ClaudeWorker::new(fixture("silence.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         // Give the script time to install its SIGTERM trap and write its own pid before we
         // try to kill it.
@@ -1130,7 +1173,7 @@ mod tests {
         ] {
             let ws = tmp_workspace(flag.trim_start_matches('-'));
             let w = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
-            let h = w.spawn(&issue(), &ws, 0, &session, None, None, None);
+            let h = w.spawn(&issue(), &ws, 0, &session, None, None, None, None);
             wait_for_finish(&h);
 
             let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
@@ -1158,7 +1201,7 @@ mod tests {
         }
 
         let w = ClaudeWorker::new(fixture("dump_env.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
         wait_for_finish(&h);
 
         let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
@@ -1178,7 +1221,7 @@ mod tests {
         // first and report Continue rather than waiting for (or trusting) the CLI's own exit.
         let ws = tmp_workspace("budget");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 1);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         assert_eq!(
             wait_for_finish(&h),
@@ -1200,7 +1243,7 @@ mod tests {
         let path = log.path().to_path_buf();
 
         let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 2, &fresh_session(), None, Some(log), None);
+        let h = w.spawn(&issue(), &ws, 2, &fresh_session(), None, Some(log), None, None);
         assert_eq!(wait_for_finish(&h), Outcome::Done);
 
         // The reader thread owns the writer, so the file is only certainly complete once the
@@ -1237,7 +1280,7 @@ mod tests {
         // the record and nothing else.
         let ws = tmp_workspace("no-transcript");
         let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         assert_eq!(h.progress().turns, 2);
@@ -1249,7 +1292,7 @@ mod tests {
     fn a_missing_binary_reports_agent_not_found_immediately() {
         let ws = tmp_workspace("missing-bin");
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
 
         let outcome = wait_for_finish(&h);
         assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }));
@@ -1268,7 +1311,7 @@ mod tests {
         let path = log.path().to_path_buf();
 
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, Some(log), None);
+        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, Some(log), None, None);
         assert!(matches!(
             wait_for_finish(&h),
             Outcome::Failed { class: ErrorClass::AgentNotFound, .. }

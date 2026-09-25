@@ -1438,6 +1438,7 @@ impl Scheduler {
             broker_session.as_ref().map(|s| s.endpoint()),
             transcript,
             feedback.as_ref(),
+            prepared.wip.as_ref(),
         );
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
         // setup time inside its own timeout must not eat the agent's stall budget.
@@ -1455,6 +1456,7 @@ impl Scheduler {
             resumed = session.is_resume(),
             tools = broker_session.is_some(),
             feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
+            wip = prepared.wip.as_ref().map(|w| w.ref_name.as_str()).unwrap_or("-"),
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
             "dispatched"
         );
