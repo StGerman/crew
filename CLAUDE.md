@@ -12,7 +12,7 @@ what it is for — intention, installation, contribution. Commands belong here, 
 
 ## What this is
 
-`symphony-cc` is a tracker-driven orchestrator for Claude Code agents: a daemon that polls an
+`crewd` is a tracker-driven orchestrator for Claude Code agents: a daemon that polls an
 issue tracker, opens a workspace per issue, runs a coding-agent session in it, and reconciles
 what comes back. It is a Rust reimplementation of the coordination layer described in
 [openai/symphony](https://github.com/openai/symphony)'s `SPEC.md`, written after a review that
@@ -21,10 +21,15 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-The repository is `crewd`, but the crate and binary are still `symphony-cc`: the rename to
-`crewd` and `crewctl` is #45 and has not happened. So are `SYMPHONY_DB`, `.symphony/`,
-`symphony.toml`, `SYMPHONY_OUTCOME` and `mcp__symphony__*`. Use the name the code uses, not the
-one the repository has.
+The workspace is three packages (#45). `crewd`, at the root, is the daemon: its library is
+`crew` (`use crew::`), its binary `crewd`. `crewctl/` is the client, a binary that links only
+`libcrew/`, which holds what both need: the published `Snapshot`/`Row` types, the ops API's
+address and marker, and the HTTP client and renderer. The standing rule is that anything both
+binaries need moves *down* into `libcrew` and is never re-described in the client; the tell that
+it has stopped being applied is a `pub` item in `libcrew` that `crewctl` never names. Because
+`crewctl`'s dependency graph holds no `rusqlite`, `ratatui`, `tokio` or `ureq` — CI checks it
+with `cargo tree` — "the client cannot open the daemon's store" is a fact about the build, not
+an early `return` someone has to remember.
 
 Slices 1–6 are complete and green: a deterministic core with a fake behind every external
 seam, then real git worktrees and a real `~/.claude/tasks` projection, then a real GitHub
@@ -36,7 +41,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 254 unit + 97 integration
+cargo test                                 # 254 unit + 99 integration, all three packages
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -48,38 +53,57 @@ cargo fmt --check
 cargo run -- --tui                         # dashboard against the fake tracker
 cargo run -- --max-ticks 20                # headless smoke run, then exit
 cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
-cargo run -- status                        # what a running daemon is doing, read over that API
-cargo run -- status MT-649                 # one issue in full: phase, attempt, turns, cost, branch
+cargo run -p crewctl -- status             # what a running daemon is doing, read over that API
+cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, turns, cost, branch
 cargo run -- --mcp 127.0.0.1:8788          # the same four routes as MCP tools, for a supervising agent
-claude mcp add --scope local --transport http symphony_ops http://127.0.0.1:8788/ops
+claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
                                            # ...and how that agent gets them. Local scope, never user
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
 
 The first three are the commit gate, and [.github/workflows/ci.yml](.github/workflows/ci.yml)
-now runs them on every push and pull request rather than trusting whoever remembers — which is
-the only version that survives a dispatched agent leaving a branch behind. `rust-toolchain.toml`
+runs them as three required checks on every pull request rather than trusting whoever
+remembers — delivery opens a pull request for every agent branch, so that is where a red gate
+can still stop a merge. `default-members` covers all three packages, so each of those commands
+checks the client and the library as well as the daemon, and `default-run` keeps a bare
+`cargo run` meaning `crewd`.
+
+The loop while editing, measured on this tree (an agent runs the command the docs name, so this
+table *is* the loop):
+
+| Editing | Command | Takes |
+|---|---|---|
+| anything | `cargo check` | ~0.2s, ~1.5s after an edit |
+| shared types, the client | `cargo test -p libcrew` | ~0.2s |
+| scheduler, store, broker | `cargo test -p crewd --lib -- --skip workspace::` | ~1s |
+| `GitWorktreeWorkspace` | `cargo test -p crewd --lib workspace::` | ~3s |
+| `crewctl` | `cargo test -p crewctl -p libcrew` | ~0.6s |
+| before committing | `cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check` | ~9s |
+
+Most of the unit-test time is the twenty `workspace::` tests shelling out to real `git`. The
+package split bought enforcement, not build speed; `--skip workspace::` is what makes the common
+case fast. `rust-toolchain.toml`
 pins the compiler so CI, this machine and every worktree agree on what "it compiles" means, and
 CI builds `--locked` so a drifted `Cargo.lock` fails rather than being quietly rewritten. One
 thing to preserve if you edit that workflow: it must never *run* an example. `broker_live`
 spawns a real `claude` and spends tokens, and only a Cargo default (examples are `test = false`)
 keeps `cargo test` from calling it — the workflow says so at the top.
 
-`SYMPHONY_DB=/tmp/x.db` points the store somewhere disposable — worth doing before any run
-that might write state you do not want kept. `SYMPHONY_TASKS_ROOT=/tmp/tasks` does the same
+`CREW_DB=/tmp/x.db` points the store somewhere disposable — worth doing before any run
+that might write state you do not want kept. `CREW_TASKS_ROOT=/tmp/tasks` does the same
 for the `~/.claude/tasks` projection, so a smoke run's demo issues (`iss-001`, `MT-601`, ...)
-don't land in your real Claude Code task list. `RUST_LOG=symphony_cc=debug` raises the log
+don't land in your real Claude Code task list. `RUST_LOG=crew=debug` raises the log
 level; logs always go to stderr, because under `--tui` the alternate screen owns stdout.
 
 Every run's raw event stream lands under `<workspace.root>/.transcripts/`, one `.jsonl` per
 run, and the `dispatched` log line names the file. That is the first thing to reach for when
 asked what a run actually did — `jq -c 'select(.type=="assistant")' <file>` for the turns,
-`grep symphony_run_end` for how it exited. Tune or switch it off under `[transcripts]`; the
-bounds there are what make it safe to leave on.
+`grep crew_run_end` for how it exited — `symphony_run_end` in transcripts written before #45.
+Tune or switch it off under `[transcripts]`; the bounds there are what make it safe to leave on.
 
 Headless runs now create real `git worktree`s under `workspace.root` (default
-`.symphony/workspaces`, gitignored) against `workspace.repo` (default `.`) and real files
+`.crew/workspaces`, gitignored) against `workspace.repo` (default `.`) and real files
 under `~/.claude/tasks/<derived-session-id>/`. Both are best-effort seams — a worktree or
 projection failure degrades the run, it does not stop it — but they are real disk and git
 state, not a simulation, so use the env overrides above when you just want to watch the
@@ -90,15 +114,15 @@ what a dispatched agent's cwd is. `GitWorktreeWorkspace::new` refuses that at st
 `workspace.repo = "."` there is a linked worktree and the worktrees a run would create register
 in the top-level checkout's shared `.git`, where the orchestrator owning it never recorded them
 (#29). The error names the way out: point `workspace.repo` at a throwaway clone and
-`workspace.root` beside it. Setting `SYMPHONY_DB` alone does not help — the litter was never
+`workspace.root` beside it. Setting `CREW_DB` alone does not help — the litter was never
 in the store.
 
 ```bash
-GITHUB_TOKEN=$(gh auth token) cargo run -- --config symphony.github.toml --max-ticks 3
+GITHUB_TOKEN=$(gh auth token) cargo run -- --config crew.github.toml --max-ticks 3
 ```
 
 points the tracker at this repo's own real Issues instead of the fake demo data —
-`symphony.github.toml` is checked in and ready to use, no token in it. Today that lists this
+`crew.github.toml` is checked in and ready to use, no token in it. Today that lists this
 repo's five open, `agent`-labelled issues and dispatches none of them, because none has an
 assignee yet (see `src/tracker/github.rs`'s module doc for the dispatchability rule and the
 state-label convention).
@@ -187,7 +211,7 @@ have it.
    order, in `launch()`. Spawning first leaves a window where a fast-exiting worker reports
    against state that was never written.
 3. No observer reads the store. The scheduler publishes an immutable `Snapshot` over a
-   `tokio::sync::watch` channel, and the TUI, the HTTP API and `symphony-cc status` render that
+   `tokio::sync::watch` channel, and the TUI, the HTTP API and `crewctl status` render that
    and nothing else. Headless is the default and `--tui` opts in, which is what keeps the
    dashboard from becoming load-bearing. The rule cuts both ways: an observer that needs
    something the snapshot does not carry does not get a `Store`, it gets a new field on
@@ -200,7 +224,7 @@ have it.
    itself with a warning if the keys it depends on are missing; that probe is the one read this
    type performs, and its result only ever flips this type's own on/off switch.
 
-**The store is a cache of judgment, not a system of record.** Losing `symphony.db` degrades
+**The store is a cache of judgment, not a system of record.** Losing `crew.db` degrades
 to stateless re-polling, never to incorrect behaviour — the session id lives there too, so
 losing it costs cold continuations rather than a wrong conversation. The claim is the one entry
 that could invert that, because *keeping* it across a hard kill is what went wrong: an issue
@@ -223,7 +247,7 @@ trusted as an already-prepared worktree. The branch, not the directory, is what 
 behind: `remove` deletes the worktree but only deletes the branch when git's own merged check
 says it carries nothing `repo`'s HEAD does not already have, and `prepare` attaches to an
 existing branch that does carry commits rather than `-B`-resetting it. What the agent had *not* committed when
-its run was stopped is snapshotted by `remove` to a new ref under `refs/symphony/wip/<issue key>/`
+its run was stopped is snapshotted by `remove` to a new ref under `refs/crew/wip/<issue key>/`
 — keyed on the issue id, not the renameable identifier, one ref per snapshot so a second stop
 cannot orphan the first, and outside `refs/heads/` so the gate, delivery and the merged check
 see only the agent's own commits — and the next run is told every such ref and its diffstat
@@ -286,12 +310,12 @@ have, so it is not passed by default — the worker inherits whatever hooks and 
 operator's own `claude` config has until a dedicated API key changes that trade-off. The model is
 not inherited that way: `worker.model` and `worker.effort` become `--model` and `--effort` on
 every attempt, a resumed one included, and each run row records what it was given (#36). Both
-unset passes neither flag, which is the old behaviour exactly; `symphony.github.toml` pins them.
+unset passes neither flag, which is the old behaviour exactly; `crew.github.toml` pins them.
 `--fallback-model` is deliberately never passed — it would make the recorded model possibly
 wrong. `Outcome`
 beyond done/failed — `Continue`, `Blocked` — has no structural signal from the CLI to key off,
-so the worker's prompt asks the agent to end its final message with `SYMPHONY_OUTCOME:
-continue: <reason>` or `SYMPHONY_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
+so the worker's prompt asks the agent to end its final message with `CREW_OUTCOME:
+continue: <reason>` or `CREW_OUTCOME: blocked: <reason>`; the module doc has the reasoning,
 and it is a soft convention by design — an agent that forgets it just reads as `Done`.
 
 Token totals come from the terminal `result` event and nowhere else (`Progress::tokens`, an
@@ -408,8 +432,8 @@ an issue is parked instead of only the log. Setting no gate is a decision, not a
 the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
 agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
 empty command list, which makes the default a rebase and nothing more) and the scheduler tests
-attach `FakeGate` explicitly. `symphony.github.toml` sets the three commands from **Commands**
-above; the fake worker never commits, so under `symphony.toml` every gate finds nothing to hand
+attach `FakeGate` explicitly. `crew.github.toml` sets the three commands from **Commands**
+above; the fake worker never commits, so under `crew.toml` every gate finds nothing to hand
 off.
 
 The ops API ([src/api/mod.rs](src/api/mod.rs)) is the second observer of that same published
@@ -436,17 +460,19 @@ the guard lives in `Store::unquarantine`'s `WHERE` clause, because an unconditio
 would reset a *running* issue's phase to `released` and let the next tick dispatch a second
 agent onto its worktree.
 
-`symphony-cc status` ([src/api/client.rs](src/api/client.rs), rendered by
-[src/api/render.rs](src/api/render.rs)) is the other end, and it exists because the API on its
-own was not enough: it had been able to answer for hours at the moment diagnosis instead went
-to a block-buffered log file and got the wrong answer (#24). Nothing was missing server-side —
-what was missing was something to type. So it is a client and nothing else. `run_status`
-returns before any of `main`'s setup, holding no `Store`, no worktree and no tracker
-credential: an operator asking what is running must not be able to disturb it, and a second
-process on `symphony.db` while the daemon holds it would be exactly that. It shares `Snapshot`
-and `Row` with the server instead of re-describing them, so a renamed field fails the build
-rather than rendering a blank column, and it reuses the dashboard's `fmt_count`/`fmt_ms`/
-`Phase::label` so a duration means the same thing on all three surfaces.
+`crewctl status` ([crewctl/src/main.rs](crewctl/src/main.rs), over
+[libcrew/src/client.rs](libcrew/src/client.rs) and [libcrew/src/render.rs](libcrew/src/render.rs))
+is the other end, and it exists because the API on its own was not enough: it had been able to
+answer for hours at the moment diagnosis instead went to a block-buffered log file and got the
+wrong answer (#24). Nothing was missing server-side — what was missing was something to type.
+So it is a client and nothing else, in its own binary: an operator asking what is running must
+not be able to disturb it, and a second process on `crew.db` while the daemon holds it would be
+exactly that. `crewctl` links no `Store`, worktree or tracker code at all — see the package
+split under **What this is** — and its HTTP is a single `std::net` GET rather than an HTTP
+crate, so its graph stays that small. It shares `Snapshot` and `Row` with the server through
+`libcrew` instead of re-describing them, so a renamed field fails the build rather than
+rendering a blank column, and it uses the same `fmt_count`/`fmt_ms`/`Phase::label` as the
+dashboard so a duration means the same thing on all three surfaces.
 
 Two behaviours there are load-bearing and easy to "simplify" away. It finds the daemon itself —
 `--api`, then `[api] bind`, then `DEFAULT_API_BIND` — and reads the config *leniently* rather
@@ -513,8 +539,8 @@ so `Worker::spawn` has a single parameter for the question and `feedback_help` i
 the single place its wording lives. And delivery only ever sees a branch the gate has passed —
 see the tick order above. The pull request body is derived
 from the run record (commits, runs, turns, tokens), never composed by the agent. Verdicts on
-review comments come back as `SYMPHONY_REVIEW: <id>: accepted: <commit>` or `rejected:
-<reason>` lines in the agent's final text, the same soft convention as `SYMPHONY_OUTCOME`; the
+review comments come back as `CREW_REVIEW: <id>: accepted: <commit>` or `rejected:
+<reason>` lines in the agent's final text, the same soft convention as `CREW_OUTCOME`; the
 orchestrator replies on the thread and, once that reply has landed, records the verdict in
 `review_verdict`, and a settled thread is never handed out again. A comment the agent gives no
 line for stays open — and so does one whose acceptance names no commit, or a commit the branch
@@ -581,7 +607,7 @@ reading — check that the named test is still meaningful, not just still green.
 | A label's casing cannot make an issue undispatchable | `GithubTracker::to_issue` trims, lowercases, drops blank and dedupes labels — the shape `Config::normalize` gives `required_labels` — so `routable`'s plain equality holds; `set_state` reads the raw labels instead, so writing them back never renames the operator's own (#70) | `labels_are_normalized_at_the_adapter_boundary`, `set_state_writes_labels_back_in_their_original_casing` |
 | A workspace path cannot escape its root | `guard()` on **both** `prepare` and `remove` | `hostile_identifiers_stay_inside_the_root` |
 | Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
-| Cleanup cannot discard an agent's *uncommitted* work | `remove` snapshots a dirty tree to a new ref under `refs/symphony/wip/<issue key>/` (never the branch, never overwriting an earlier snapshot) before deleting it, failing closed; `prepare` reports every such ref and the next prompt names them | `a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref`, `a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed` |
+| Cleanup cannot discard an agent's *uncommitted* work | `remove` snapshots a dirty tree to a new ref under `refs/crew/wip/<issue key>/` (never the branch, never overwriting an earlier snapshot) before deleting it, failing closed; `prepare` reports every such ref and the next prompt names them | `a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref`, `a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed` |
 | A dead session cannot strand an issue | drop the session name after a run with zero turns | `a_run_that_took_no_turns_is_not_retried_into_the_same_conversation` |
 | A hard kill cannot strand a claim | startup `recover()`: a claim with no live run is stale, because `running` cannot cross a process boundary | `a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup` |
 | A hard kill cannot zero an in-flight run's progress | `observe_progress` checkpoints `run.turns` once per tick when the count moved, and `close_open_runs` keeps it and charges it to `cumulative_turns` in one transaction | `a_run_interrupted_by_a_hard_kill_reports_its_last_known_turn_count_after_restart` |
@@ -595,6 +621,7 @@ reading — check that the named test is still meaningful, not just still green.
 | A half-applied migration cannot stop the store opening | each migration and the `user_version` bump that records it commit in one transaction | `a_migration_that_fails_partway_leaves_no_trace_and_does_not_advance_the_version` |
 | A released migration is never edited | `migrate` records only the number of the last migration a store applied, so the tests pin a `blake3` of every released entry in `RELEASED`: an edited entry fails naming its version, and a new one fails until its hash is appended (#81) | `a_released_migration_is_never_edited` |
 | "No daemon" is never confused with "daemon said no" | `StatusError` splits a refused connection from a refused request, and names the address and its source in both | `a_closed_port_reads_as_no_daemon_rather_than_a_refused_request` |
+| The client cannot open the daemon's store | `crewctl` is its own package over `libcrew`, whose graph holds no `rusqlite`, `ratatui`, `tokio` or `ureq`; CI fails if `cargo tree -p crewctl -e normal` ever shows one (#45) | `a_status_query_does_not_open_the_database_the_daemon_holds` |
 | The branch an operator is sent to is the one git checked out | `Workspace::branch_for` is the same naming function `prepare` uses, not a second spelling of it | `the_branch_the_snapshot_publishes_is_the_one_prepare_checks_out` |
 | The published branch never names a ref that is gone or was never this run's | `Store::set_branch` persists what `prepare` returned and is cleared exactly when `Removed::branch_deleted` says cleanup deleted it — never recomputed from `identifier`, which `Store::ensure` can rename after dispatch | `the_published_branch_is_the_one_prepare_recorded_not_one_recomputed_from_the_current_identifier` |
 | Retention cannot delete a live run's transcript | `prune` is handed the paths of runs still in `running` | `retention_bounds_the_transcript_directory_but_spares_a_stalled_runs_own_file` |
@@ -661,19 +688,19 @@ See [docs/coding-guidelines.md](docs/coding-guidelines.md), linked at the top of
 The backlog is GitHub Issues on this repository, labelled `agent` — which is exactly the shape
 `TrackerConfig.required_labels` filters on. Work is picked up from there, not from a plan file.
 
-Every seam symphony-cc needs to dispatch against its own backlog now has a real
+Every seam crewd needs to dispatch against its own backlog now has a real
 implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`
 (`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`), the tool broker
 (`[broker]`, on by default), run transcripts (`[transcripts]`, likewise) and the handoff gate
-(`[gate]`, on by default with `symphony.github.toml` naming the three commit-gate commands) and
-delivery (`[delivery]`, off by default and on in `symphony.github.toml`, for the same reason
+(`[gate]`, on by default with `crew.github.toml` naming the three commit-gate commands) and
+delivery (`[delivery]`, off by default and on in `crew.github.toml`, for the same reason
 `worker.kind` is: it publishes under the operator's credentials). The broker is on by default where the worker is not, because the
 two switches mean opposite things: `worker.kind` decides whether an agent runs at all, while
 the broker only decides whether an agent that is already running has a *scoped, logged* way to
 do what it could otherwise do ambiently. Turning it off removes the audit trail, not the
-authority. `symphony.github.toml` sets the first three; flipping `worker.kind` to `"claude"` in that same file is what turns
+authority. `crew.github.toml` sets the first three; flipping `worker.kind` to `"claude"` in that same file is what turns
 "list this repo's backlog" into "work it" — a decision left to whoever runs it, not a default.
-`symphony.toml`, the default config, stays on `kind = "fake"` for both so the quickstart
+`crew.toml`, the default config, stays on `kind = "fake"` for both so the quickstart
 experience is unchanged. When you change scheduler behaviour, ask whether the change would
 still be correct when the agent running it is working on this repo.
 
@@ -687,7 +714,7 @@ exists rather than a command line here. A `SessionStart` hook
 ([.claude/hooks/rust-analyzer-check.sh](.claude/hooks/rust-analyzer-check.sh)) probes for all
 three and names whichever is missing; without it the only symptom is an ENOENT at connect
 time, which says nothing about which piece to install. Being committed, it is inherited by every
-worktree under `.symphony/workspaces`, so each dispatched agent indexes its own copy of the
+worktree under `.crew/workspaces`, so each dispatched agent indexes its own copy of the
 tree. That is intended, but it is not free — budget roughly 1-2 GB resident and one
 `cargo check` per concurrent run when setting `agent.max_concurrent`.
 
