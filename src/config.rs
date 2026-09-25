@@ -375,6 +375,29 @@ pub struct WorkerConfig {
     pub env_allowlist: Option<Vec<String>>,
 }
 
+/// The worker a config selects. Parsed rather than compared as a string, so a misspelling is
+/// a preflight error instead of an `else` branch that quietly runs the fake (#69).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerKind {
+    Fake,
+    Claude,
+}
+
+impl WorkerConfig {
+    /// Empty reads as `fake`: `symphony.toml` has no `[worker]` section, and a real agent must
+    /// be a decision written down, never a default.
+    pub fn kind(&self) -> Result<WorkerKind, ConfigError> {
+        match self.kind.trim().to_ascii_lowercase().as_str() {
+            "" | "fake" => Ok(WorkerKind::Fake),
+            "claude" => Ok(WorkerKind::Claude),
+            _ => Err(ConfigError::Invalid(format!(
+                "unsupported worker.kind {:?}; expected one of \"fake\", \"claude\"",
+                self.kind
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrackerConfig {
     /// Selects an adapter: `fake` or `github`.
@@ -392,6 +415,27 @@ pub struct TrackerConfig {
     pub owner: String,
     #[serde(default)]
     pub repo: String,
+}
+
+/// The tracker a config selects; see [`WorkerKind`] for why this is parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerKind {
+    Fake,
+    Github,
+}
+
+impl TrackerConfig {
+    pub fn kind(&self) -> Result<TrackerKind, ConfigError> {
+        match self.kind.trim().to_ascii_lowercase().as_str() {
+            "" => Err(ConfigError::Invalid("tracker.kind is required".into())),
+            "fake" => Ok(TrackerKind::Fake),
+            "github" => Ok(TrackerKind::Github),
+            _ => Err(ConfigError::Invalid(format!(
+                "unsupported tracker.kind {:?}; expected one of \"fake\", \"github\"",
+                self.kind
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,10 +553,8 @@ impl Config {
 
     /// Checks that must hold before the scheduling loop starts, and again before each dispatch.
     pub fn preflight(&self) -> Result<(), ConfigError> {
-        if self.tracker.kind.trim().is_empty() {
-            return Err(ConfigError::Invalid("tracker.kind is required".into()));
-        }
-        if self.tracker.kind.trim().eq_ignore_ascii_case("github")
+        self.worker.kind()?;
+        if self.tracker.kind()? == TrackerKind::Github
             && (self.tracker.owner.trim().is_empty() || self.tracker.repo.trim().is_empty())
         {
             return Err(ConfigError::Invalid(
@@ -523,6 +565,11 @@ impl Config {
         // nothing, logs nothing, and looks perfectly healthy.
         if self.tracker.active_states.is_empty() {
             return Err(ConfigError::Invalid("tracker.active_states must be non-empty".into()));
+        }
+        // With no terminal states nothing is ever terminal, so no worktree is ever reclaimed
+        // and `sweep_parked` never fires — the same silent health as above.
+        if self.tracker.terminal_states.is_empty() {
+            return Err(ConfigError::Invalid("tracker.terminal_states must be non-empty".into()));
         }
         if self.agent.max_concurrent == 0 {
             return Err(ConfigError::Invalid("agent.max_concurrent must be > 0".into()));
@@ -731,6 +778,65 @@ mod tests {
         let mut c = base();
         c.tracker.active_states.clear();
         assert!(c.preflight().is_err());
+    }
+
+    #[test]
+    fn empty_terminal_states_is_rejected() {
+        let mut c = base();
+        c.tracker.terminal_states.clear();
+        assert!(c.preflight().is_err());
+    }
+
+    #[test]
+    fn a_misspelled_tracker_kind_is_rejected_rather_than_running_the_demo() {
+        let mut c = base();
+        c.tracker.kind = "gihub".into();
+        let err = c.preflight().unwrap_err().to_string();
+        assert!(err.contains("gihub") && err.contains("github"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_worker_kind_is_rejected_rather_than_running_the_fake() {
+        let mut c = base();
+        c.worker.kind = "cluade".into();
+        let err = c.preflight().unwrap_err().to_string();
+        assert!(err.contains("cluade") && err.contains("claude"), "{err}");
+    }
+
+    #[test]
+    fn supported_kinds_are_accepted_in_any_case_and_an_empty_worker_kind_is_fake() {
+        let mut c = base();
+        c.tracker.owner = "o".into();
+        c.tracker.repo = "r".into();
+        for (kind, want) in [
+            ("fake", TrackerKind::Fake),
+            (" GitHub ", TrackerKind::Github),
+            ("FAKE", TrackerKind::Fake),
+        ] {
+            c.tracker.kind = kind.into();
+            assert_eq!(c.tracker.kind().unwrap(), want);
+            assert!(c.preflight().is_ok());
+        }
+        for (kind, want) in [
+            ("", WorkerKind::Fake),
+            ("Fake", WorkerKind::Fake),
+            ("claude", WorkerKind::Claude),
+            (" CLAUDE", WorkerKind::Claude),
+        ] {
+            c.worker.kind = kind.into();
+            assert_eq!(c.worker.kind().unwrap(), want);
+            assert!(c.preflight().is_ok());
+        }
+    }
+
+    #[test]
+    fn the_checked_in_configs_load() {
+        for name in ["symphony.toml", "symphony.github.toml"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            if let Err(e) = Config::load(&path) {
+                panic!("{name}: {e}");
+            }
+        }
     }
 
     #[test]

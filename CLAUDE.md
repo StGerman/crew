@@ -36,7 +36,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 232 unit + 93 integration
+cargo test                                 # 239 unit + 93 integration
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -611,6 +611,7 @@ reading — check that the named test is still meaningful, not just still green.
 | A rebased branch updates its pull request, and never overwrites someone else's work | `publish` pushes `--force-with-lease`; a lease failure is classified on its own as permanent, naming the remote branch that moved, so it stays distinct from a stale-base rejection | `a_rebased_branch_is_pushed_over_its_own_history_but_never_over_someone_elses` |
 | An account-wide rate limit is not any one issue's failure | a rejected `rate_limit_event` releases the claim (`Store::release_for_rate_limit`, not `release`) without charging an attempt or the identical-failure streak, and pauses dispatch itself until `resets_at` rather than scheduling a per-issue retry | `a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupted` |
 | A rate limit cannot stop dispatch on a clock the host disagrees with | a `resets_at` that is missing or already behind the clock falls through to the ordinary `Failed` path instead of pausing on a value that would never lift | `a_rate_limit_with_no_usable_resets_at_degrades_to_ordinary_backoff` |
+| A misspelled `tracker.kind` or `worker.kind` cannot silently run the fake | both parse into `TrackerKind`/`WorkerKind` in `preflight`, naming the value and the supported set, and `main.rs` matches on the enum with no `else` fallthrough; an empty `worker.kind` is `fake` on purpose | `a_misspelled_tracker_kind_is_rejected_rather_than_running_the_demo`, `a_misspelled_worker_kind_is_rejected_rather_than_running_the_fake` |
 
 The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
 way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop
