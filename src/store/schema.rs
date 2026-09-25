@@ -153,6 +153,15 @@ pub(super) const MIGRATIONS: &[&str] = &[
     -- case both most in need of the bound and most likely to outlive a restart.
     ALTER TABLE issue_state ADD COLUMN gate_failures INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v8
+    r#"
+    -- The model and effort a run was dispatched with (#36), written when the run starts and
+    -- never updated: they are history, not a view of the current config, so a run keeps naming
+    -- what did its work after `worker.model` changes. NULL means no flag was passed and the run
+    -- got whatever the operator's CLI defaulted to — recorded as unknown rather than guessed.
+    ALTER TABLE run ADD COLUMN model TEXT;
+    ALTER TABLE run ADD COLUMN effort TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::worker::{Effort, ModelChoice};
+
 fn d_interval() -> u64 {
     30_000
 }
@@ -373,6 +375,21 @@ pub struct WorkerConfig {
     /// credentials away.
     #[serde(default)]
     pub env_allowlist: Option<Vec<String>>,
+    /// Passed as `--model`, an alias (`opus`) or a full name. Unset passes no flag and the agent
+    /// runs on the operator's CLI default, as it did before this setting existed. Not checked
+    /// against a list: the CLI is the authority on which names exist, and one it refuses fails
+    /// the dispatch as [`ErrorClass::ModelNotFound`](crate::model::ErrorClass::ModelNotFound).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Passed as `--effort`. Unset passes no flag.
+    #[serde(default)]
+    pub effort: Option<Effort>,
+}
+
+impl WorkerConfig {
+    pub fn model_choice(&self) -> ModelChoice {
+        ModelChoice { model: self.model.clone(), effort: self.effort }
+    }
 }
 
 /// The worker a config selects. Parsed rather than compared as a string, so a misspelling is
@@ -576,6 +593,13 @@ impl Config {
         }
         if self.agent.max_turns_per_session == 0 || self.agent.max_turns_per_issue == 0 {
             return Err(ConfigError::Invalid("turn budgets must be > 0".into()));
+        }
+        // A blank name would reach the child as `--model ""`, which the CLI refuses on every
+        // attempt — one quarantine per issue for a typo that belongs here.
+        if self.worker.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(ConfigError::Invalid(
+                "worker.model must not be blank; leave it unset for the CLI default".into(),
+            ));
         }
         if self.polling.interval_ms == 0 {
             return Err(ConfigError::Invalid("polling.interval_ms must be > 0".into()));

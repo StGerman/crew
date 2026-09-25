@@ -164,7 +164,10 @@ async fn main() -> anyhow::Result<()> {
                 cfg.worker.env_allowlist.clone().unwrap_or_else(|| {
                     DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect()
                 });
-            Arc::new(ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session))
+            Arc::new(
+                ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session)
+                    .with_model(cfg.worker.model_choice()),
+            )
         }
         WorkerKind::Fake => {
             let fake = Arc::new(FakeWorker::new(clock.clone()));

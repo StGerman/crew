@@ -37,7 +37,7 @@ use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, session_id, worktree_key,
 };
 use crate::project::{ProjectedIssue, Projector};
-use crate::store::{RunRecord, Store};
+use crate::store::{RunRecord, RunStart, Store};
 use crate::tracker::{Tracker, TrackerError};
 use crate::transcript::Transcripts;
 use crate::worker::{Progress, RunHandle, Session, Spawn, TokenUsage, Worker};
@@ -1384,12 +1384,18 @@ impl Scheduler {
         // have to predate the thing that might die.
         let transcript = self.transcripts.as_ref().and_then(|t| t.open(&run_id));
         let transcript_path = transcript.as_ref().map(|t| t.path().to_path_buf());
+        // Asked of the worker, not read from `cfg`: the worker is what builds the argv, so this
+        // is the one source that cannot disagree with what the child was given.
+        let model = self.worker.model();
         self.store.start_run(
             self.clock.as_ref(),
-            &run_id,
-            &issue.id,
-            session.id(),
-            transcript_path.as_deref(),
+            &RunStart {
+                run_id: &run_id,
+                issue_id: &issue.id,
+                session_id: session.id(),
+                transcript: transcript_path.as_deref(),
+                model: &model,
+            },
         )?;
 
         // Opened before the worker exists, for the same reason the claim and the session name
@@ -1449,6 +1455,8 @@ impl Scheduler {
             session = session.id(),
             resumed = session.is_resume(),
             tools = broker_session.is_some(),
+            model = model.model.as_deref().unwrap_or("-"),
+            effort = model.effort.map(|e| e.as_str()).unwrap_or("-"),
             feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
             wip = prepared.wip.len(),
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),

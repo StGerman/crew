@@ -31,6 +31,9 @@ repo = "."
 # describes — a real tracker on its own only watches; this is what turns watching into working.
 [worker]
 kind = "claude"
+# Pinned so dogfood runs are reproducible and every run row names what did the work (#36).
+model = "claude-opus-5-5"
+effort = "medium"
 
 [agent]
 # Each concurrent agent brings its own rust-analyzer index and its own `cargo check` — budget

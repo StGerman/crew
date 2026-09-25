@@ -160,7 +160,12 @@ impl ClaudeWorker {
         env_allowlist: Vec<String>,
         max_turns_per_session: u32,
     ) -> Self {
-        Self { bin: bin.into(), env_allowlist, max_turns_per_session, model: ModelChoice::default() }
+        Self {
+            bin: bin.into(),
+            env_allowlist,
+            max_turns_per_session,
+            model: ModelChoice::default(),
+        }
     }
 
     /// Unset fields pass no flag, which is exactly the behaviour before `worker.model` existed.

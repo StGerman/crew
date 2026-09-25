@@ -54,6 +54,9 @@ pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
         ),
     ];
 
+    if let Some(run) = r.runs.first() {
+        lines.push(field("model", run.model_label()));
+    }
     if let Some(ws) = &r.workspace {
         lines.push(field("workspace", ws.clone()));
     }
