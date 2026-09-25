@@ -12,16 +12,11 @@
 //! `credentials::GithubApp` because this branch was written before that one landed; whichever
 //! merges second should keep one.
 
+use crate::credentials::{AppSigner, parse_app_key};
 use std::collections::BTreeMap;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ring::rand::SystemRandom;
-use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
-use rustls_pki_types::PrivateKeyDer;
-use rustls_pki_types::pem::PemObject;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::clock::Wall;
 use crate::tracker::github::{Http, HttpResponse};
@@ -31,10 +26,6 @@ use super::manifest::PERMISSIONS;
 
 pub const API_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
-/// GitHub rejects a JWT whose `iat` is in its future, so it is backdated past a skewed host clock.
-const JWT_BACKDATE_S: i64 = 60;
-/// GitHub's ceiling on a JWT's lifetime is ten minutes.
-const JWT_LIFETIME_S: i64 = 9 * 60;
 
 /// A private key in PEM form. Its `Debug` is what keeps it out of a `?`-formatted log field.
 pub struct Pem(String);
@@ -117,41 +108,20 @@ pub fn convert(http: &dyn Http, code: &str) -> Result<Converted, InitError> {
     Ok(Converted { app_id: raw.id, slug: raw.slug, owner: raw.owner.login, pem: Pem(raw.pem) })
 }
 
-/// The App, authenticated as itself.
+/// The App, authenticated as itself through the same signer the daemon's token source uses.
 pub struct AppAuth {
-    app_id: u64,
-    key: RsaKeyPair,
-    rng: SystemRandom,
+    signer: AppSigner,
 }
 
 impl AppAuth {
     pub fn new(app_id: u64, pem: &Pem) -> Result<Self, InitError> {
-        let bad = |m: String| InitError::Key(format!("the key GitHub returned does not load: {m}"));
-        let der = PrivateKeyDer::from_pem_slice(pem.as_str().as_bytes())
-            .map_err(|e| bad(e.to_string()))?;
-        let key = match der {
-            PrivateKeyDer::Pkcs1(der) => RsaKeyPair::from_der(der.secret_pkcs1_der()),
-            PrivateKeyDer::Pkcs8(der) => RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()),
-            _ => return Err(bad("GitHub App keys are RSA".into())),
-        }
-        .map_err(|e| bad(e.to_string()))?;
-        Ok(Self { app_id, key, rng: SystemRandom::new() })
+        let key = parse_app_key(pem.as_str().as_bytes())
+            .map_err(|m| InitError::Key(format!("the key GitHub returned does not load: {m}")))?;
+        Ok(Self { signer: AppSigner::new(app_id, key) })
     }
 
     fn jwt(&self, now: Wall) -> Result<String, InitError> {
-        let now_s = now.0.div_euclid(1000);
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-        let claims = json!({
-            "iat": now_s - JWT_BACKDATE_S,
-            "exp": now_s + JWT_LIFETIME_S,
-            "iss": self.app_id.to_string(),
-        });
-        let signing_input = format!("{header}.{}", URL_SAFE_NO_PAD.encode(claims.to_string()));
-        let mut sig = vec![0u8; self.key.public().modulus_len()];
-        self.key
-            .sign(&RSA_PKCS1_SHA256, &self.rng, signing_input.as_bytes(), &mut sig)
-            .map_err(|_| InitError::Key("signing the App's JWT failed".into()))?;
-        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig)))
+        self.signer.jwt(now).map_err(InitError::Key)
     }
 
     fn get(&self, http: &dyn Http, path: &str, now: Wall) -> Result<HttpResponse, InitError> {

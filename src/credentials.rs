@@ -172,14 +172,53 @@ impl GithubAppFile {
         let path = &self.private_key_path;
         let pem = std::fs::read(path)
             .map_err(|source| AppFileError::KeyRead { path: path.clone(), source })?;
-        let bad = |message: String| AppFileError::Key { path: path.clone(), message };
-        let key = PrivateKeyDer::from_pem_slice(&pem).map_err(|e| bad(e.to_string()))?;
-        match key {
-            PrivateKeyDer::Pkcs1(der) => RsaKeyPair::from_der(der.secret_pkcs1_der()),
-            PrivateKeyDer::Pkcs8(der) => RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()),
-            _ => return Err(bad("GitHub App keys are RSA".into())),
-        }
-        .map_err(|e| bad(e.to_string()))
+        parse_app_key(&pem).map_err(|message| AppFileError::Key { path: path.clone(), message })
+    }
+}
+
+/// A GitHub App's private key, from the PEM GitHub issues. The one key parser: the token source
+/// below reads it from the settings file and `crewd init` from the manifest conversion (#65).
+pub fn parse_app_key(pem: &[u8]) -> Result<RsaKeyPair, String> {
+    match PrivateKeyDer::from_pem_slice(pem).map_err(|e| e.to_string())? {
+        PrivateKeyDer::Pkcs1(der) => RsaKeyPair::from_der(der.secret_pkcs1_der()),
+        PrivateKeyDer::Pkcs8(der) => RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()),
+        _ => return Err("GitHub App keys are RSA".into()),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// What an App authenticates as itself with: its id and key, signing the short-lived RS256 JWT
+/// GitHub accepts from an App. One implementation, shared by the installation-token source below
+/// and `crewd init`'s read-back of the App it just created (#65), so the claims and the
+/// signature cannot drift apart between the two.
+pub struct AppSigner {
+    app_id: u64,
+    key: RsaKeyPair,
+    rng: SystemRandom,
+}
+
+impl AppSigner {
+    pub fn new(app_id: u64, key: RsaKeyPair) -> Self {
+        Self { app_id, key, rng: SystemRandom::new() }
+    }
+
+    /// `iat` is backdated by [`JWT_BACKDATE_S`] for clock drift against GitHub's, and both
+    /// times come from `now`, the injected clock.
+    pub fn jwt(&self, now: Wall) -> Result<String, String> {
+        let now_s = now.0.div_euclid(1000);
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let claims = json!({
+            "iat": now_s - JWT_BACKDATE_S,
+            "exp": now_s + JWT_LIFETIME_S,
+            "iss": self.app_id.to_string(),
+        });
+        let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
+        let signing_input = format!("{header}.{claims}");
+        let mut sig = vec![0u8; self.key.public().modulus_len()];
+        self.key
+            .sign(&RSA_PKCS1_SHA256, &self.rng, signing_input.as_bytes(), &mut sig)
+            .map_err(|_| "signing the App's JWT failed".to_string())?;
+        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig)))
     }
 }
 
@@ -199,10 +238,8 @@ struct Cached {
 
 pub struct GithubApp<H: Http> {
     http: H,
-    app_id: u64,
     installation_id: u64,
-    key: RsaKeyPair,
-    rng: SystemRandom,
+    signer: AppSigner,
     clock: Arc<dyn Clock>,
     /// Held across a mint, so a tracker poll and a forge call arriving together mint once.
     cached: Mutex<Option<Cached>>,
@@ -212,30 +249,15 @@ impl<H: Http> GithubApp<H> {
     pub fn new(http: H, file: &GithubAppFile, clock: Arc<dyn Clock>) -> Result<Self, AppFileError> {
         Ok(Self {
             http,
-            app_id: file.app_id,
             installation_id: file.installation_id,
-            key: file.load_key()?,
-            rng: SystemRandom::new(),
+            signer: AppSigner::new(file.app_id, file.load_key()?),
             clock,
             cached: Mutex::new(None),
         })
     }
 
     fn jwt(&self, now: Wall) -> Result<String, CredentialError> {
-        let now_s = now.0.div_euclid(1000);
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-        let claims = json!({
-            "iat": now_s - JWT_BACKDATE_S,
-            "exp": now_s + JWT_LIFETIME_S,
-            "iss": self.app_id.to_string(),
-        });
-        let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
-        let signing_input = format!("{header}.{claims}");
-        let mut sig = vec![0u8; self.key.public().modulus_len()];
-        self.key
-            .sign(&RSA_PKCS1_SHA256, &self.rng, signing_input.as_bytes(), &mut sig)
-            .map_err(|_| CredentialError::Permanent("signing the app JWT failed".into()))?;
-        Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig)))
+        self.signer.jwt(now).map_err(CredentialError::Permanent)
     }
 
     fn mint(&self, now: Wall) -> Result<Cached, CredentialError> {
@@ -442,7 +464,8 @@ pub(crate) mod tests {
         let auth = http.calls.lock()[0].1.clone();
         let jwt = auth.strip_prefix("Bearer ").unwrap();
         let (signing_input, sig) = jwt.rsplit_once('.').unwrap();
-        let public = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, app.key.public().as_ref());
+        let public =
+            UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, app.signer.key.public().as_ref());
         public.verify(signing_input.as_bytes(), &URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap();
 
         let claims = signing_input.split_once('.').unwrap().1;
