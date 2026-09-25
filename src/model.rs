@@ -359,6 +359,7 @@ mod tests {
             ErrorClass::TemplateRender,
             ErrorClass::ConfigInvalid,
             ErrorClass::AgentNotFound,
+            ErrorClass::ModelNotFound,
             ErrorClass::WorkspaceOutsideRoot,
             ErrorClass::AuthFailed,
         ];

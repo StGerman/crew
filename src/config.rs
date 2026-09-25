@@ -790,6 +790,28 @@ mod tests {
     }
 
     #[test]
+    fn a_model_setting_the_cli_would_silently_ignore_is_refused_at_load() {
+        let with = |worker: &str| {
+            toml::from_str::<Config>(&format!(
+                "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\n[worker]\n{worker}"
+            ))
+        };
+        // The CLI answers an unknown `--effort` with a stderr warning and the default effort,
+        // so a typo that got this far would run on a level the run row does not name.
+        assert!(with("effort = \"meduim\"").is_err());
+        let cfg = with("model = \"claude-opus-5-5\"\neffort = \"xhigh\"").unwrap();
+        assert_eq!(cfg.worker.model_choice().effort, Some(Effort::Xhigh));
+        assert!(cfg.preflight().is_ok());
+
+        let unset = with("").unwrap();
+        assert_eq!(unset.worker.model_choice(), ModelChoice::default());
+
+        let mut blank = unset;
+        blank.worker.model = Some("  ".into());
+        assert!(blank.preflight().is_err(), "a blank name would reach the child as --model ''");
+    }
+
+    #[test]
     fn states_are_normalized_for_comparison() {
         let c = base();
         assert!(c.is_active("in progress"));
