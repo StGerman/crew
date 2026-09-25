@@ -154,6 +154,11 @@ pub trait Forge: Send + Sync {
     /// Reply on the thread rooted at `comment_id`. This is how a verdict becomes visible to
     /// the reviewer who left the comment.
     fn reply(&self, number: u64, comment_id: &str, body: &str) -> Result<(), ForgeError>;
+
+    /// Resolve the thread rooted at `comment_id`, so a settled comment reads as done to the
+    /// person merging. Idempotent: a thread already resolved is `Ok`, and so is one that no
+    /// longer exists — a deleted comment has nothing left to resolve.
+    fn resolve_thread(&self, number: u64, comment_id: &str) -> Result<(), ForgeError>;
 }
 
 /// What a run leaves on its branch after `Workspace::publish` has pushed it.

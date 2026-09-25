@@ -165,6 +165,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE run ADD COLUMN model TEXT;
     ALTER TABLE run ADD COLUMN effort TEXT;
     "#,
+    // v9
+    r#"
+    -- When the thread a verdict answers was resolved on the provider (#89). NULL until then, so
+    -- a resolve that failed is retried on the next poll; set once and never cleared, so a
+    -- human re-opening the thread is their conversation, not a reason to resolve it again.
+    ALTER TABLE review_verdict ADD COLUMN resolved_at INTEGER;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -255,6 +262,7 @@ mod tests {
         "078f6e37cb5db33df1653342b32b1364e50d4e18662c5288f502267c24f2fdf6", // v6
         "0fe2a0bfac334b97916fbd74b2bbe95bc849095d7c114180d8bf6700819d88b6", // v7
         "ed7f6925c75fac094be75380ad40f558d6ba9be90f69924168a970c358393593", // v8
+        "c0f411b768e640dee5cfa9e4703d8af27c23a7e322bcac4c3e5585fdf083fca7", // v9
     ];
 
     #[test]

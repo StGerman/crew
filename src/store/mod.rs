@@ -1432,6 +1432,40 @@ impl Store {
         })?;
         rows.collect()
     }
+
+    /// The comments on pull request `pr_number` whose verdict is recorded and whose thread has
+    /// not yet been resolved on the provider, oldest verdict first.
+    pub fn unresolved_verdicts(
+        &self,
+        issue_id: &str,
+        pr_number: u64,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT comment_id FROM review_verdict
+             WHERE issue_id = ?1 AND pr_number = ?2 AND resolved_at IS NULL
+             ORDER BY recorded_at, comment_id",
+        )?;
+        let rows = stmt.query_map(params![issue_id, pr_number as i64], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// Record that the thread a verdict answers is resolved. Touches nothing about the verdict
+    /// itself: resolution follows a settled comment and never re-opens or re-decides one.
+    pub fn mark_thread_resolved(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        comment_id: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE review_verdict SET resolved_at = ?3
+             WHERE issue_id = ?1 AND comment_id = ?2 AND resolved_at IS NULL",
+            params![issue_id, comment_id, clock.wall().0],
+        )?;
+        Ok(())
+    }
 }
 
 const DELIVERY_SELECT: &str = "SELECT issue_id, stage, pr_number, pr_url, base, head_sha,
