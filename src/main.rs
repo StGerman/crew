@@ -25,6 +25,7 @@ use crew::broker::fake::FakeWrites;
 use crew::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use crew::clock::{Clock, SystemClock};
 use crew::config::{Config, TrackerKind, WorkerKind};
+use crew::credentials::{Credentials, GithubApp, GithubAppFile, StaticToken};
 use crew::forge::fake::FakeForge;
 use crew::forge::github::GithubForge;
 use crew::forge::{Forge, Publisher};
@@ -34,7 +35,7 @@ use crew::sched::{Scheduler, Snapshot};
 use crew::store::Store;
 use crew::tracker::Tracker;
 use crew::tracker::fake::FakeTracker;
-use crew::tracker::github::{GithubTracker, UreqHttp};
+use crew::tracker::github::{DispatchRule, GithubTracker, UreqHttp};
 use crew::transcript::Transcripts;
 use crew::tui::{Ui, UiAction};
 use crew::worker::Worker;
@@ -95,7 +96,27 @@ async fn main() -> anyhow::Result<()> {
     let ws_root =
         cfg.workspace.root.clone().unwrap_or_else(|| std::env::temp_dir().join("crew_workspaces"));
     let repo = cfg.workspace.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    let workspace = Arc::new(GitWorktreeWorkspace::new(&ws_root, &repo)?);
+    // One source for the tracker, the forge and the push, so they mint one installation token
+    // between them rather than one each. `None` is the `GITHUB_TOKEN` path, and there the push
+    // rides the operator's ambient git credential exactly as before.
+    let app: Option<Arc<dyn Credentials>> = match &cfg.tracker.github_app {
+        Some(path) if cfg.tracker.kind()? == TrackerKind::Github => {
+            let file = GithubAppFile::load(path)
+                .with_context(|| format!("reading tracker.github_app {}", path.display()))?;
+            tracing::info!(
+                app_id = file.app_id,
+                installation_id = file.installation_id,
+                "writes are authored by the GitHub App, not the operator"
+            );
+            Some(Arc::new(GithubApp::new(UreqHttp::default(), &file, clock.clone())?))
+        }
+        _ => None,
+    };
+    let mut workspace = GitWorktreeWorkspace::new(&ws_root, &repo)?;
+    if let Some(app) = &app {
+        workspace = workspace.with_push_credentials(app.clone());
+    }
+    let workspace = Arc::new(workspace);
 
     let tasks_root = std::env::var_os("CREW_TASKS_ROOT")
         .map(PathBuf::from)
@@ -151,23 +172,39 @@ async fn main() -> anyhow::Result<()> {
     let (tracker, writes, forge): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>, Arc<dyn Forge>) =
         match tracker_kind {
             TrackerKind::Github => {
-                let token = std::env::var("GITHUB_TOKEN")
-                    .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
-                let gh = Arc::new(GithubTracker::new(
-                    UreqHttp::default(),
-                    &cfg.tracker.owner,
-                    &cfg.tracker.repo,
-                    &token,
-                    &cfg.tracker.required_labels,
-                ));
+                let creds: Arc<dyn Credentials> = match &app {
+                    Some(app) => app.clone(),
+                    None => Arc::new(StaticToken::new(&std::env::var("GITHUB_TOKEN").context(
+                        "GITHUB_TOKEN must be set when tracker.kind = \"github\" and no \
+                         tracker.github_app is configured",
+                    )?)),
+                };
+                let rule = DispatchRule {
+                    label: cfg.tracker.dispatch_label.clone(),
+                    assignee: cfg.tracker.assignee.clone(),
+                };
+                let gh = Arc::new(
+                    GithubTracker::new(
+                        UreqHttp::default(),
+                        &cfg.tracker.owner,
+                        &cfg.tracker.repo,
+                        "",
+                        &cfg.tracker.required_labels,
+                    )
+                    .with_credentials(creds.clone())
+                    .with_dispatch_rule(rule),
+                );
                 // The forge is the same repository on GitHub, so the same credential; on any
                 // other provider it would be a separate adapter with its own.
-                let forge = Arc::new(GithubForge::new(
-                    UreqHttp::default(),
-                    &cfg.tracker.owner,
-                    &cfg.tracker.repo,
-                    &token,
-                ));
+                let forge = Arc::new(
+                    GithubForge::new(
+                        UreqHttp::default(),
+                        &cfg.tracker.owner,
+                        &cfg.tracker.repo,
+                        "",
+                    )
+                    .with_credentials(creds),
+                );
                 (gh.clone(), gh, forge)
             }
             TrackerKind::Fake => {
