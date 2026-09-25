@@ -355,14 +355,18 @@ name = "crewd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "blake3",
  "clap",
  "crossterm",
  "insta",
  "libc",
  "libcrew",
+ "parking_lot",
  "ratatui",
+ "ring",
  "rusqlite",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
