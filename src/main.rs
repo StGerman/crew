@@ -114,7 +114,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut workspace = GitWorktreeWorkspace::new(&ws_root, &repo)?;
     if let Some(app) = &app {
-        workspace = workspace.with_push_credentials(app.clone());
+        // The repository's canonical HTTPS URL, not the remote's: a `pushurl` or an SSH alias
+        // there would send the push out on the operator's key (#64).
+        let url = format!("https://github.com/{}/{}.git", cfg.tracker.owner, cfg.tracker.repo);
+        workspace = workspace.with_push_credentials(app.clone(), url);
     }
     let workspace = Arc::new(workspace);
 

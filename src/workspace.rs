@@ -191,9 +191,17 @@ pub struct GitWorktreeWorkspace {
     push_auth: Option<PushAuth>,
 }
 
-/// The credential `publish` pushes with when the orchestrator has an identity of its own (#64).
-/// Unset, the push rides the operator's ambient git credential, as it always has.
-struct PushAuth(Arc<dyn Credentials>);
+/// The credential `publish` pushes with when the orchestrator has an identity of its own (#64),
+/// and the URL it pushes to. Unset, the push rides the operator's ambient git credential to the
+/// remote's own push URL, as it always has.
+///
+/// The URL is explicit because the remote's is not trustworthy for this: an explicit `pushurl`
+/// or an SSH host alias sends a push over SSH, authored by the operator's key whatever
+/// credential this holds, and `pushInsteadOf` rewriting is skipped for exactly those.
+struct PushAuth {
+    creds: Arc<dyn Credentials>,
+    url: String,
+}
 
 impl std::fmt::Debug for PushAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -242,15 +250,11 @@ impl PushCredentialFile {
 
     /// Config for one `git` invocation. The empty `credential.helper` first clears every helper
     /// configured anywhere else — the operator's keychain included, which would otherwise be
-    /// consulted first and, on success, be handed the installation token to store. The
-    /// `pushInsteadOf` pair sends an SSH remote over HTTPS for the push alone, since an SSH push
-    /// would be authored by the operator's key whatever this file says.
+    /// consulted first and, on success, be handed the installation token to store.
     fn git_config(&self) -> Vec<String> {
         [
             "credential.helper=".to_string(),
             format!("credential.helper=store --file={}", self.file.display()),
-            "url.https://github.com/.pushInsteadOf=git@github.com:".to_string(),
-            "url.https://github.com/.pushInsteadOf=ssh://git@github.com/".to_string(),
         ]
         .into_iter()
         .flat_map(|c| ["-c".to_string(), c])
@@ -361,36 +365,50 @@ impl GitWorktreeWorkspace {
         let refused =
             matches!(&first, Err(WorkspaceError::Git { stderr, .. }) if is_auth_refusal(stderr));
         match &self.push_auth {
-            Some(PushAuth(creds)) if refused && creds.invalidate() => push(),
+            Some(PushAuth { creds, .. }) if refused && creds.invalidate() => push(),
             _ => Ok(first),
         }
     }
 
-    /// Push as the orchestrator's own identity rather than the operator's ambient one.
-    pub fn with_push_credentials(mut self, creds: Arc<dyn Credentials>) -> Self {
-        self.push_auth = Some(PushAuth(creds));
+    /// Push as the orchestrator's own identity rather than the operator's ambient one, to `url`
+    /// — the repository's canonical HTTPS URL in `main` — never to whatever the remote resolves
+    /// to for a push (see [`PushAuth`]).
+    pub fn with_push_credentials(
+        mut self,
+        creds: Arc<dyn Credentials>,
+        url: impl Into<String>,
+    ) -> Self {
+        self.push_auth = Some(PushAuth { creds, url: url.into() });
         self
     }
 
     /// The token-bearing file, when there is one, is created here and dropped by the caller
     /// once the push has returned.
+    ///
+    /// With an App credential the push goes to an explicit URL, so git updates no
+    /// remote-tracking ref and would take its lease from nothing. `lease` is therefore spelled
+    /// out: what `refs/remotes/<remote>/<branch>` holds, or empty for "must not exist yet", and
+    /// `publish` moves that ref itself once the push lands.
     fn push_args(
         &self,
         remote: &str,
         branch: &str,
+        lease: &str,
     ) -> Result<(Vec<String>, Option<PushCredentialFile>), ForgeError> {
-        let file = match &self.push_auth {
-            Some(PushAuth(creds)) => Some(
-                PushCredentialFile::new(&creds.token()?)
-                    .map_err(|e| ForgeError::Transient(format!("writing push credential: {e}")))?,
-            ),
-            None => None,
+        let Some(PushAuth { creds, url }) = &self.push_auth else {
+            let args = ["push", "--force-with-lease", "--set-upstream", remote, branch];
+            return Ok((args.map(str::to_string).to_vec(), None));
         };
-        let mut args = file.as_ref().map(PushCredentialFile::git_config).unwrap_or_default();
-        args.extend(
-            ["push", "--force-with-lease", "--set-upstream", remote, branch].map(str::to_string),
-        );
-        Ok((args, file))
+        let file = PushCredentialFile::new(&creds.token()?)
+            .map_err(|e| ForgeError::Transient(format!("writing push credential: {e}")))?;
+        let mut args = file.git_config();
+        args.extend([
+            "push".to_string(),
+            format!("--force-with-lease=refs/heads/{branch}:{lease}"),
+            url.clone(),
+            format!("{branch}:refs/heads/{branch}"),
+        ]);
+        Ok((args, Some(file)))
     }
 
     pub fn root(&self) -> &Path {
@@ -720,8 +738,11 @@ impl Publisher for GitWorktreeWorkspace {
         // because the branch is the orchestrator's own; the lease is what keeps that apart from
         // forcing over somebody else's — it expects the remote ref to be what this repository
         // last saw of it, and a remote that has moved since is refused, not overwritten.
+        let tracking = format!("refs/remotes/{remote}/{branch}");
+        let lease = Self::git(worktree, &["rev-parse", "--verify", "--quiet", &tracking])
+            .unwrap_or_default();
         let push = || {
-            let (args, credential) = self.push_args(remote, branch)?;
+            let (args, credential) = self.push_args(remote, branch, &lease)?;
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let pushed = Self::git(worktree, &args);
             drop(credential);
@@ -730,6 +751,13 @@ impl Publisher for GitWorktreeWorkspace {
         self.retry_on_auth(push)?.map_err(|e| classify_push(remote, branch, &e.to_string()))?;
         let head_sha = Self::git(worktree, &["rev-parse", "HEAD"])
             .map_err(|e| ForgeError::Transient(e.to_string()))?;
+        if self.push_auth.is_some() {
+            // A push to a URL moves no remote-tracking ref; the next lease is taken from this one.
+            Self::git(worktree, &["update-ref", &tracking, &head_sha])
+                .map_err(|e| ForgeError::Transient(format!("recording the pushed head: {e}")))?;
+            let upstream = format!("{remote}/{branch}");
+            let _ = Self::git(worktree, &["branch", "--set-upstream-to", &upstream, branch]);
+        }
 
         // Best-effort: a fetch that fails leaves the local `base`, which is right whenever the
         // remote has nothing newer, and only over-lists commits otherwise.
@@ -1523,15 +1551,16 @@ mod tests {
         const TOKEN: &str = "ghs_push_token_that_must_not_leak";
         let root = tmp_root("wt-push-cred");
         let (repo, bare) = repo_with_remote("wt-push-cred");
-        let ws = GitWorktreeWorkspace::new(&root, &repo)
-            .unwrap()
-            .with_push_credentials(Arc::new(crate::credentials::StaticToken::new(TOKEN)));
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(
+            Arc::new(crate::credentials::StaticToken::new(TOKEN)),
+            bare.to_str().unwrap(),
+        );
 
         let p = ws.prepare("id-1", "MT-1").unwrap();
         let branch = p.branch.clone().unwrap();
         commit_in(&p.path, "a.txt", "a change");
 
-        let (args, file) = ws.push_args("origin", &branch).unwrap();
+        let (args, file) = ws.push_args("origin", &branch, "").unwrap();
         assert!(args.iter().all(|a| !a.contains(TOKEN)), "the token is in argv: {args:?}");
         // What git itself resolves through exactly those arguments is the token, ahead of any
         // helper the operator configured.
@@ -1583,6 +1612,53 @@ mod tests {
         std::fs::remove_dir_all(&bare).ok();
     }
 
+    /// An explicit SSH `pushurl` (or an SSH host alias) is where `pushInsteadOf` rewriting stops
+    /// applying, and the push would go out on the operator's key. With an App credential the
+    /// push goes to the URL it was given and the remote's push URL is never consulted — here it
+    /// names a host that does not exist, so taking it would fail the push outright. The lease
+    /// still holds across a rewrite and still refuses someone else's work.
+    #[test]
+    fn an_app_push_ignores_the_remotes_push_url_and_keeps_its_lease() {
+        let root = tmp_root("wt-push-url");
+        let (repo, bare) = repo_with_remote("wt-push-url");
+        git_out(&repo, &["config", "remote.origin.pushurl", "ssh://git@crew-test.invalid/o/r.git"])
+            .unwrap();
+        let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(
+            Arc::new(crate::credentials::StaticToken::new("tok")),
+            bare.to_str().unwrap(),
+        );
+        let p = ws.prepare("id-1", "MT-1").unwrap();
+        let branch = p.branch.clone().unwrap();
+        let on_remote = |b: &str| git_out(&bare, &["rev-parse", &format!("refs/heads/{b}")]);
+
+        commit_in(&p.path, "a.txt", "first");
+        let first = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_eq!(on_remote(&branch).unwrap(), first.head_sha, "pushed to the given URL");
+
+        // A rewrite of our own branch is forced over our own earlier push.
+        git_out(&p.path, &["commit", "-q", "--amend", "-m", "first, reworded"]).unwrap();
+        let second = ws.publish(&p.path, &branch, "origin", "main").unwrap();
+        assert_ne!(second.head_sha, first.head_sha);
+        assert_eq!(on_remote(&branch).unwrap(), second.head_sha);
+
+        // Someone else moves the remote branch: the lease refuses rather than overwrites.
+        let other = tmp_root("wt-push-url-other");
+        git_out(&other, &["clone", "-q", bare.to_str().unwrap(), "."]).unwrap();
+        git_out(&other, &["checkout", "-q", &branch]).unwrap();
+        commit_in(&other, "theirs.txt", "not ours");
+        git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
+        commit_in(&p.path, "b.txt", "second");
+        let refused = ws.publish(&p.path, &branch, "origin", "main").unwrap_err();
+        assert!(
+            matches!(refused, ForgeError::Permanent(ref m) if m.contains("has moved")),
+            "{refused:?}"
+        );
+
+        for d in [&root, &repo, &bare, &other] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
     #[test]
     fn a_push_refused_for_authentication_is_retried_once_on_a_fresh_token() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1601,8 +1677,9 @@ mod tests {
         let root = tmp_root("wt-push-reauth");
         let (repo, bare) = repo_with_remote("wt-push-reauth");
         let creds = Arc::new(Rotating(AtomicU32::new(0)));
-        let ws =
-            GitWorktreeWorkspace::new(&root, &repo).unwrap().with_push_credentials(creds.clone());
+        let ws = GitWorktreeWorkspace::new(&root, &repo)
+            .unwrap()
+            .with_push_credentials(creds.clone(), bare.to_str().unwrap());
         let refused = || WorkspaceError::Git {
             args: "push".into(),
             stderr: "fatal: Authentication failed for 'https://github.com/o/r.git/'".into(),
@@ -1656,7 +1733,7 @@ mod tests {
         let root = tmp_root("wt-push-plain");
         let (repo, bare) = repo_with_remote("wt-push-plain");
         let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
-        let (args, file) = ws.push_args("origin", "crew/x").unwrap();
+        let (args, file) = ws.push_args("origin", "crew/x", "").unwrap();
         assert!(file.is_none());
         assert_eq!(args, ["push", "--force-with-lease", "--set-upstream", "origin", "crew/x"]);
         std::fs::remove_dir_all(&root).ok();
