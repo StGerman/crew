@@ -1096,6 +1096,73 @@ mod tests {
         assert!(f.http.writes().is_empty());
     }
 
+    fn gh_threads(threads: &[(&str, bool, u64)], next: Option<&str>) -> Value {
+        let nodes: Vec<Value> = threads
+            .iter()
+            .map(|(id, resolved, root)| {
+                json!({
+                    "id": id,
+                    "isResolved": resolved,
+                    "comments": { "nodes": [{ "databaseId": root }] },
+                })
+            })
+            .collect();
+        json!({ "data": { "repository": { "pullRequest": { "reviewThreads": {
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+            "nodes": nodes,
+        } } } } })
+    }
+
+    #[test]
+    fn resolve_thread_finds_the_thread_by_its_root_comment_and_resolves_it() {
+        let http = FakeHttp::new();
+        http.push(ok(gh_threads(&[("T_other", false, 41)], Some("cur1"))));
+        http.push(ok(gh_threads(&[("T_mine", false, 42)], None)));
+        http.push(ok(json!({ "data": { "resolveReviewThread": {
+            "thread": { "id": "T_mine", "isResolved": true } } } })));
+        let f = forge(http);
+
+        f.resolve_thread(7, "42").unwrap();
+
+        let w = f.http.writes();
+        assert_eq!(w.len(), 3, "two pages of threads, then the mutation: {w:?}");
+        assert!(w.iter().all(|(m, u, _)| m == "POST" && u == "https://api.github.com/graphql"));
+        assert_eq!(
+            w[0].2["variables"],
+            json!({ "owner": "o", "repo": "r", "number": 7, "after": null })
+        );
+        assert_eq!(w[1].2["variables"]["after"], "cur1", "the second page follows the cursor");
+        assert!(w[2].2["query"].as_str().unwrap().contains("resolveReviewThread"));
+        assert_eq!(w[2].2["variables"], json!({ "id": "T_mine" }), "the matching thread only");
+    }
+
+    #[test]
+    fn resolving_an_already_resolved_thread_is_ok_and_sends_no_mutation() {
+        let http = FakeHttp::new();
+        http.push(ok(gh_threads(&[("T_mine", true, 42)], None)));
+        let f = forge(http);
+
+        f.resolve_thread(7, "42").unwrap();
+
+        assert_eq!(f.http.writes().len(), 1, "the query only: {:?}", f.http.writes());
+    }
+
+    #[test]
+    fn a_graphql_error_in_a_200_is_classified_rather_than_read_as_success() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({ "errors": [{ "type": "RATE_LIMITED", "message": "slow down" }] })));
+        let err = forge(http).resolve_thread(7, "42").unwrap_err();
+        assert!(err.retryable(), "got {err:?}");
+
+        let http = FakeHttp::new();
+        http.push(ok(gh_threads(&[("T_mine", false, 42)], None)));
+        http.push(ok(
+            json!({ "data": null, "errors": [{ "type": "FORBIDDEN", "message": "no" }] }),
+        ));
+        let err = forge(http).resolve_thread(7, "42").unwrap_err();
+        assert!(matches!(err, ForgeError::Permanent(_)), "got {err:?}");
+    }
+
     #[test]
     fn a_429_classifies_as_transient() {
         let http = FakeHttp::new();
