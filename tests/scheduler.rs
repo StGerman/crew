@@ -21,7 +21,7 @@ use symphony_cc::tracker::TrackerError;
 use symphony_cc::tracker::fake::FakeTracker;
 use symphony_cc::transcript::Transcripts;
 use symphony_cc::worker::fake::{FakeWorker, Script};
-use symphony_cc::worker::{RateLimitSignal, Session};
+use symphony_cc::worker::{Effort, ModelChoice, RateLimitSignal, Session};
 use symphony_cc::workspace::{DirWorkspace, GitWorktreeWorkspace, Workspace};
 
 struct Harness {
@@ -1270,6 +1270,61 @@ fn a_permanent_failure_quarantines_immediately_rather_than_retrying_forever() {
     h.clock.advance_ms(600_000);
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 0);
+}
+
+/// The model a run names is history (#36): changing the setting under a run in flight, or before
+/// the next one, must not rewrite what the earlier run reports it was dispatched with.
+#[test]
+fn a_run_records_the_model_it_was_dispatched_with_rather_than_the_current_default() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let pinned =
+        ModelChoice { model: Some("claude-opus-5-5".into()), effort: Some(Effort::Medium) };
+    h.worker.set_model(pinned);
+    h.worker.set_default(
+        Script::succeeds_in(10_000).with_outcome(Outcome::Continue { why: "more".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1);
+
+    // The operator unpins while the first run is still going.
+    h.worker.set_model(ModelChoice::default());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    let runs = h.sched.snapshot().unwrap().rows[0].runs.clone();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(runs[0].effort.as_deref(), Some("medium"));
+
+    // Finish it, and let the continuation dispatch under the new (absent) setting.
+    for _ in 0..6 {
+        h.clock.advance_ms(31_000);
+        h.sched.tick().unwrap();
+    }
+    let runs = h.sched.snapshot().unwrap().rows[0].runs.clone();
+    assert!(runs.len() >= 2, "expected the continuation to have dispatched: {runs:?}");
+    let (newest, first) = (&runs[0], runs.last().unwrap());
+    assert_eq!((newest.model.as_deref(), newest.effort.as_deref()), (None, None));
+    assert_eq!(first.model.as_deref(), Some("claude-opus-5-5"), "history, not current config");
+    assert_eq!(first.effort.as_deref(), Some("medium"));
+}
+
+/// A silent fallback to the default would make the recorded model a lie; the refusal has to
+/// take the permanent path instead (#36).
+#[test]
+fn a_model_the_cli_refuses_quarantines_the_issue_instead_of_retrying_it() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.worker.set_default(Script::succeeds_in(1_000).with_outcome(Outcome::Failed {
+        class: ErrorClass::ModelNotFound,
+        msg: "There's an issue with the selected model".into(),
+    }));
+
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().is_quarantined());
+    assert!(h.sched.store().all_retries().unwrap().is_empty());
 }
 
 #[test]

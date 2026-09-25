@@ -1235,6 +1235,58 @@ mod tests {
         }
     }
 
+    fn argv_of(w: &ClaudeWorker, session: &Session, tag: &str) -> Vec<String> {
+        let ws = tmp_workspace(tag);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, session));
+        wait_for_finish(&h);
+        let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
+        std::fs::remove_dir_all(&ws).ok();
+        dump.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_configured_model_and_effort_reach_every_attempt_and_unset_passes_neither_flag() {
+        let pinned = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0).with_model(
+            ModelChoice {
+                model: Some("claude-opus-5-5".into()),
+                effort: Some(crate::worker::Effort::Medium),
+            },
+        );
+        // A continuation included: a flag passed only on the first attempt would leave every
+        // resumed one on whatever the CLI chose, under a run row naming the pinned model.
+        for session in [Session::New("s-new".into()), Session::Resume("s-old".into())] {
+            let argv = argv_of(&pinned, &session, "model-pinned");
+            let after = |flag: &str| {
+                argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1)).cloned()
+            };
+            assert_eq!(after("--model").as_deref(), Some("claude-opus-5-5"), "{argv:?}");
+            assert_eq!(after("--effort").as_deref(), Some("medium"), "{argv:?}");
+        }
+
+        let unset = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
+        let argv = argv_of(&unset, &Session::New("s-new".into()), "model-unset");
+        assert!(
+            !argv.iter().any(|a| a == "--model" || a == "--effort"),
+            "an operator who sets neither must get exactly the old command line: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_fails_on_a_permanent_class_rather_than_reading_as_a_crash() {
+        let ws = tmp_workspace("unknown-model");
+        let w = ClaudeWorker::new(fixture("unknown_model.sh"), vec!["PATH".into()], 0);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
+        let outcome = wait_for_finish(&h);
+        match outcome {
+            Outcome::Failed { class, .. } => {
+                assert_eq!(class, ErrorClass::ModelNotFound);
+                assert!(!class.retryable(), "every retry would pass the same name");
+            }
+            other => panic!("expected a permanent failure, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
     #[test]
     fn no_tracker_credential_reaches_the_child_environment() {
         let ws = tmp_workspace("env-leak");
