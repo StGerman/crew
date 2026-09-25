@@ -1645,6 +1645,9 @@ mod tests {
         let other = tmp_root("wt-push-url-other");
         git_out(&other, &["clone", "-q", bare.to_str().unwrap(), "."]).unwrap();
         git_out(&other, &["checkout", "-q", &branch]).unwrap();
+        // Its own identity, as `tmp_repo` gives each repo: CI has no global one.
+        git_out(&other, &["config", "user.name", "someone else"]).unwrap();
+        git_out(&other, &["config", "user.email", "someone@example.invalid"]).unwrap();
         commit_in(&other, "theirs.txt", "not ours");
         git_out(&other, &["push", "-q", "origin", &branch]).unwrap();
         commit_in(&p.path, "b.txt", "second");
