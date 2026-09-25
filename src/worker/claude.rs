@@ -452,10 +452,14 @@ fn run_reader(
 
         match value.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
-                turns += 1;
+                // A failed request's synthetic turn is not a turn: counted, it could trip the
+                // session budget below and read as `Continue` before the error `result` that
+                // follows it is ever seen — a refused model retried instead of quarantined.
                 if let Some(e) = value.get("error").and_then(|e| e.as_str()) {
                     api_error = Some(e.to_string());
+                    continue;
                 }
+                turns += 1;
                 let last_event = extract_text(&value);
                 let mut g = state.0.lock().unwrap();
                 g.progress.turns = turns;
@@ -1278,7 +1282,9 @@ mod tests {
     #[test]
     fn an_unknown_model_fails_on_a_permanent_class_rather_than_reading_as_a_crash() {
         let ws = tmp_workspace("unknown-model");
-        let w = ClaudeWorker::new(fixture("unknown_model.sh"), vec!["PATH".into()], 0);
+        // A budget of one: the smallest valid one, and the one that would cut the run off on the
+        // synthetic turn if it counted.
+        let w = ClaudeWorker::new(fixture("unknown_model.sh"), vec!["PATH".into()], 1);
         let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
         let outcome = wait_for_finish(&h);
         match outcome {
