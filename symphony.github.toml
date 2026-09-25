@@ -41,12 +41,13 @@ kind = "claude"
 # not an orchestrator error, so lower this before blaming stall_timeout_ms.
 #
 # Memory is not what binds here today, though. Five concurrent agents drove the account's
-# five-hour token window to 1.05 utilization in minutes, and every dispatched run died on the
-# rejection that followed. Until #37 teaches the scheduler to pause until `resetsAt` instead of
-# quarantining each interrupted issue, this number is really a burn-rate dial: raising it does
-# not buy throughput once the window is the limit, it only reaches the wall sooner and leaves
-# more quarantines to clear by hand.
-max_concurrent = 3
+# five-hour token window to 1.05 utilization in minutes. Since #37 a rejection pauses dispatch
+# until `resetsAt` instead of quarantining each interrupted issue, so hitting the window no
+# longer costs quarantines, but this number is still a burn-rate dial: raising it does not buy
+# throughput once the window is the limit, it only reaches the pause sooner. One also means
+# issues run strictly in the order dispatch picks them, with no two branches built off the
+# same base at once.
+max_concurrent = 1
 # Budgets sized for a real agent rather than for the fake worker. A turn is one `assistant`
 # event, so a slice of work runs to dozens of them; at 20 the session was cut every 20 tool
 # calls, and at 40 cumulative the issue quarantined before the work could land.
