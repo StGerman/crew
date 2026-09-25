@@ -725,6 +725,44 @@ that has already been broken. Only `rename` (which refuses outright) and `diagno
 (which carries a `complete` flag) wait for a quiescent workspace. Ask again until an answer
 is non-empty before concluding anything from one.
 
+## Skills and supervision
+
+Three skills cover the kinds of work this repo keeps producing. Reach for each at the moment
+named. Outside it, a skill is context spent for nothing.
+
+- **`engineering:architecture`**: when a change needs a decision recorded before any code. That
+  covers an issue with an unanswered question (an "Open" section, like #57's sync-versus-async),
+  a new seam or trait, or anything that reverses a line in this file. The ADR goes in
+  `docs/adr/` (#63) and the issue body links to it. Code that implements the decision cites the
+  ADR in one line rather than retelling it.
+- **`mattpocock-skills:diagnosing-bugs`**: when a run, a scheduling decision or a test does
+  something nobody can explain, such as a stall, an interleaving like #86, or an unexpected
+  quarantine. Start from the evidence this repo already keeps: the run's transcript (named on
+  the `dispatched` log line), `crewctl status <issue>`, and the daemon log. Finish with a guard
+  test that fails without the fix, as every row of the invariant table requires.
+- **`/code-review`**: on every pull request before it merges, agent-authored or not, as well as
+  Copilot's review. This is the pass that reads the diff against this file and
+  `docs/coding-guidelines.md`. It catches the class Copilot missed on #88, which re-implemented
+  #64's JWT signing: a second description of something that already exists.
+
+A dispatched agent uses the first two inside its own issue as written. Reviewing its own branch
+with `/code-review` is optional and never replaces the handoff gate.
+
+### Watching the daemon (supervising session only)
+
+The session supervising a running daemon watches it with `/loop` over the `crew_ops` tools. A
+dispatched agent never does: it never has those tools (see the ops MCP server above).
+
+```
+/loop 15m Check crewd with the crew_ops snapshot tool and report only what changed since the last check: runs started or finished, a pull request opened or updated, a quarantine, a rate-limit pause, a delivery handoff, a new last_error. When a pull request's delivery stage becomes ready, run /code-review on it and summarise. Read only: never call refresh or unquarantine, and never push to a branch the daemon owns, without asking.
+```
+
+The loop stays read-only because `refresh` and `unquarantine` change what the scheduler does,
+and a push from outside the daemon onto a branch it is delivering is exactly what delivery's
+`--force-with-lease` exists to refuse. Fifteen minutes suits the pace of the work: a session is
+a few minutes of turns, so each check sees a transition without spending one on nothing. Leave
+the interval out to let the loop set its own pace.
+
 ## Constraints for the worker and broker
 
 Decisions already taken that are expensive to rediscover. The first two are implemented in
