@@ -574,7 +574,11 @@ impl Scheduler {
     /// A step of its own, after `apply_verdicts` rather than inside it, so a verdict is still
     /// settled by its reply alone: a resolve that fails is logged and retried on the next poll,
     /// and costs no second reply, no round and no hold on readiness, which stays computed from
-    /// the verdict table and never from the provider's `isResolved`.
+    /// the verdict table and never from the provider's `isResolved`. So the failure is not
+    /// returned — that would stop the step before CI and the threads are read, and hand a
+    /// ready pull request off over a cosmetic write — but it is surfaced as `advance_delivery`
+    /// surfaces one: a transient failure in `last_error`, a permanent one on the issue's row,
+    /// logged at `error`, since it will keep failing until the operator fixes the credential.
     fn resolve_settled_threads(&mut self, issue_id: &str, number: u64) -> Result<(), StepError> {
         let forge = self.forge.clone().expect("checked by delivery_on");
         for comment in self.store.unresolved_verdicts(issue_id, number)? {
@@ -583,8 +587,14 @@ impl Scheduler {
                     self.store.mark_thread_resolved(self.clock.as_ref(), issue_id, &comment)?;
                     tracing::info!(issue_id, pr = number, comment, "review thread resolved");
                 }
-                Err(e) => {
+                Err(e) if e.retryable() => {
                     tracing::warn!(issue_id, pr = number, comment, error = %e, "resolving a settled thread failed; retried next poll");
+                    self.last_error = Some(format!("resolving review thread {comment}: {e}"));
+                }
+                Err(e) => {
+                    tracing::error!(issue_id, pr = number, comment, error = %e, "resolving a settled thread was refused; retried next poll, but will not succeed on its own");
+                    let msg = format!("resolving review thread {comment} refused: {e}");
+                    self.store.note_error(self.clock.as_ref(), issue_id, &msg)?;
                 }
             }
         }

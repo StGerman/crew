@@ -2578,6 +2578,10 @@ fn a_failed_resolve_is_retried_and_never_re_replies() {
         crew::store::DeliveryStage::Ready,
         "readiness is the verdict table's, not the provider's isResolved"
     );
+    assert!(
+        h.sched.snapshot().unwrap().last_error.as_deref().unwrap().contains("connection reset"),
+        "the failure is visible"
+    );
 
     forge.fail_resolve_with(None);
     h.clock.advance_ms(1_000);
@@ -2587,6 +2591,41 @@ fn a_failed_resolve_is_retried_and_never_re_replies() {
     assert_eq!(forge.replies_to(pr, &c).len(), 1, "without replying a second time");
     assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "and resolving opened no round");
     assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
+}
+
+/// Review on #93: a resolve the provider refuses outright — a credential without the
+/// permission — must be visible on the issue's row, and still must not hand off a pull request
+/// that is otherwise ready over a write that only tidies its threads.
+#[test]
+fn a_refused_resolve_is_reported_on_the_row_without_handing_off_a_ready_pull_request() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let c = forge.add_comment(pr, "Copilot", "src/config.rs", "missing #[serde(default)]");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: c.clone(),
+        verdict: Verdict::Rejected,
+        detail: "the default is set two lines below".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    forge.fail_resolve_with(Some(ForgeError::Permanent("403: Resource not accessible".into())));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let row = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert!(
+        row.last_error.as_deref().is_some_and(|e| e.contains("Resource not accessible")),
+        "the refusal is on the row: {:?}",
+        row.last_error
+    );
+    assert_eq!(forge.replies_to(pr, &c).len(), 1);
 }
 
 /// Finding 4 on #47, end to end: the reviewer approves the first head, CI sends the issue round,
