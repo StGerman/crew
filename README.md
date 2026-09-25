@@ -81,7 +81,10 @@ By default every comment, label and branch is authored by *you*, because the tok
 GitHub App gives the daemon its own identity, so its writes are distinguishable from yours and
 it can hold `contents: write` while being denied merge entirely.
 
-Register an App with `contents`, `issues` and `pull_requests` set to write, install it on the
+Register an App with `contents`, `issues` and `pull_requests` set to **write** and `checks` set
+to **read** — delivery reads CI through the check-runs API, and without it every delivery is
+handed off on a 403 right after its pull request opens. Add `actions` **read** to have a red
+job's failing steps and log tail included in what the agent is sent back. Install it on the
 repository, and write a small file naming it:
 
 ```toml
