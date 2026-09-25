@@ -1,0 +1,5 @@
+---
+source: src/init/tests.rs
+expression: err.to_string()
+---
+the App GitHub created does not have the permissions crewd asked for: wanted permissions [checks:read, contents:write, issues:write, metadata:read, pull_requests:write, statuses:read], events []; got permissions [administration:write, checks:read, contents:write, issues:write, metadata:read, pull_requests:write, statuses:read], events []. Delete it at https://github.com/settings/apps and run `crewd init` again

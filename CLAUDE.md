@@ -41,7 +41,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 254 unit + 99 integration, all three packages
+cargo test                                 # 289 unit + 99 integration, all three packages
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -58,6 +58,7 @@ cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, 
 cargo run -- --mcp 127.0.0.1:8788          # the same four routes as MCP tools, for a supervising agent
 claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
                                            # ...and how that agent gets them. Local scope, never user
+cargo run -- init                          # register your own GitHub App: two clicks, writes ~/.crewd/
 cargo run --example dashboard_preview      # render the UI to stdout, no terminal needed
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
@@ -537,6 +538,22 @@ servers. Register this one in the supervising agent's **local or project scope, 
 scope**, or every worker inherits it and the wiring is bypassed by configuration.
 
 
+**`crewd init`** ([src/init/](src/init/)) registers the operator's own GitHub App through the
+App Manifest flow (#65): a loopback page posts the manifest to GitHub, the operator clicks
+*Create*, GitHub redirects back with a single-use code, and `init` exchanges it for the App's
+id and private key, then sends the browser on to *Install* and reads the installation id back
+over the App's own JWT. It writes `~/.crewd/github-app.pem` (600) and `~/.crewd/github-app.toml`
+(`app_id`, `installation_id`, `private_key_path`) in a 700 directory — the file #64's
+`tracker.github_app` names — and never edits the daemon's config or overwrites either file.
+Each operator registers their own App because the key is the App owner's; `GITHUB_TOKEN` and
+a hand-registered App written into the same file stay supported. The listener reuses the broker
+transport's `read_request`, `Limits` and `ConnSlot` cap, not its MCP service: it binds loopback, answers only
+its own `Host`, and is joined shut once a callback carrying a code arrives. The GitHub calls go
+over the tracker's `Http` seam, so the whole flow is tested against a fake GitHub over a real
+socket; the real two-click run is the operator's. The conversion response is the one place in
+the crate that carries a private key and a client secret, and the types are what keep it out of
+the logs: the key sits in a `Pem` whose `Debug` redacts, and the secrets have no field at all.
+
 **Delivery** ([src/sched/delivery.rs](src/sched/delivery.rs), behind the `Forge` and
 `Publisher` traits in [src/forge/](src/forge/)) is what happens after a run reports `Done`,
 when `[delivery] enabled` is on. `Done` still releases the claim and parks the issue exactly as
@@ -676,6 +693,12 @@ reading — check that the named test is still meaningful, not just still green.
 | A misspelled `tracker.kind` or `worker.kind` cannot silently run the fake | both parse into `TrackerKind`/`WorkerKind` in `preflight`, naming the value and the supported set, and `main.rs` matches on the enum with no `else` fallthrough; an empty `worker.kind` is `fake` on purpose | `a_misspelled_tracker_kind_is_rejected_rather_than_running_the_demo`, `a_misspelled_worker_kind_is_rejected_rather_than_running_the_fake` |
 | A run names the model that did its work, not today's setting | the scheduler records `Worker::model()` — the value the worker builds `--model`/`--effort` from — on the run row at `start_run`, and never updates it | `a_run_records_the_model_it_was_dispatched_with_rather_than_the_current_default` |
 | A model the CLI refuses is not silently replaced by the default | `model_not_found` on the stream is `ErrorClass::ModelNotFound`, permanent; an unknown `effort`, which the CLI would ignore with a warning, fails config load | `a_model_the_cli_refuses_quarantines_the_issue_instead_of_retrying_it`, `a_model_setting_the_cli_would_silently_ignore_is_refused_at_load` |
+| `crewd init` cannot be driven by a page other than its own | a per-run 128-bit `state` nonce checked on the callback — a mismatch ends the run before the code is converted — and a listener that answers only its own loopback `Host` | `a_callback_whose_state_this_run_did_not_issue_is_refused_without_converting_the_code`, `a_request_under_another_host_name_is_not_shown_the_page_or_its_nonce` |
+| The init listener does not outlive its one callback | `await_callback` stops and joins the accept thread before returning, whatever the callback's outcome | `init_ends_with_a_600_key_a_settings_file_naming_it_and_an_installed_app_after_two_clicks` |
+| The App's key and client secret never reach a log | the key is held in a redacting `Pem`, the secrets are never deserialized, and no error quotes a successful conversion body | `neither_the_key_nor_the_client_secret_reaches_the_log_at_any_level` |
+| `init` never overwrites a key | both files checked before GitHub is asked anything, then created with `create_new` at mode 600 | `an_existing_key_or_settings_file_is_refused_by_name_before_github_is_asked_anything` |
+| The created App has exactly the permissions asked for, and is not offered for install otherwise | one `PERMISSIONS` table builds the manifest and is compared against `GET /app`, read with the App's own JWT, while the callback is still open — only a pass redirects the browser to *Install* | `an_app_created_with_other_permissions_than_the_manifest_fails_the_run_over_its_own_jwt` |
+| The init listener cannot be made to hold threads without bound | `ConnSlot::take` against `Limits::max_connections` before a connection's thread exists; past the cap the socket is closed | `connections_past_the_cap_are_refused_rather_than_each_given_a_thread` |
 
 The delivery rows' bound is the same shape as the broker's, and each guard was checked the same
 way: disable the mechanism — treat a CI failure as success, trust the provider's `200`, drop

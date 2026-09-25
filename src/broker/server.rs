@@ -214,10 +214,10 @@ pub fn serve_with<S: McpService>(service: Arc<S>, listener: TcpListener, limits:
 /// [`BrokerSession`](super::BrokerSession) is: a path that ends the connection without
 /// releasing the slot — an early `?`, a panic in a tool — leaks a slot permanently, and a
 /// server that has leaked every slot refuses everyone while doing nothing.
-struct ConnSlot(Arc<AtomicUsize>);
+pub(crate) struct ConnSlot(Arc<AtomicUsize>);
 
 impl ConnSlot {
-    fn take(live: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+    pub(crate) fn take(live: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
         live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
             .ok()?;
         Some(Self(Arc::clone(live)))
@@ -230,10 +230,15 @@ impl Drop for ConnSlot {
     }
 }
 
-struct Request {
-    method: String,
-    path: String,
-    body: Vec<u8>,
+/// One request as read off the wire. `crewd init`'s callback listener reads with the same
+/// function, so it inherits the same caps and the same idle/request deadline split.
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    /// The `Host` header, which the callback listener checks so a page that rebinds its own
+    /// name to `127.0.0.1` cannot read the init page's nonce. The MCP transport ignores it.
+    pub(crate) host: Option<String>,
+    pub(crate) body: Vec<u8>,
 }
 
 fn handle_conn<S: McpService>(
@@ -342,7 +347,7 @@ fn error_body(id: Value, code: i64, message: &str) -> Value {
 /// dribbling, which is not. A single deadline would have to be the generous one to keep
 /// keep-alive working, and a generous deadline on a half-sent request is no deadline at all.
 /// A timeout surfaces as an ordinary read error and ends the connection.
-fn read_request(
+pub(crate) fn read_request(
     reader: &mut BufReader<TcpStream>,
     limits: Limits,
 ) -> std::io::Result<Option<Request>> {
@@ -366,6 +371,7 @@ fn read_request(
     let path = parts.next().unwrap_or_default().to_string();
 
     let mut content_length = 0usize;
+    let mut host = None;
     let mut header_bytes = start.len();
     loop {
         let mut line = String::new();
@@ -379,10 +385,12 @@ fn read_request(
         if line.trim().is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = v.trim().parse().unwrap_or(0);
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            } else if k.trim().eq_ignore_ascii_case("host") {
+                host = Some(v.trim().to_string());
+            }
         }
     }
 
@@ -393,7 +401,7 @@ fn read_request(
     if content_length > 0 {
         reader.read_exact(&mut body)?;
     }
-    Ok(Some(Request { method, path, body }))
+    Ok(Some(Request { method, path, host, body }))
 }
 
 fn respond(

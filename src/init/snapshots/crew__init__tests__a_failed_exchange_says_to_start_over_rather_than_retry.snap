@@ -1,0 +1,5 @@
+---
+source: src/init/tests.rs
+expression: err.to_string()
+---
+exchanging GitHub's code for the App's key failed: GitHub answered 404: Not Found. The code is single-use and expires within the hour, so this cannot be retried: run `crewd init` again, deleting the App at https://github.com/settings/apps first if GitHub shows it was created
