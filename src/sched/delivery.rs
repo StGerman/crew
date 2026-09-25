@@ -581,8 +581,13 @@ impl Scheduler {
     /// logged at `error`, since it will keep failing until the operator fixes the credential.
     fn resolve_settled_threads(&mut self, issue_id: &str, number: u64) -> Result<(), StepError> {
         let forge = self.forge.clone().expect("checked by delivery_on");
-        for comment in self.store.unresolved_verdicts(issue_id, number)? {
-            match forge.resolve_thread(number, &comment) {
+        let comments = self.store.unresolved_verdicts(issue_id, number)?;
+        if comments.is_empty() {
+            return Ok(());
+        }
+        let results = forge.resolve_threads(number, &comments);
+        for (comment, result) in comments.into_iter().zip(results) {
+            match result {
                 Ok(()) => {
                     self.store.mark_thread_resolved(self.clock.as_ref(), issue_id, &comment)?;
                     tracing::info!(issue_id, pr = number, comment, "review thread resolved");

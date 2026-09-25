@@ -20,6 +20,7 @@
 //! GitHub Actions is not the CI provider on this repo at all, which is why the job/log lookup
 //! only fires for a `details_url` shaped like an Actions job link and is skipped otherwise.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -239,6 +240,23 @@ struct GqlThread {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlResolveData {
+    resolve_review_thread: Option<GqlResolvePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlResolvePayload {
+    thread: Option<GqlResolvedThread>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlResolvedThread {
+    is_resolved: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GqlCommentPage {
     nodes: Vec<GqlComment>,
 }
@@ -334,6 +352,51 @@ impl<H: Http> GithubForge<H> {
             });
         }
         gql.data.ok_or_else(|| ForgeError::Permanent("graphql: a response with no data".into()))
+    }
+
+    /// Every review thread on the pull request, keyed by its root comment's `databaseId`.
+    fn review_threads(&self, number: u64) -> Result<HashMap<u64, GqlThread>, ForgeError> {
+        let mut threads = HashMap::new();
+        let mut after: Option<String> = None;
+        loop {
+            let data: GqlThreadsData = self.graphql(
+                THREADS_QUERY,
+                json!({ "owner": self.owner, "repo": self.repo, "number": number, "after": after }),
+            )?;
+            let page = data
+                .repository
+                .and_then(|r| r.pull_request)
+                .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))?
+                .review_threads;
+            for t in page.nodes {
+                if let Some(root) = t.comments.nodes.first().and_then(|c| c.database_id) {
+                    threads.insert(root, t);
+                }
+            }
+            match page.page_info.end_cursor {
+                Some(cursor) if page.page_info.has_next_page => after = Some(cursor),
+                _ => return Ok(threads),
+            }
+        }
+    }
+
+    /// A mutation GitHub answers without `isResolved: true` did not resolve the thread, and
+    /// reading it as success would record the verdict resolved and never try again (#100). It
+    /// is permanent: the same credential asking again gets the same answer.
+    fn resolve_review_thread(&self, thread_id: &str) -> Result<(), ForgeError> {
+        let data: GqlResolveData = self.graphql(RESOLVE_MUTATION, json!({ "id": thread_id }))?;
+        let applied = data
+            .resolve_review_thread
+            .and_then(|p| p.thread)
+            .and_then(|t| t.is_resolved)
+            .unwrap_or(false);
+        if applied {
+            Ok(())
+        } else {
+            Err(ForgeError::Permanent(format!(
+                "graphql: review thread {thread_id} was not resolved by resolveReviewThread"
+            )))
+        }
     }
 
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ForgeError> {
@@ -604,43 +667,26 @@ impl<H: Http> Forge for GithubForge<H> {
         Ok(())
     }
 
-    /// Finds the thread whose root comment is `comment_id` — a thread has no REST id, only
-    /// its root's `databaseId` joins the two APIs — then resolves it, unless it already is.
-    fn resolve_thread(&self, number: u64, comment_id: &str) -> Result<(), ForgeError> {
-        let id: u64 = comment_id.parse().map_err(|_| {
-            ForgeError::Permanent(format!("comment id {comment_id} is not numeric"))
-        })?;
-        let mut after: Option<String> = None;
-        let thread = loop {
-            let data: GqlThreadsData = self.graphql(
-                THREADS_QUERY,
-                json!({ "owner": self.owner, "repo": self.repo, "number": number, "after": after }),
-            )?;
-            let page = data
-                .repository
-                .and_then(|r| r.pull_request)
-                .ok_or_else(|| ForgeError::Permanent(format!("no pull request #{number}")))?
-                .review_threads;
-            if let Some(t) = page
-                .nodes
-                .into_iter()
-                .find(|t| t.comments.nodes.first().and_then(|c| c.database_id) == Some(id))
-            {
-                break Some(t);
-            }
-            match page.page_info.end_cursor {
-                Some(cursor) if page.page_info.has_next_page => after = Some(cursor),
-                _ => break None,
-            }
+    /// Reads the pull request's threads once, then resolves each comment's from that read — a
+    /// thread has no REST id, only its root's `databaseId` joins the two APIs.
+    fn resolve_threads(&self, number: u64, comment_ids: &[String]) -> Vec<Result<(), ForgeError>> {
+        let mut threads = match self.review_threads(number) {
+            Ok(t) => t,
+            Err(e) => return comment_ids.iter().map(|_| Err(e.clone())).collect(),
         };
-        match thread {
-            Some(t) if !t.is_resolved => {
-                let _: Value = self.graphql(RESOLVE_MUTATION, json!({ "id": t.id }))?;
-                Ok(())
-            }
-            // Already resolved, or its root comment is gone: nothing left to do either way.
-            _ => Ok(()),
-        }
+        comment_ids
+            .iter()
+            .map(|comment_id| {
+                let id: u64 = comment_id.parse().map_err(|_| {
+                    ForgeError::Permanent(format!("comment id {comment_id} is not numeric"))
+                })?;
+                match threads.remove(&id) {
+                    Some(t) if !t.is_resolved => self.resolve_review_thread(&t.id),
+                    // Already resolved, or its root comment is gone: nothing left to do either way.
+                    _ => Ok(()),
+                }
+            })
+            .collect()
     }
 }
 
@@ -1113,16 +1159,81 @@ mod tests {
         } } } } })
     }
 
+    fn resolve_one(f: &GithubForge<FakeHttp>, comment_id: &str) -> Result<(), ForgeError> {
+        let mut results = f.resolve_threads(7, &[comment_id.to_string()]);
+        assert_eq!(results.len(), 1);
+        results.remove(0)
+    }
+
+    fn resolved(id: &str, is_resolved: Value) -> Value {
+        json!({ "data": { "resolveReviewThread": {
+            "thread": { "id": id, "isResolved": is_resolved } } } })
+    }
+
+    /// #100: the mutation's answer was discarded, so a thread GitHub declined to resolve was
+    /// recorded resolved and never tried again. A permanent error is what puts it on the row.
     #[test]
-    fn resolve_thread_finds_the_thread_by_its_root_comment_and_resolves_it() {
+    fn a_resolve_the_provider_did_not_apply_is_not_recorded_as_resolved() {
+        for answer in [json!(false), Value::Null] {
+            let http = FakeHttp::new();
+            http.push(ok(gh_threads(&[("T_mine", false, 42)], None)));
+            http.push(ok(resolved("T_mine", answer.clone())));
+            let err = resolve_one(&forge(http), "42").unwrap_err();
+            assert!(
+                matches!(&err, ForgeError::Permanent(m) if m.contains("T_mine")),
+                "isResolved {answer}: got {err:?}"
+            );
+        }
+    }
+
+    /// #100: each comment paged through every thread again, so the cost was verdicts × pages.
+    #[test]
+    fn resolving_several_comments_reads_the_threads_once() {
+        let http = FakeHttp::new();
+        http.push(ok(gh_threads(
+            &[("T_a", false, 41), ("T_b", false, 42), ("T_c", false, 43)],
+            None,
+        )));
+        for id in ["T_a", "T_b", "T_c"] {
+            http.push(ok(resolved(id, json!(true))));
+        }
+        let f = forge(http);
+
+        let ids: Vec<String> = ["41", "42", "43"].map(String::from).into();
+        let results = f.resolve_threads(7, &ids);
+
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        let w = f.http.writes();
+        let queries =
+            w.iter().filter(|(_, _, b)| b["query"].as_str().unwrap().contains("reviewThreads"));
+        assert_eq!(queries.count(), 1, "one threads query: {w:?}");
+        let mutated: Vec<&Value> = w[1..].iter().map(|(_, _, b)| &b["variables"]["id"]).collect();
+        assert_eq!(mutated, [&json!("T_a"), &json!("T_b"), &json!("T_c")]);
+    }
+
+    #[test]
+    fn a_failed_thread_read_fails_every_comment_in_the_batch() {
+        let http = FakeHttp::new();
+        http.push(status(502, &[], json!({})));
+        let f = forge(http);
+        let results = f.resolve_threads(7, &["41".to_string(), "42".to_string()]);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.as_ref().is_err_and(ForgeError::retryable)),
+            "{results:?}"
+        );
+        assert_eq!(f.http.writes().len(), 1, "no mutation without the threads");
+    }
+
+    #[test]
+    fn resolve_threads_finds_the_thread_by_its_root_comment_and_resolves_it() {
         let http = FakeHttp::new();
         http.push(ok(gh_threads(&[("T_other", false, 41)], Some("cur1"))));
         http.push(ok(gh_threads(&[("T_mine", false, 42)], None)));
-        http.push(ok(json!({ "data": { "resolveReviewThread": {
-            "thread": { "id": "T_mine", "isResolved": true } } } })));
+        http.push(ok(resolved("T_mine", json!(true))));
         let f = forge(http);
 
-        f.resolve_thread(7, "42").unwrap();
+        resolve_one(&f, "42").unwrap();
 
         let w = f.http.writes();
         assert_eq!(w.len(), 3, "two pages of threads, then the mutation: {w:?}");
@@ -1142,7 +1253,7 @@ mod tests {
         http.push(ok(gh_threads(&[("T_mine", true, 42)], None)));
         let f = forge(http);
 
-        f.resolve_thread(7, "42").unwrap();
+        resolve_one(&f, "42").unwrap();
 
         assert_eq!(f.http.writes().len(), 1, "the query only: {:?}", f.http.writes());
     }
@@ -1151,7 +1262,7 @@ mod tests {
     fn a_graphql_error_in_a_200_is_classified_rather_than_read_as_success() {
         let http = FakeHttp::new();
         http.push(ok(json!({ "errors": [{ "type": "RATE_LIMITED", "message": "slow down" }] })));
-        let err = forge(http).resolve_thread(7, "42").unwrap_err();
+        let err = resolve_one(&forge(http), "42").unwrap_err();
         assert!(err.retryable(), "got {err:?}");
 
         let http = FakeHttp::new();
@@ -1159,7 +1270,7 @@ mod tests {
         http.push(ok(
             json!({ "data": null, "errors": [{ "type": "FORBIDDEN", "message": "no" }] }),
         ));
-        let err = forge(http).resolve_thread(7, "42").unwrap_err();
+        let err = resolve_one(&forge(http), "42").unwrap_err();
         assert!(matches!(err, ForgeError::Permanent(_)), "got {err:?}");
     }
 
