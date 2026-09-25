@@ -79,7 +79,7 @@ async fn crewctl(cwd: &Path, db: &Path, args: &[&str]) -> Output {
         std::process::Command::new(env!("CARGO_BIN_EXE_crewctl"))
             .args(&args)
             .current_dir(&cwd)
-            .env("SYMPHONY_DB", &db)
+            .env("CREW_DB", &db)
             .output()
             .unwrap()
     })
@@ -92,7 +92,7 @@ async fn a_status_query_does_not_open_the_database_the_daemon_holds() {
     let root: PathBuf = std::env::temp_dir().join(format!("crewctl-status-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let db = root.join("symphony.db");
+    let db = root.join("crew.db");
 
     // The daemon's side: a scheduler on a real database file, one tick, one published snapshot.
     let mut sched = scheduler(&root, &db);

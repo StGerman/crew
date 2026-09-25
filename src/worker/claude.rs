@@ -859,7 +859,7 @@ mod tests {
 
     fn tmp_workspace(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "symphony-claude-worker-{}-{tag}-{:?}",
+            "crew-claude-worker-{}-{tag}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1060,11 +1060,11 @@ mod tests {
     fn snapshots_of_uncommitted_work_are_named_in_both_prompts_with_their_diffstats() {
         let wip = [
             WipSnapshot {
-                ref_name: "refs/symphony/wip/iss-1-abc/000001-0123456789ab".into(),
+                ref_name: "refs/crew/wip/iss-1-abc/000001-0123456789ab".into(),
                 diffstat: " half.txt | 1 +\n 1 file changed, 1 insertion(+)".into(),
             },
             WipSnapshot {
-                ref_name: "refs/symphony/wip/iss-1-abc/000002-ba9876543210".into(),
+                ref_name: "refs/crew/wip/iss-1-abc/000002-ba9876543210".into(),
                 diffstat: " src/lib.rs | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)"
                     .into(),
             },

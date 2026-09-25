@@ -339,7 +339,7 @@ pub enum WorkerKind {
 }
 
 impl WorkerConfig {
-    /// Empty reads as `fake`: `symphony.toml` has no `[worker]` section, and a real agent must
+    /// Empty reads as `fake`: `crew.toml` has no `[worker]` section, and a real agent must
     /// be a decision written down, never a default.
     pub fn kind(&self) -> Result<WorkerKind, ConfigError> {
         match self.kind.trim().to_ascii_lowercase().as_str() {
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_configs_load() {
-        for name in ["symphony.toml", "symphony.github.toml"] {
+        for name in ["crew.toml", "crew.github.toml"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
             if let Err(e) = Config::load(&path) {
                 panic!("{name}: {e}");

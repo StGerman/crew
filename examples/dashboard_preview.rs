@@ -19,7 +19,7 @@ fn row(identifier: &str, title: &str, state: &str, phase: Phase) -> Row {
         title: title.into(),
         tracker_state: state.into(),
         phase,
-        workspace: Some(format!("/tmp/symphony_workspaces/{identifier}-d36eac00286d")),
+        workspace: Some(format!("/tmp/crew_workspaces/{identifier}-d36eac00286d")),
         url: Some(format!("https://tracker.example/issues/{identifier}")),
         ..Default::default()
     }

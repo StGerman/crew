@@ -58,7 +58,7 @@ fn issue(n: u32, state: &str, prio: Option<i32>) -> Issue {
 fn harness(issues: Vec<Issue>, tune: impl FnOnce(&mut Config)) -> Harness {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let root = std::env::temp_dir().join(format!("symphony-sched-{}-{n}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("crew-sched-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
     let workspace = Arc::new(DirWorkspace::new(&root).unwrap());
@@ -130,7 +130,7 @@ fn harness_full(
 fn test_broker(clock: Arc<FakeClock>) -> (Arc<Broker>, Arc<FakeWrites>) {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("symphony-sched-mcp-{}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("crew-sched-mcp-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
     let writes = Arc::new(FakeWrites::new());
@@ -1080,7 +1080,7 @@ fn repeated_gate_failures_escalate_to_blocked_rather_than_looping() {
 #[test]
 fn a_gate_failure_streak_is_not_forgiven_by_restarting_the_daemon() {
     let dir = tmp_dir("gate-streak-restart");
-    let db = dir.join("symphony.db");
+    let db = dir.join("crew.db");
     let root = dir.join("workspaces");
     let failing = GateScript::passes_in(1_000).with_verdict(GateVerdict::Failed {
         step: "cargo test".into(),
@@ -1553,7 +1553,7 @@ fn nothing_is_dispatched_twice_across_repeated_ticks() {
 // ---- startup recovery -------------------------------------------------------
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("symphony-{tag}-{}", std::process::id()));
+    let p = std::env::temp_dir().join(format!("crew-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -1656,7 +1656,7 @@ fn restart_took_time(h: &Harness) {
 #[test]
 fn a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup() {
     let dir = tmp_dir("hard-kill");
-    let db = dir.join("symphony.db");
+    let db = dir.join("crew.db");
     let root = dir.join("workspaces");
 
     let ws = {
@@ -1712,7 +1712,7 @@ fn a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup() {
 #[test]
 fn a_hard_killed_runs_commits_survive_the_recovery_that_frees_its_issue() {
     let dir = tmp_dir("hard-kill-git");
-    let db = dir.join("symphony.db");
+    let db = dir.join("crew.db");
     let root = dir.join("workspaces");
     let repo = git_repo(&dir.join("repo"));
 
@@ -1766,7 +1766,7 @@ fn a_hard_killed_runs_commits_survive_the_recovery_that_frees_its_issue() {
 #[test]
 fn a_run_interrupted_by_a_hard_kill_reports_its_last_known_turn_count_after_restart() {
     let dir = tmp_dir("hard-kill-turns");
-    let db = dir.join("symphony.db");
+    let db = dir.join("crew.db");
     let root = dir.join("workspaces");
 
     // Ten turns over 600s: one every minute, so the count is unambiguous at any tick.
@@ -2187,7 +2187,7 @@ impl Workspace for NamedBranches {
         self.0.path_for(issue_id, identifier)
     }
     fn branch_for(&self, issue_id: &str, identifier: &str) -> Option<String> {
-        Some(format!("symphony/{}", crew::model::worktree_key(issue_id, identifier)))
+        Some(format!("crew/{}", crew::model::worktree_key(issue_id, identifier)))
     }
 }
 
@@ -2211,7 +2211,7 @@ fn delivery_harness_with(
 ) -> (Harness, Arc<FakeForge>) {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let root = std::env::temp_dir().join(format!("symphony-deliver-{}-{n}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("crew-deliver-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let workspace = Arc::new(NamedBranches(DirWorkspace::new(&root).unwrap()));
 
@@ -2250,7 +2250,7 @@ fn a_run_that_finishes_leaves_an_open_pull_request_not_only_a_branch() {
     let prs = forge.open_prs();
     assert_eq!(prs.len(), 1, "a done run must leave a pull request, got {:?}", forge.ops());
     let spec = forge.spec_of(prs[0].number).unwrap();
-    assert!(spec.head.starts_with("symphony/MT-1-"), "opened from the run's branch: {}", spec.head);
+    assert!(spec.head.starts_with("crew/MT-1-"), "opened from the run's branch: {}", spec.head);
     assert_eq!(spec.base, "master");
     assert!(spec.title.contains("MT-1"), "{}", spec.title);
     assert!(
@@ -2584,7 +2584,7 @@ fn an_acceptance_naming_a_commit_the_branch_does_not_carry_leaves_the_comment_ou
 fn fix_rounds_are_bounded_per_pull_request_and_per_issue_and_the_bound_survives_a_new_run_and_a_new_pull_request()
  {
     let dir = tmp_dir("delivery-rounds");
-    let db = dir.join("symphony.db");
+    let db = dir.join("crew.db");
     let tune = |c: &mut Config| {
         c.delivery.max_rounds_per_pr = 2;
         c.delivery.max_rounds_per_issue = 3;

@@ -71,7 +71,7 @@ impl Harness {
     async fn new(issues: Vec<Issue>) -> Self {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("symphony-api-{}-{n}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("crew-api-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
 
         let cfg = Config {
@@ -597,8 +597,8 @@ async fn a_padded_bind_address_in_the_config_reaches_the_daemon_the_way_a_trimme
     let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
     h.tick();
 
-    let cfg_path = std::env::temp_dir()
-        .join(format!("symphony-api-test-padded-bind-{}.toml", std::process::id()));
+    let cfg_path =
+        std::env::temp_dir().join(format!("crew-api-test-padded-bind-{}.toml", std::process::id()));
     std::fs::write(&cfg_path, format!("[api]\nbind = \"  {}  \"\n", h.addr)).unwrap();
 
     let ep = crew::api::client::endpoint(None, &cfg_path);

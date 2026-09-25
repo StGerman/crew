@@ -23,7 +23,7 @@ required_labels = ["agent"]
 interval_ms = 30000
 
 [workspace]
-root = ".symphony/workspaces"
+root = ".crew/workspaces"
 repo = "."
 
 # Live dispatch: real `claude -p` processes, with `--permission-mode bypassPermissions`, against
@@ -89,8 +89,8 @@ max_calls_per_issue = 40
 
 # Inspect a headless run without attaching a terminal. `status` reads `bind` out of this file,
 # so neither command needs the port repeated to it:
-#   symphony-cc --config symphony.github.toml status
-#   symphony-cc --config symphony.github.toml status 24
+#   crewctl --config crew.github.toml status
+#   crewctl --config crew.github.toml status 24
 [api]
 enabled = true
 bind = "127.0.0.1:8787"

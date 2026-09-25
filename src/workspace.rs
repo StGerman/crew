@@ -61,7 +61,7 @@ pub struct Prepared {
 /// all read the branch, and a snapshot commit there would be handed off as the agent's work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WipSnapshot {
-    /// Full ref name, `refs/symphony/wip/<issue key>/<sequence>-<commit>`.
+    /// Full ref name, `refs/crew/wip/<issue key>/<sequence>-<commit>`.
     pub ref_name: String,
     /// `git diff --stat` of the snapshot against the branch head it was taken on.
     pub diffstat: String,
@@ -278,7 +278,7 @@ impl GitWorktreeWorkspace {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Namespaced under `symphony/` and named after the same key as the directory, so the
+    /// Namespaced under `crew/` and named after the same key as the directory, so the
     /// branch holding a finished run's work can be found from the issue identifier by eye
     /// rather than by recomputing a hash. `worktree_key` already keys off the dispatch id, so
     /// two issues that happen to share an identifier still get two distinct branches.
@@ -286,7 +286,7 @@ impl GitWorktreeWorkspace {
     /// Dots are dropped even though the directory name keeps them: `a..b` is a legal directory
     /// and an illegal ref, and a hostile identifier reaches both.
     fn branch_name(issue_id: &str, identifier: &str) -> String {
-        format!("symphony/{}", Self::ref_key(issue_id, identifier))
+        format!("crew/{}", Self::ref_key(issue_id, identifier))
     }
 
     fn ref_key(issue_id: &str, identifier: &str) -> String {
@@ -301,7 +301,7 @@ impl GitWorktreeWorkspace {
     /// ever sees it, and outside `refs/worktree/` so it lives in the shared `.git` and
     /// outlives the worktree.
     pub fn wip_prefix(issue_id: &str) -> String {
-        format!("refs/symphony/wip/{}", Self::ref_key(issue_id, issue_id))
+        format!("refs/crew/wip/{}", Self::ref_key(issue_id, issue_id))
     }
 
     /// Commit the worktree's tracked changes and untracked, non-ignored files to a new ref
@@ -317,7 +317,7 @@ impl GitWorktreeWorkspace {
     /// worktree creates no ref and an ordinary finish gains no noise. Authored as `crewd`
     /// so it cannot be mistaken for the agent's own commit.
     fn snapshot(path: &Path, prefix: &str) -> Result<Option<String>, WorkspaceError> {
-        let index = Self::git(path, &["rev-parse", "--git-path", "symphony-wip-index"])?;
+        let index = Self::git(path, &["rev-parse", "--git-path", "crew-wip-index"])?;
         let index = path.join(index);
         let _ = std::fs::remove_file(&index);
         let env: [(&str, &std::ffi::OsStr); 5] = [
@@ -684,7 +684,7 @@ mod tests {
 
     fn tmp_root(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "symphony-ws-{}-{tag}-{:?}",
+            "crew-ws-{}-{tag}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1151,7 +1151,7 @@ mod tests {
         let fresh = ws.prepare("id-1", "MT-1").unwrap();
         let reused = ws.prepare("id-1", "MT-1").unwrap();
         let named = fresh.branch.as_deref().expect("a git worktree always has a branch");
-        assert!(named.starts_with("symphony/MT-1-"), "{named} does not name its issue");
+        assert!(named.starts_with("crew/MT-1-"), "{named} does not name its issue");
         assert_eq!(fresh.branch, reused.branch, "reuse reports the same branch as creation");
 
         std::fs::remove_dir_all(&root).ok();
@@ -1194,7 +1194,7 @@ mod tests {
     fn a_branch_names_the_issue_whose_work_it_holds() {
         // Finding a finished run's output must not mean recomputing a hash by hand.
         let branch = GitWorktreeWorkspace::branch_name("id-1", "MT-1");
-        assert!(branch.starts_with("symphony/MT-1-"), "{branch} does not name its issue");
+        assert!(branch.starts_with("crew/MT-1-"), "{branch} does not name its issue");
         assert_ne!(
             branch,
             GitWorktreeWorkspace::branch_name("id-2", "MT-1"),
@@ -1255,7 +1255,7 @@ mod tests {
             GitWorktreeWorkspace::new(&root, &repo).unwrap().prepare("id-1", "MT-1").unwrap().path;
 
         // repo inside a linked worktree, root inside it too: the exact #29 configuration.
-        let nested_root = outer.join(".symphony/workspaces");
+        let nested_root = outer.join(".crew/workspaces");
         let err = GitWorktreeWorkspace::new(&nested_root, &outer).err().expect("must be refused");
         assert!(
             matches!(err, WorkspaceError::Nested { .. }),
@@ -1280,7 +1280,7 @@ mod tests {
         );
 
         // The dogfooding shape — root under the main checkout — is not nesting.
-        let in_main = repo.join(".symphony/workspaces");
+        let in_main = repo.join(".crew/workspaces");
         GitWorktreeWorkspace::new(&in_main, &repo)
             .expect("a root inside the main checkout is fine");
 
@@ -1302,17 +1302,14 @@ mod tests {
         let ws = GitWorktreeWorkspace::new(&root, &repo).unwrap();
         let outer = ws.prepare("id-1", "MT-1").unwrap().path;
 
-        let inner_root = outer.join(".symphony/workspaces");
+        let inner_root = outer.join(".crew/workspaces");
         std::fs::create_dir_all(&inner_root).unwrap();
         let empty = inner_root.join("MT-601");
         let with_work = inner_root.join("MT-602");
+        git_in(&outer, &["worktree", "add", "-q", "-B", "crew/MT-601", empty.to_str().unwrap()]);
         git_in(
             &outer,
-            &["worktree", "add", "-q", "-B", "symphony/MT-601", empty.to_str().unwrap()],
-        );
-        git_in(
-            &outer,
-            &["worktree", "add", "-q", "-B", "symphony/MT-602", with_work.to_str().unwrap()],
+            &["worktree", "add", "-q", "-B", "crew/MT-602", with_work.to_str().unwrap()],
         );
         commit_in(&with_work, "work.txt", "a nested run's output");
         assert_eq!(registered_count(&repo), 4, "main, outer and two nested");
@@ -1321,8 +1318,8 @@ mod tests {
 
         assert!(!outer.exists());
         assert_eq!(registered_count(&repo), 1, "no registration may outlive its directory");
-        assert!(!branch_exists(&repo, "symphony/MT-601"), "a nested branch holding nothing goes");
-        assert!(branch_exists(&repo, "symphony/MT-602"), "a nested branch holding commits stays");
+        assert!(!branch_exists(&repo, "crew/MT-601"), "a nested branch holding nothing goes");
+        assert!(branch_exists(&repo, "crew/MT-602"), "a nested branch holding commits stays");
         assert!(
             !branch_exists(&repo, &GitWorktreeWorkspace::branch_name("id-1", "MT-1")),
             "the parent's own branch is treated exactly as before"

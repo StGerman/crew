@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
 
     let listener = broker::server::bind()?;
     let addr = listener.local_addr()?;
-    let dir = std::env::temp_dir().join(format!("symphony-mcp-live-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("crew-mcp-live-{}", std::process::id()));
     let broker = Arc::new(Broker::new(
         w,
         clock,
@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         blocked_by: vec![],
     };
 
-    let workspace = std::env::temp_dir().join(format!("symphony-live-ws-{}", std::process::id()));
+    let workspace = std::env::temp_dir().join(format!("crew-live-ws-{}", std::process::id()));
     std::fs::create_dir_all(&workspace)?;
 
     let session = broker.open(&issue, "live-run")?;
@@ -82,7 +82,7 @@ fn main() -> anyhow::Result<()> {
     // comes from the actual CLI, so it is also the best place to see what a transcript of one
     // looks like.
     let transcripts = crew::transcript::Transcripts::new(
-        &std::env::temp_dir().join("symphony-live-transcripts"),
+        &std::env::temp_dir().join("crew-live-transcripts"),
         8 << 20,
         10,
     )?;

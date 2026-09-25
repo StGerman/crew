@@ -637,7 +637,7 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "symphony-broker-{}-{tag}-{:?}",
+            "crew-broker-{}-{tag}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

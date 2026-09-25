@@ -300,7 +300,7 @@ impl Scheduler {
     /// iterates `running` and never sees it, and no retry row exists to bring it back. The
     /// issue silently stops being picked up, with no log line marking the moment it did.
     ///
-    /// That inverts the store's contract. Losing `symphony.db` degrades to stateless
+    /// That inverts the store's contract. Losing `crew.db` degrades to stateless
     /// re-polling; *keeping* it across a hard kill is what produces incorrect behaviour.
     ///
     /// Adopting the work is not on the table — the agent went down with its parent and there is

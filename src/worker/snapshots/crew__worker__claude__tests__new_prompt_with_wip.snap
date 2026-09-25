@@ -14,10 +14,10 @@ CREW_OUTCOME: blocked: <one-sentence reason>
 
 Earlier runs on this issue were stopped with uncommitted work, and the orchestrator saved it to the refs below, oldest first — each a commit on top of the branch head it was taken from, not on your branch. Decide whether each is still useful. To apply one: `git cherry-pick --no-commit <ref>`. Once you have applied or discarded it, delete it with `git update-ref -d <ref>` so the next run is not told about it again.
 
-`refs/symphony/wip/iss-1-abc/000001-0123456789ab`:
+`refs/crew/wip/iss-1-abc/000001-0123456789ab`:
  half.txt | 1 +
  1 file changed, 1 insertion(+)
 
-`refs/symphony/wip/iss-1-abc/000002-ba9876543210`:
+`refs/crew/wip/iss-1-abc/000002-ba9876543210`:
  src/lib.rs | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)

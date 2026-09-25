@@ -17,7 +17,7 @@ use libcrew::render;
 struct Args {
     /// The daemon's config, read only for `[api] bind` and leniently: a config the daemon would
     /// refuse to start with still says where to look.
-    #[arg(short, long, default_value = "symphony.toml", global = true)]
+    #[arg(short, long, default_value = "crew.toml", global = true)]
     config: PathBuf,
 
     /// Query this address instead of the one the config or the default names.

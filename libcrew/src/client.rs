@@ -419,8 +419,8 @@ mod tests {
     use super::*;
 
     fn write_config(name: &str, body: &str) -> PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("symphony-client-{}-{name}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("crew-client-{}-{name}.toml", std::process::id()));
         std::fs::write(&path, body).unwrap();
         path
     }
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(from_cfg.addr, "127.0.0.1:9001");
         assert_eq!(from_cfg.source, Source::Config(cfg.clone()));
 
-        let missing = endpoint(None, Path::new("/nonexistent/symphony.toml"));
+        let missing = endpoint(None, Path::new("/nonexistent/crew.toml"));
         assert_eq!(missing.addr, DEFAULT_API_BIND);
         assert_eq!(missing.source, Source::Default);
 

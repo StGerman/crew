@@ -496,7 +496,7 @@ mod tests {
             attempt: 2,
             turns: 12,
             tokens: Some(TokenUsage { input: 82_100, output: 3_400 }),
-            branch: Some("symphony/MT-601-a1b2c3d4e5f6".into()),
+            branch: Some("crew/MT-601-a1b2c3d4e5f6".into()),
             workspace: Some("/tmp/ws/MT-601-a1b2c3d4e5f6".into()),
             age_ms: 252_000,
             ..row("MT-601", Phase::Running)
@@ -507,7 +507,7 @@ mod tests {
         assert!(out.contains("attempt    2"), "{out}");
         assert!(out.contains("turns      12"), "{out}");
         assert!(out.contains("82.1k in / 3.4k out"), "{out}");
-        assert!(out.contains("symphony/MT-601-a1b2c3d4e5f6"), "{out}");
+        assert!(out.contains("crew/MT-601-a1b2c3d4e5f6"), "{out}");
         assert!(out.contains("4m12s"), "{out}");
     }
 
@@ -580,11 +580,11 @@ mod tests {
         let r = Row {
             phase: Phase::Released,
             workspace: None,
-            branch: Some("symphony/MT-9-deadbeef".into()),
+            branch: Some("crew/MT-9-deadbeef".into()),
             ..row("MT-9", Phase::Released)
         };
         let out = issue(&r);
-        assert!(out.contains("symphony/MT-9-deadbeef"), "{out}");
+        assert!(out.contains("crew/MT-9-deadbeef"), "{out}");
         assert!(!out.contains("workspace"), "a deleted worktree must not be listed: {out}");
     }
 

@@ -13,7 +13,7 @@
 //! `status` is the third surface and the odd one out: it is a *client* of a daemon in another
 //! process, so it returns before any of the setup below. It opens no store, prepares no
 //! worktree and needs no tracker credential — an operator asking what is running must not be
-//! able to disturb what is running, and a second process touching `symphony.db` while the
+//! able to disturb what is running, and a second process touching `crew.db` while the
 //! daemon holds it would be exactly that.
 
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ use tokio::sync::{mpsc, watch};
 #[command(name = "crewd", about = "Tracker-driven orchestrator for coding agents")]
 struct Args {
     /// Path to the TOML config.
-    #[arg(short, long, default_value = "symphony.toml")]
+    #[arg(short, long, default_value = "crew.toml")]
     config: PathBuf,
 
     /// Show the terminal dashboard. Without it the service runs headless and logs.
@@ -90,20 +90,16 @@ async fn main() -> anyhow::Result<()> {
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
-    let db_path = std::env::var("SYMPHONY_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("symphony.db"));
+    let db_path =
+        std::env::var("CREW_DB").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("crew.db"));
     let store = Store::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
-    let ws_root = cfg
-        .workspace
-        .root
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("symphony_workspaces"));
+    let ws_root =
+        cfg.workspace.root.clone().unwrap_or_else(|| std::env::temp_dir().join("crew_workspaces"));
     let repo = cfg.workspace.repo.clone().unwrap_or_else(|| PathBuf::from("."));
     let workspace = Arc::new(GitWorktreeWorkspace::new(&ws_root, &repo)?);
 
-    let tasks_root = std::env::var_os("SYMPHONY_TASKS_ROOT")
+    let tasks_root = std::env::var_os("CREW_TASKS_ROOT")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude/tasks")))
         .unwrap_or_else(|| PathBuf::from(".claude/tasks"));
@@ -431,7 +427,7 @@ fn start_broker(
     };
 
     // Per-process, so two orchestrators on one host cannot collide or read each other's tokens.
-    let config_dir = std::env::temp_dir().join(format!("symphony-mcp-{}", std::process::id()));
+    let config_dir = std::env::temp_dir().join(format!("crew-mcp-{}", std::process::id()));
     let limits = BrokerLimits {
         max_calls_per_run: cfg.broker.max_calls_per_run,
         max_calls_per_issue: cfg.broker.max_calls_per_issue,
