@@ -81,6 +81,25 @@ description the moment it is made, not left in a comment or in this conversation
 An issue whose body still has an unanswered question is not ready to be made dispatchable,
 whatever its milestone.
 
+## Scope check
+
+Before placing an issue, name the boundary its work lands on
+([ADR 1](../../../docs/adr/0001-extension-boundaries.md)):
+
+| Boundary | Fits when |
+|---|---|
+| **trait implementation** | a new backend behind `Tracker`, `TrackerWrites`, `Worker`, `Workspace`, `Forge`, `Gate`, `Store` or `Projector` |
+| **external command** | an operator tool that needs only the ops API: a `crewctl-<name>` program on `PATH` |
+| **hook** | a reaction to a lifecycle event that decides nothing: notifications, metrics |
+| **core change** | it closes or protects an invariant, or needs the scheduler's authority: a claim, a budget, a bound, a write on an agent's behalf |
+
+Write the boundary into the description. A one-line `**Boundary:** <name>, because <reason>`
+under the opening section is enough; for a core change, name the invariant row it adds or
+protects. An issue that needs a core change only because no hook or command exists yet
+still gets its boundary from the rule; the missing hook or command becomes its own issue,
+linked from the description. An issue that fits none of the four goes to Backlog, whatever its
+urgency sounds like.
+
 ## Placing an issue
 
 Apply this rule top-down; the first match wins.
