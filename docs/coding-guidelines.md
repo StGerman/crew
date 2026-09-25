@@ -169,7 +169,7 @@ this file.
 | `libc` | Process-group signals in `src/worker/claude.rs` | Leaves with #50 |
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
-| `ring` | RS256 signature on the GitHub App JWT (#64) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
+| `ring` | RS256 signature on the GitHub App JWT (#64), and the `crewd init` state nonce (#65) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
 | `rusqlite` (bundled) | The store | Bundled so no system SQLite is needed |
 | `rustls-pki-types` | PEM parsing of the GitHub App private key | Already in the tree under `rustls` |
 | `serde`, `serde_json` | Config, `stream-json`, MCP framing, GitHub payloads | |
@@ -179,6 +179,12 @@ this file.
 | `toml` | Config file | |
 | `tracing`, `tracing-subscriber` | Logs, always to stderr | stdout belongs to the TUI |
 | `ureq` | Blocking HTTP client over `rustls` | Chosen for the blocking API and for needing no C toolchain |
+
+`ring`, `rustls-pki-types` and `base64` arrived with `crewd init` (#65), which signs one JWT with
+the key GitHub hands back to read the new App as itself. The first two were already compiled into
+the tree by `ureq`'s TLS, so they add nothing to the build; `jsonwebtoken` was the alternative, and
+its crypto backends would add a second RSA implementation for one signature. #64 adds the same
+three for the same reason, and whichever lands second keeps one JWT signer.
 
 ### Approved to add
 
