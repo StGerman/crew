@@ -2,6 +2,9 @@
 
 use rusqlite::Connection;
 
+/// Append-only. A store records only the number of the last migration it applied, so an entry
+/// edited after it shipped is skipped for good by every store that already ran it (#81). Change
+/// the schema with a new entry, and pin its hash in `RELEASED` in the tests below.
 pub(super) const MIGRATIONS: &[&str] = &[
     // v1
     r#"
@@ -239,5 +242,40 @@ mod tests {
         migrate(&conn).unwrap();
 
         conn.prepare("SELECT model, effort FROM run").expect("v8 must add the model columns");
+    }
+
+    /// The `blake3` of each migration as it shipped, v1 first. A mismatch means a released
+    /// migration was edited; a missing entry means a new one was added without saying so.
+    const RELEASED: &[&str] = &[
+        "14e82b747db56f527afe0a5a6a0b2f94770fa7baa0d7e02aadd09f8c4d16840e", // v1
+        "2da644fc2cdfbab221193b636f6dec6914c592f7944d97e9d3e958dbc54bdc85", // v2
+        "dbba94e1a4136623100f45830f210aeb9ebae032d782965b7f19e34648af8c85", // v3
+        "9633dfbe2976eea22c539e1a43fb9c280517455d7c7840d33f1180f2382a8363", // v4
+        "67c7d584e3911b0ef33d0419694f1e73dab08a885061e58e99d25ae4a8b96c2d", // v5
+        "078f6e37cb5db33df1653342b32b1364e50d4e18662c5288f502267c24f2fdf6", // v6
+        "0fe2a0bfac334b97916fbd74b2bbe95bc849095d7c114180d8bf6700819d88b6", // v7
+        "ed7f6925c75fac094be75380ad40f558d6ba9be90f69924168a970c358393593", // v8
+    ];
+
+    #[test]
+    fn a_released_migration_is_never_edited() {
+        let hash = |sql: &str| blake3::hash(sql.as_bytes()).to_hex().to_string();
+        for (i, pinned) in RELEASED.iter().enumerate() {
+            assert_eq!(
+                hash(MIGRATIONS[i]),
+                *pinned,
+                "v{} has changed since it shipped. Stores that already applied it will never \
+                 see the edit; put the change in a new migration instead",
+                i + 1
+            );
+        }
+        if let Some(sql) = MIGRATIONS.get(RELEASED.len()) {
+            panic!(
+                "v{} has no pinned hash. Once it is final, append \"{}\" to RELEASED: from then \
+                 on it is released and never edited",
+                RELEASED.len() + 1,
+                hash(sql)
+            );
+        }
     }
 }
