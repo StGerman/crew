@@ -191,6 +191,8 @@ struct Seen {
     waits: u32,
     /// The browser has read the callback's answer.
     finished: bool,
+    /// The state this run's page carried.
+    nonce: String,
 }
 
 struct Browser {
@@ -240,6 +242,7 @@ impl Operator for Browser {
             let (status, _, page) = get(addr, "/", &host);
             record.lock().unwrap().answers.push((status, page.clone()));
             let state = page.split("state=").nth(1).unwrap().split('"').next().unwrap();
+            record.lock().unwrap().nonce = state.to_string();
             let state = if script.forge_state { "not-this-runs" } else { state };
             let (status, location, body) =
                 get(addr, &format!("/callback?code=c0de&state={state}"), &host);
@@ -293,12 +296,23 @@ fn mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+/// Refused, or answered by something that is not this run's listener: parallel tests bind
+/// ephemeral ports too, and one may be handed this port the moment it is freed.
 fn assert_closed(seen: &Arc<Mutex<Seen>>) {
-    let addr = seen.lock().unwrap().addr.unwrap();
+    let (addr, nonce) = {
+        let seen = seen.lock().unwrap();
+        (seen.addr.unwrap(), seen.nonce.clone())
+    };
     assert!(addr.ip().is_loopback(), "bound to loopback, not {addr}");
+    assert!(!nonce.is_empty());
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else { return };
+    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let _ = write!(s, "GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
     assert!(
-        TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_err(),
-        "the listener is still accepting at {addr} after the callback was handled"
+        !String::from_utf8_lossy(&raw).contains(&nonce),
+        "this run's listener is still serving at {addr} after the callback was handled"
     );
 }
 
