@@ -339,20 +339,26 @@ impl<H: Http> GithubTracker<H> {
         ])
     }
 
-    /// A 401 here means the cached token is dead, not that the next one will be.
-    fn observe(&self, resp: HttpResponse) -> HttpResponse {
-        if resp.status == 401 {
-            self.creds.invalidate();
+    /// Sends once, and once more with a fresh token if the first was refused with a 401: an
+    /// installation token revoked before its expiry would otherwise fail a poll and a broker
+    /// write that the next mint would have served. A refused request was not applied, so
+    /// repeating it is safe; a second 401 is the credential really being wrong, and stands.
+    fn authed(
+        &self,
+        send: impl Fn(&[(&str, String)]) -> Result<HttpResponse, HttpTransportError>,
+    ) -> Result<HttpResponse, TrackerError> {
+        let resp = send(&self.headers()?).map_err(|e| TrackerError::Request(e.0))?;
+        if resp.status == 401 && self.creds.invalidate() {
+            return send(&self.headers()?).map_err(|e| TrackerError::Request(e.0));
         }
-        resp
+        Ok(resp)
     }
 
     /// One authenticated GET, classified onto [`TrackerError`]. The only branch a caller needs
     /// to handle specially beyond this is "404 on a single-issue fetch", which `by_ids` treats
     /// as absence rather than as an error.
     fn request(&self, url: &str) -> Result<HttpResponse, TrackerError> {
-        let resp = self.http.get(url, &self.headers()?).map_err(|e| TrackerError::Request(e.0))?;
-        classify(self.observe(resp))
+        classify(self.authed(|h| self.http.get(url, h))?)
     }
 
     /// One authenticated write, classified the same way a read is — so a broker tool failing
@@ -361,11 +367,7 @@ impl<H: Http> GithubTracker<H> {
     fn write(&self, method: &str, url: &str, body: &Value) -> Result<HttpResponse, TrackerError> {
         let payload =
             serde_json::to_vec(body).map_err(|e| TrackerError::Response(e.to_string()))?;
-        let resp = self
-            .http
-            .send_json(method, url, &self.headers()?, &payload)
-            .map_err(|e| TrackerError::Request(e.0))?;
-        classify(self.observe(resp))
+        classify(self.authed(|h| self.http.send_json(method, url, h, &payload))?)
     }
 
     fn number_for(&self, issue_id: &str) -> Result<u64, TrackerError> {
@@ -387,10 +389,7 @@ impl<H: Http> GithubTracker<H> {
         };
 
         let url = format!("{API_BASE}/repos/{}/{}/issues/{number}", self.owner, self.repo);
-        let resp = match self.http.get(&url, &self.headers()?) {
-            Ok(r) => self.observe(r),
-            Err(e) => return Err(TrackerError::Request(e.0)),
-        };
+        let resp = self.authed(|h| self.http.get(&url, h))?;
         if resp.status == 404 {
             return Ok(None); // genuinely gone: the caller's grace-count path handles this
         }
@@ -1027,6 +1026,11 @@ mod app_tests {
             self.state.lock().0
         }
 
+        /// GitHub revoking the live token before its expiry.
+        fn revoke(&self) {
+            self.state.lock().1 = None;
+        }
+
         fn queries(&self) -> Vec<String> {
             self.state.lock().2.iter().cloned().collect()
         }
@@ -1123,6 +1127,20 @@ mod app_tests {
         assert!(gh.mints() >= 36, "one mint per hour, not one per process: {}", gh.mints());
         let per_token_ms = (36 * 3_600_000) / i64::from(gh.mints() - 1);
         assert!(per_token_ms >= 3_600_000 - REFRESH_MARGIN_MS - 30_000, "not minted per poll");
+    }
+
+    #[test]
+    fn a_token_revoked_before_its_expiry_is_re_minted_within_the_same_poll() {
+        let clock = Arc::new(FakeClock::new());
+        let gh = Github::new(clock.clone(), json!([issue(1, &[], &["someone"])]));
+        let t = app_tracker(clock, &gh);
+        let open = ["open".to_string()];
+        t.by_states(&open).unwrap();
+
+        gh.revoke();
+        t.by_states(&open).expect("a revoked token costs one retry, not a failed poll");
+        assert_eq!(gh.mints(), 2);
+        assert_eq!(gh.queries().len(), 3, "the refused request is repeated exactly once");
     }
 
     fn by_label(label: Option<&str>) -> DispatchRule {

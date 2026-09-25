@@ -81,8 +81,11 @@ pub trait Credentials: Send + Sync {
     fn token(&self) -> Result<String, CredentialError>;
 
     /// The provider answered 401 to the last token: a revoked installation token would otherwise
-    /// be served from the cache until its own expiry.
-    fn invalidate(&self) {}
+    /// be served from the cache until its own expiry. `true` when the next `token` may differ,
+    /// which is what makes retrying the refused request worth one more call.
+    fn invalidate(&self) -> bool {
+        false
+    }
 }
 
 /// A personal or fine-grained token from `GITHUB_TOKEN`, which does not expire on any scale this
@@ -290,8 +293,9 @@ impl<H: Http> Credentials for GithubApp<H> {
         Ok(token)
     }
 
-    fn invalidate(&self) {
+    fn invalidate(&self) -> bool {
         *self.cached.lock() = None;
+        true
     }
 }
 
