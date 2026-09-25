@@ -22,7 +22,7 @@ use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
 use symphony_cc::model::Issue;
 use symphony_cc::worker::claude::{ClaudeWorker, DEFAULT_ENV_ALLOWLIST};
-use symphony_cc::worker::{Session, Worker};
+use symphony_cc::worker::{Session, Spawn, Worker};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -94,16 +94,16 @@ fn main() -> anyhow::Result<()> {
         println!("transcript: {}", t.path().display());
     }
 
-    let handle = worker.spawn(
-        &issue,
-        &workspace,
-        0,
-        &Session::New(symphony_cc::model::session_id("live", 1)),
-        Some(session.endpoint()),
+    let handle = worker.spawn(Spawn {
+        tools: Some(session.endpoint()),
         transcript,
-        None,
-        None,
-    );
+        ..Spawn::new(
+            &issue,
+            &workspace,
+            0,
+            &Session::New(symphony_cc::model::session_id("live", 1)),
+        )
+    });
 
     let deadline = Instant::now() + Duration::from_secs(180);
     let outcome = loop {

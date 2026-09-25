@@ -90,14 +90,15 @@
 //! like every other line.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{
-    KillResult, Progress, RateLimitSignal, RunHandle, Session, TokenUsage, ToolEndpoint, Worker,
+    KillResult, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage, ToolEndpoint,
+    Worker,
 };
 use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, ReviewVerdict, Verdict, looks_like_commit,
@@ -245,17 +246,9 @@ impl RunHandle for ClaudeRun {
 }
 
 impl Worker for ClaudeWorker {
-    fn spawn(
-        &self,
-        issue: &Issue,
-        workspace: &Path,
-        attempt: u32,
-        session: &Session,
-        tools: Option<&ToolEndpoint>,
-        mut transcript: Option<TranscriptWriter>,
-        feedback: Option<&Feedback>,
-        wip: Option<&WipSnapshot>,
-    ) -> Arc<dyn RunHandle> {
+    fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
+        let Spawn { issue, workspace, attempt, session, tools, mut transcript, feedback, wip } =
+            req;
         // `--resume` is passed with an explicit id, never bare: bare opens an interactive
         // picker, and there is no human here to answer it.
         let (prompt, flag) = match session {
@@ -803,6 +796,7 @@ fn tool_help(tools: Option<&ToolEndpoint>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Instant;
 
     use super::*;
@@ -867,7 +861,7 @@ mod tests {
         // The two disagree on purpose, so this test can only pass by reading the right one.
         let ws = tmp_workspace("done");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let p = h.progress();
@@ -889,7 +883,7 @@ mod tests {
         // long tool call reads as silent.
         let ws = tmp_workspace("events");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -905,7 +899,7 @@ mod tests {
         // number; the number would be wrong by the turn count, so the honest report is none.
         let ws = tmp_workspace("no-total");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         wait_for_finish(&h);
         let p = h.progress();
@@ -919,7 +913,7 @@ mod tests {
     fn a_symphony_outcome_continue_marker_is_parsed_from_the_final_text() {
         let ws = tmp_workspace("continue");
         let w = ClaudeWorker::new(fixture("explicit_continue.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         assert_eq!(
             wait_for_finish(&h),
@@ -934,7 +928,7 @@ mod tests {
     {
         let ws = tmp_workspace("verdicts");
         let w = ClaudeWorker::new(fixture("review_verdicts.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         let v = h.verdicts();
@@ -979,7 +973,7 @@ mod tests {
     fn a_run_handed_no_review_reports_no_verdicts() {
         let ws = tmp_workspace("no-verdicts");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
         wait_for_finish(&h);
         assert!(h.verdicts().is_empty());
         std::fs::remove_dir_all(&ws).ok();
@@ -1056,7 +1050,7 @@ mod tests {
     fn a_crash_with_no_result_event_fails_rather_than_hanging_or_inferring_done() {
         let ws = tmp_workspace("crash");
         let w = ClaudeWorker::new(fixture("crash_mid_stream.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         let outcome = wait_for_finish(&h);
         assert!(
@@ -1074,7 +1068,7 @@ mod tests {
     fn a_rejected_rate_limit_is_reported_alongside_the_crash_it_causes() {
         let ws = tmp_workspace("rate-limited");
         let w = ClaudeWorker::new(fixture("rate_limited.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         let outcome = wait_for_finish(&h);
         assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentCrash, .. }));
@@ -1123,7 +1117,7 @@ mod tests {
     fn a_partial_trailing_line_is_skipped_not_fatal_to_the_supervisor() {
         let ws = tmp_workspace("partial");
         let w = ClaudeWorker::new(fixture("partial_trailing_line.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         // The point under test is that a malformed final line does not panic or hang the
         // reader thread — it still reaches a verdict (Failed, since no result event arrived).
@@ -1137,7 +1131,7 @@ mod tests {
     fn killing_a_process_that_ignores_sigterm_forces_it_and_it_is_actually_gone() {
         let ws = tmp_workspace("silence");
         let w = ClaudeWorker::new(fixture("silence.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         // Give the script time to install its SIGTERM trap and write its own pid before we
         // try to kill it.
@@ -1173,7 +1167,7 @@ mod tests {
         ] {
             let ws = tmp_workspace(flag.trim_start_matches('-'));
             let w = ClaudeWorker::new(fixture("dump_argv.sh"), vec!["PATH".into()], 0);
-            let h = w.spawn(&issue(), &ws, 0, &session, None, None, None, None);
+            let h = w.spawn(Spawn::new(&issue(), &ws, 0, &session));
             wait_for_finish(&h);
 
             let dump = std::fs::read_to_string(ws.join("argv_dump.txt")).unwrap();
@@ -1201,7 +1195,7 @@ mod tests {
         }
 
         let w = ClaudeWorker::new(fixture("dump_env.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
         wait_for_finish(&h);
 
         let dump = std::fs::read_to_string(ws.join("env_dump.txt")).unwrap();
@@ -1221,7 +1215,7 @@ mod tests {
         // first and report Continue rather than waiting for (or trusting) the CLI's own exit.
         let ws = tmp_workspace("budget");
         let w = ClaudeWorker::new(fixture("clean_done.sh"), vec!["PATH".into()], 1);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         assert_eq!(
             wait_for_finish(&h),
@@ -1243,7 +1237,10 @@ mod tests {
         let path = log.path().to_path_buf();
 
         let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 2, &fresh_session(), None, Some(log), None, None);
+        let h = w.spawn(Spawn {
+            transcript: Some(log),
+            ..Spawn::new(&issue(), &ws, 2, &fresh_session())
+        });
         assert_eq!(wait_for_finish(&h), Outcome::Done);
 
         // The reader thread owns the writer, so the file is only certainly complete once the
@@ -1280,7 +1277,7 @@ mod tests {
         // the record and nothing else.
         let ws = tmp_workspace("no-transcript");
         let w = ClaudeWorker::new(fixture("chatty_done.sh"), vec!["PATH".into()], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         assert_eq!(wait_for_finish(&h), Outcome::Done);
         assert_eq!(h.progress().turns, 2);
@@ -1292,7 +1289,7 @@ mod tests {
     fn a_missing_binary_reports_agent_not_found_immediately() {
         let ws = tmp_workspace("missing-bin");
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, None, None, None);
+        let h = w.spawn(Spawn::new(&issue(), &ws, 0, &fresh_session()));
 
         let outcome = wait_for_finish(&h);
         assert!(matches!(outcome, Outcome::Failed { class: ErrorClass::AgentNotFound, .. }));
@@ -1311,7 +1308,10 @@ mod tests {
         let path = log.path().to_path_buf();
 
         let w = ClaudeWorker::new("/definitely/not/a/real/claude/binary", vec![], 0);
-        let h = w.spawn(&issue(), &ws, 0, &fresh_session(), None, Some(log), None, None);
+        let h = w.spawn(Spawn {
+            transcript: Some(log),
+            ..Spawn::new(&issue(), &ws, 0, &fresh_session())
+        });
         assert!(matches!(
             wait_for_finish(&h),
             Outcome::Failed { class: ErrorClass::AgentNotFound, .. }
