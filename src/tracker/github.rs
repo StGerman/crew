@@ -111,7 +111,16 @@ impl Default for UreqHttp {
         // headers — exactly the rate-limit header and body snippet `request()` needs to
         // classify the failure. Disabling it is what makes every status code, not just 2xx,
         // arrive as an ordinary `HttpResponse` for this adapter to read.
-        let config = ureq::Agent::config_builder().http_status_as_error(false).build();
+        //
+        // A renamed repo makes every call 301 to `/repositories/<id>/...`; ureq's own default
+        // (`RedirectAuthHeaders::Never`) never forwards `Authorization` on that redirect, so the
+        // retry lands anonymous and burns the 60/hour IP-keyed limit in minutes (#68). `SameHost`
+        // keeps the header only when the redirect stays on the same host under HTTPS, which is
+        // this case, without weakening the cross-host protection the default exists for.
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
+            .build();
         Self { agent: ureq::Agent::new_with_config(config) }
     }
 }
@@ -909,5 +918,67 @@ mod ureq_http_tests {
         let resp = http.get(&format!("http://127.0.0.1:{port}/"), &[]).unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"{\"ok\": true}\n");
+    }
+
+    /// Answers one request with `200` and reports the `Authorization` header it carried, if any.
+    fn capture_authorization() -> (u16, std::sync::mpsc::Receiver<Option<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let auth = request
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("authorization: ").or(l.strip_prefix("Authorization: "))
+                })
+                .map(str::to_owned);
+            tx.send(auth).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        });
+        (port, rx)
+    }
+
+    /// A `301` to `location`, closing the connection so the redirected request opens a new one.
+    fn redirect_once(location: String) -> u16 {
+        let response = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        serve_once(Box::leak(response.into_boxed_str()))
+    }
+
+    #[test]
+    fn a_same_host_redirect_keeps_the_authorization_header() {
+        // #68: a renamed repo 301s every call; losing the token on that hop sends the retry to
+        // the anonymous 60/hour limit.
+        let (target, auth) = capture_authorization();
+        let port = redirect_once(format!("http://127.0.0.1:{target}/repositories/1/issues"));
+        let resp = UreqHttp::default()
+            .get(
+                &format!("http://127.0.0.1:{port}/repos/o/old-name/issues"),
+                &[("Authorization", "Bearer t0ken".to_string())],
+            )
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(auth.recv().unwrap().as_deref(), Some("Bearer t0ken"));
+    }
+
+    #[test]
+    fn a_cross_host_redirect_still_drops_the_authorization_header() {
+        // `localhost` and `127.0.0.1` reach the same socket but are different hosts to ureq,
+        // which is exactly the comparison that keeps the token off a third-party redirect.
+        let (target, auth) = capture_authorization();
+        let port = redirect_once(format!("http://localhost:{target}/elsewhere"));
+        let resp = UreqHttp::default()
+            .get(
+                &format!("http://127.0.0.1:{port}/repos/o/r/issues"),
+                &[("Authorization", "Bearer t0ken".to_string())],
+            )
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(auth.recv().unwrap(), None, "the token must not follow a redirect off-host");
     }
 }
