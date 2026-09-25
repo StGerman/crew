@@ -41,7 +41,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 268 unit + 99 integration, all three packages
+cargo test                                 # 289 unit + 99 integration, all three packages
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
