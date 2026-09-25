@@ -791,16 +791,14 @@ mod tests {
     fn a_misspelled_tracker_kind_is_rejected_rather_than_running_the_demo() {
         let mut c = base();
         c.tracker.kind = "gihub".into();
-        let err = c.preflight().unwrap_err().to_string();
-        assert!(err.contains("gihub") && err.contains("github"), "{err}");
+        insta::assert_snapshot!("misspelled_tracker_kind", c.preflight().unwrap_err());
     }
 
     #[test]
     fn a_misspelled_worker_kind_is_rejected_rather_than_running_the_fake() {
         let mut c = base();
         c.worker.kind = "cluade".into();
-        let err = c.preflight().unwrap_err().to_string();
-        assert!(err.contains("cluade") && err.contains("claude"), "{err}");
+        insta::assert_snapshot!("misspelled_worker_kind", c.preflight().unwrap_err());
     }
 
     #[test]
