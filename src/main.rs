@@ -27,7 +27,7 @@ use symphony_cc::api::{Api, Command, render};
 use symphony_cc::broker::fake::FakeWrites;
 use symphony_cc::broker::{self, Broker, BrokerLimits, TrackerWrites};
 use symphony_cc::clock::{Clock, SystemClock};
-use symphony_cc::config::Config;
+use symphony_cc::config::{Config, TrackerKind, WorkerKind};
 use symphony_cc::forge::fake::FakeForge;
 use symphony_cc::forge::github::GithubForge;
 use symphony_cc::forge::{Forge, Publisher};
@@ -148,59 +148,70 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let use_real_worker = cfg.worker.kind.trim().eq_ignore_ascii_case("claude");
-    let use_github_tracker = cfg.tracker.kind.trim().eq_ignore_ascii_case("github");
+    // `Config::load` ran preflight, which parses both; matching on the enums rather than a
+    // string comparison is what keeps a new kind from falling through to the fake (#69).
+    let worker_kind = cfg.worker.kind()?;
+    let tracker_kind = cfg.tracker.kind()?;
 
     // Deliberately independent of the tracker: see WorkerConfig's doc for why a real tracker
     // does not imply a real worker.
-    let worker: Arc<dyn Worker> = if use_real_worker {
-        let bin = cfg.worker.bin.clone().unwrap_or_else(|| "claude".to_string());
-        // An operator-supplied list replaces the default outright rather than extending it, so
-        // what reaches the child is exactly what the config says.
-        let env_allowlist = cfg
-            .worker
-            .env_allowlist
-            .clone()
-            .unwrap_or_else(|| DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect());
-        Arc::new(ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session))
-    } else {
-        let fake = Arc::new(FakeWorker::new(clock.clone()));
-        // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
-        // silently ignored, since none of those ids would ever be dispatched) against a real
-        // tracker's real ids.
-        if !use_github_tracker {
-            seed_demo_scripts(&fake);
+    let worker: Arc<dyn Worker> = match worker_kind {
+        WorkerKind::Claude => {
+            let bin = cfg.worker.bin.clone().unwrap_or_else(|| "claude".to_string());
+            // An operator-supplied list replaces the default outright rather than extending it,
+            // so what reaches the child is exactly what the config says.
+            let env_allowlist =
+                cfg.worker.env_allowlist.clone().unwrap_or_else(|| {
+                    DEFAULT_ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect()
+                });
+            Arc::new(ClaudeWorker::new(bin, env_allowlist, cfg.agent.max_turns_per_session))
         }
-        fake
+        WorkerKind::Fake => {
+            let fake = Arc::new(FakeWorker::new(clock.clone()));
+            // The demo scripts are keyed to FakeTracker::demo()'s own issue ids; pointless (and
+            // silently ignored, since none of those ids would ever be dispatched) against a
+            // real tracker's real ids.
+            if tracker_kind == TrackerKind::Fake {
+                seed_demo_scripts(&fake);
+            }
+            fake
+        }
     };
 
     // One adapter, two traits: the GitHub tracker reads for the scheduler and writes for the
     // broker over the same credential, which never leaves this process either way.
     let (tracker, writes, forge): (Arc<dyn Tracker>, Arc<dyn TrackerWrites>, Arc<dyn Forge>) =
-        if use_github_tracker {
-            let token = std::env::var("GITHUB_TOKEN")
-                .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
-            let gh = Arc::new(GithubTracker::new(
-                UreqHttp::default(),
-                &cfg.tracker.owner,
-                &cfg.tracker.repo,
-                &token,
-                &cfg.tracker.required_labels,
-            ));
-            // The forge is the same repository on GitHub, so the same credential; on any
-            // other provider it would be a separate adapter with its own.
-            let forge = Arc::new(GithubForge::new(
-                UreqHttp::default(),
-                &cfg.tracker.owner,
-                &cfg.tracker.repo,
-                &token,
-            ));
-            (gh.clone(), gh, forge)
-        } else {
-            // The demo tracker has nothing to write to, so broker calls are recorded and
-            // dropped. That still exercises the whole path — scoping, budgets, audit — without
-            // a network. The fake forge likewise: green CI, reviewers that attach.
-            (Arc::new(FakeTracker::demo()), Arc::new(FakeWrites::new()), Arc::new(FakeForge::new()))
+        match tracker_kind {
+            TrackerKind::Github => {
+                let token = std::env::var("GITHUB_TOKEN")
+                    .context("GITHUB_TOKEN must be set when tracker.kind = \"github\"")?;
+                let gh = Arc::new(GithubTracker::new(
+                    UreqHttp::default(),
+                    &cfg.tracker.owner,
+                    &cfg.tracker.repo,
+                    &token,
+                    &cfg.tracker.required_labels,
+                ));
+                // The forge is the same repository on GitHub, so the same credential; on any
+                // other provider it would be a separate adapter with its own.
+                let forge = Arc::new(GithubForge::new(
+                    UreqHttp::default(),
+                    &cfg.tracker.owner,
+                    &cfg.tracker.repo,
+                    &token,
+                ));
+                (gh.clone(), gh, forge)
+            }
+            TrackerKind::Fake => {
+                // The demo tracker has nothing to write to, so broker calls are recorded and
+                // dropped. That still exercises the whole path — scoping, budgets, audit —
+                // without a network. The fake forge likewise: green CI, reviewers that attach.
+                (
+                    Arc::new(FakeTracker::demo()),
+                    Arc::new(FakeWrites::new()),
+                    Arc::new(FakeForge::new()),
+                )
+            }
         };
 
     // Best-effort, like the projector: a root that cannot be created costs post-mortems, not
@@ -230,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if use_real_worker && use_github_tracker {
+    if worker_kind == WorkerKind::Claude && tracker_kind == TrackerKind::Github {
         tracing::warn!(
             "real tracker + real worker: this run will dispatch actual coding agents against \
              real issues and let them commit to real worktrees"
