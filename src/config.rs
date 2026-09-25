@@ -793,7 +793,7 @@ mod tests {
     fn a_model_setting_the_cli_would_silently_ignore_is_refused_at_load() {
         let with = |worker: &str| {
             toml::from_str::<Config>(&format!(
-                "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\n[worker]\n{worker}"
+                "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\nterminal_states = [\"closed\"]\n[worker]\n{worker}"
             ))
         };
         // The CLI answers an unknown `--effort` with a stderr warning and the default effort,
