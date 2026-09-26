@@ -1120,6 +1120,7 @@ fn a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths() {
     let (mut h, gate) = gated_harness(|c| c.gate.base = Some("master".into()));
     gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
         paths: vec!["src/sched/mod.rs".into(), "CLAUDE.md".into()],
+        base_sha: BASE.into(),
     }));
     dispatch_and_finish(&mut h);
     h.clock.advance_ms(1_000);
@@ -1141,6 +1142,173 @@ fn a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths() {
         h.sched.tick().unwrap();
         assert_eq!(h.sched.running_count() + h.sched.gating_count(), 0, "blocked stays parked");
     }
+}
+
+const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+
+fn resolvable(c: &mut Config) {
+    c.gate.base = Some("master".into());
+    c.gate.agent_resolvable =
+        vec!["CLAUDE.md".into(), "docs/**".into(), "src/store/schema.rs".into()];
+}
+
+/// Two branches appending to the same invariant table is not a human's problem (#111): the
+/// agent that wrote one of them is handed the conflict back as a continuation, told the base,
+/// the paths and that the rebase was aborted — `GitGate` aborts before any verdict, which is
+/// what `a_conflicting_rebase_is_aborted_and_names_the_conflicted_paths` guards, so the branch
+/// is the one the agent committed.
+#[test]
+fn a_conflict_confined_to_agent_resolvable_paths_is_handed_back_to_the_agent() {
+    let (mut h, gate) = gated_harness(resolvable);
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["CLAUDE.md".into()],
+        base_sha: BASE.into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::RetryQueued, "a resolvable conflict is a continuation");
+    assert_eq!(st.parked_state, None, "and does not park");
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs[0].outcome.as_deref(), Some("continue"));
+
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "the continuation is dispatched");
+    assert!(matches!(h.worker.sessions_for("iss-1")[1], Session::Resume(_)));
+    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+        panic!("the continuation must be told about the conflict");
+    };
+    assert!(output.contains("CLAUDE.md"), "which paths: {output}");
+    assert!(output.contains("master"), "onto which base: {output}");
+    assert!(output.contains(&format!("git rebase {BASE}")), "by commit, not ref: {output}");
+    assert!(output.contains("aborted") && output.contains("where you left it"), "{output}");
+    assert!(output.contains("1 of 3"), "and how many tries are left: {output}");
+    assert!(!output.contains("RELEASED"), "the migration rule only when schema.rs conflicts");
+}
+
+/// With `gate.base` unset the gate rebased onto `workspace.repo`'s HEAD; in the agent's own
+/// worktree `HEAD` is its branch, so a brief saying `git rebase HEAD` is a no-op that leaves
+/// the conflict to recur. The brief names the commit the gate actually tried.
+#[test]
+fn a_conflict_brief_with_no_configured_base_names_the_commit_not_head() {
+    let (mut h, gate) = gated_harness(|c| {
+        resolvable(c);
+        c.gate.base = None;
+    });
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["CLAUDE.md".into()],
+        base_sha: BASE.into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+        panic!("the continuation must be told about the conflict");
+    };
+    assert!(output.contains(&format!("git rebase {BASE}")), "{output}");
+    assert!(!output.contains("git rebase HEAD"), "{output}");
+}
+
+/// A rebase the gate could not abort leaves the worktree mid-rebase — not the branch the agent
+/// left, and not a tree any brief describes — so it is a human's even when every conflicted
+/// path is on the agent's list.
+#[test]
+fn a_rebase_the_gate_could_not_abort_blocks_for_a_human_even_on_resolvable_paths() {
+    let (mut h, gate) = gated_harness(resolvable);
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Stuck {
+        step: "rebase onto master".into(),
+        output: "`git rebase --abort` left it in progress: index.lock exists".into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"), "parked Blocked");
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "no continuation into it");
+    let note = st.last_error.expect("the reason must reach the dashboard");
+    assert!(note.contains("index.lock"), "{note}");
+}
+
+/// A renumbering is mechanical, but a migration is a one-way door: the brief states the rule
+/// the gate's own `a_released_migration_is_never_edited` would otherwise teach by failing.
+#[test]
+fn a_schema_conflict_brief_names_the_released_migration_rule() {
+    let (mut h, gate) = gated_harness(resolvable);
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["src/store/schema.rs".into(), "docs/adr/0001-x.md".into()],
+        base_sha: BASE.into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+        panic!("the continuation must be told about the conflict");
+    };
+    assert!(output.contains("never be edited") && output.contains("RELEASED"), "{output}");
+}
+
+/// The list narrows which conflicts are the agent's; it does not make a partly-listed one so.
+#[test]
+fn a_conflict_touching_any_other_path_still_blocks_for_a_human() {
+    let (mut h, gate) = gated_harness(resolvable);
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["CLAUDE.md".into(), "src/sched/mod.rs".into()],
+        base_sha: BASE.into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"), "parked Blocked, as before #111");
+    assert!(h.sched.store().all_retries().unwrap().is_empty());
+    let note = st.last_error.expect("the reason must reach the dashboard");
+    assert!(note.contains("src/sched/mod.rs") && note.contains("CLAUDE.md"), "{note}");
+}
+
+/// A resolvable conflict the agent keeps failing to resolve is a gate failure like any other,
+/// so `max_failures` hands it to a human instead of re-dispatching it forever.
+#[test]
+fn repeated_unresolved_docs_conflicts_escalate_to_blocked() {
+    let (mut h, gate) = gated_harness(|c| {
+        resolvable(c);
+        c.gate.max_failures = 2;
+    });
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["docs/coding-guidelines.md".into()],
+        base_sha: BASE.into(),
+    }));
+
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().phase, Phase::RetryQueued);
+
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.gating_count(), 1);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released, "the second unresolved conflict blocks");
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "no third try");
+    let note = st.last_error.expect("the escalation must say why");
+    assert!(note.contains("2 time(s)") && note.contains("docs/coding-guidelines.md"), "{note}");
+    assert!(!note.contains("git rebase --continue"), "the human is not sent the agent's brief");
+    assert_eq!(gate.starts_for("iss-1").len(), 2);
 }
 
 /// A failing command is the agent's problem: the verdict is `Continue`, and the continuation
