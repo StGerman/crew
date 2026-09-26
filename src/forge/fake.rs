@@ -82,7 +82,7 @@ struct Inner {
     /// Makes `reply` alone fail: the network dropping exactly the write that carries a verdict
     /// to its reviewer, while every read still answers.
     fail_reply: Option<ForgeError>,
-    /// Makes `resolve_thread` alone fail.
+    /// Makes `resolve_threads` alone fail.
     fail_resolve: Option<ForgeError>,
     /// `(number, comment_id)` of every thread resolved.
     resolved: HashSet<(u64, String)>,
@@ -192,7 +192,7 @@ impl FakeForge {
         self.inner.lock().unwrap().fail_reply = e;
     }
 
-    /// Make only `resolve_thread` fail until cleared.
+    /// Make only `resolve_threads` fail until cleared.
     pub fn fail_resolve_with(&self, e: Option<ForgeError>) {
         self.inner.lock().unwrap().fail_resolve = e;
     }
@@ -415,14 +415,19 @@ impl Forge for FakeForge {
         Ok(())
     }
 
-    fn resolve_thread(&self, number: u64, comment_id: &str) -> Result<(), ForgeError> {
+    fn resolve_threads(&self, number: u64, comment_ids: &[String]) -> Vec<Result<(), ForgeError>> {
         let mut g = self.inner.lock().unwrap();
-        Self::gate(&g)?;
-        g.ops.push(Op::Resolve { number, comment_id: comment_id.into() });
-        if let Some(e) = &g.fail_resolve {
-            return Err(e.clone());
-        }
-        g.resolved.insert((number, comment_id.to_string()));
-        Ok(())
+        comment_ids
+            .iter()
+            .map(|comment_id| {
+                Self::gate(&g)?;
+                g.ops.push(Op::Resolve { number, comment_id: comment_id.clone() });
+                if let Some(e) = &g.fail_resolve {
+                    return Err(e.clone());
+                }
+                g.resolved.insert((number, comment_id.clone()));
+                Ok(())
+            })
+            .collect()
     }
 }
