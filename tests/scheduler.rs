@@ -661,6 +661,37 @@ fn a_waiting_continuation_survives_one_tracker_omission_with_its_slot() {
     assert!(h.worker.sessions_for("iss-2").is_empty());
 }
 
+/// Reservations follow their ticket's state, so two can land in a state whose limit holds one.
+/// Each counting the other would defer both forever; the earliest due goes first instead.
+#[test]
+fn reservations_oversubscribing_a_state_limit_dispatch_in_due_order_rather_than_deadlocking() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |c| {
+            c.agent.max_concurrent = 2;
+            c.tracker.active_states.push("review".into());
+            c.agent.max_concurrent_by_state.insert("review".into(), 1);
+        });
+    let cont = |ms| Script::succeeds_in(ms).with_outcome(Outcome::Continue { why: "more".into() });
+    h.worker.script("iss-1", cont(1_000));
+    h.worker.script("iss-2", cont(2_000));
+
+    h.sched.tick().unwrap(); // both dispatched
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // A continues, due at 6s
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // B continues, due at 7s
+
+    h.tracker.set_state("iss-1", "Review");
+    h.tracker.set_state("iss-2", "Review");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // both reservations now count against review's one slot
+
+    h.clock.advance_ms(3_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "the earliest due reservation launches");
+    assert_eq!(h.worker.sessions_for("iss-2").len(), 1, "the later one waits behind it");
+}
+
 /// A failure backoff grows to minutes, so a reservation there would let one failing issue hold
 /// capacity hostage (#86): only a continuation keeps its slot.
 #[test]

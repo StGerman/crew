@@ -1152,7 +1152,7 @@ impl Scheduler {
             refreshed.into_iter().map(|i| (i.id.clone(), i)).collect();
         let mut reserved = self.reservations()?;
 
-        for entry in pending {
+        for (i, entry) in pending.iter().enumerate() {
             let Some(issue) = by_id.get(&entry.issue_id) else {
                 // One omission is not proof the ticket is gone (`refresh_miss_grace` exists for
                 // exactly that), so a reservation still waiting keeps its slot and its retry;
@@ -1210,9 +1210,22 @@ impl Scheduler {
             }
 
             // Its own reservation is the slot it is about to take, so it does not count
-            // against itself.
+            // against itself. Nor do the reservations queued behind it: when a state change
+            // leaves more reservations than a limit allows, each counting the others would
+            // defer every one of them forever, so the earliest due goes first. A failure
+            // retry has no place in that queue and counts them all.
             let own = reserved.remove(&issue.id);
-            if self.global_slots(&reserved) == 0 || self.state_slots(&key, &reserved) == 0 {
+            let counted: Reservations = if own.is_some() {
+                let ahead: Vec<&str> = pending[..i].iter().map(|e| e.issue_id.as_str()).collect();
+                reserved
+                    .iter()
+                    .filter(|(id, _)| ahead.contains(&id.as_str()))
+                    .map(|(id, k)| (id.clone(), k.clone()))
+                    .collect()
+            } else {
+                reserved.clone()
+            };
+            if self.global_slots(&counted) == 0 || self.state_slots(&key, &counted) == 0 {
                 // Leave the entry in place; it is already due and will be retried next tick.
                 tracing::debug!(issue_id = %issue.id, "no slots for retry; deferring");
                 if let Some(k) = own {
