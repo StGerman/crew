@@ -76,6 +76,10 @@ struct GhPullRequest {
     merged_at: Option<String>,
     #[serde(default)]
     requested_reviewers: Vec<GhUser>,
+    #[serde(default)]
+    mergeable: Option<bool>,
+    #[serde(default)]
+    mergeable_state: Option<String>,
 }
 
 /// `merged`/`merged_at` win over `state`: GitHub reports a merged pull request's `state` as
@@ -96,6 +100,13 @@ fn to_pull_request(gh: GhPullRequest) -> PullRequest {
         base: gh.base.r#ref,
         state,
         requested_reviewers: gh.requested_reviewers.into_iter().map(|u| u.login).collect(),
+        // `dirty` is GitHub's word for a merge conflict, and can arrive with `mergeable` still
+        // unset; any other state leaves the boolean to speak.
+        mergeable: if gh.mergeable_state.as_deref() == Some("dirty") {
+            Some(false)
+        } else {
+            gh.mergeable
+        },
     }
 }
 
