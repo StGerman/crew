@@ -232,6 +232,16 @@ impl GateRun {
             return stopped("check the branch against the base", false);
         }
         let rebased = if contains_base {
+            // A rebase paused cleanly — an `exec` stop, a resolution committed by hand — leaves
+            // `HEAD` a replayed commit on the base and nothing for `status` to report, and would
+            // otherwise be handed off with the rest of the branch never replayed.
+            if self.rebase_in_progress(ws) {
+                return Verdict::Stuck {
+                    step: "check the branch against the base".into(),
+                    output: "the worktree is in the middle of a rebase that was never finished"
+                        .into(),
+                };
+            }
             // Skipping the rebase skips its refusal of a dirty tree too, and delivery pushes
             // `HEAD` alone: a tracked edit left uncommitted would pass the gate and never ship.
             if let Some(verdict) = self.uncommitted(ws) {
@@ -604,6 +614,25 @@ mod tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         assert!(!wt.join("gate-ran").exists(), "the commands do not run on an unshippable tree");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worktree paused mid-rebase can already sit on the base with a clean status; the
+    /// no-rebase path must not run the gate on it and pass what is half a branch.
+    #[test]
+    fn a_worktree_paused_mid_rebase_on_the_base_is_stuck_rather_than_passed() {
+        let (dir, repo, wt) = repo_and_worktree("paused-rebase");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        commit(&wt, "more.txt", "more\n", "more of the agent's work");
+        commit(&repo, "from_master.txt", "moved\n", "master moved on");
+        assert!(git(&wt, &["rebase", "-q", "-x", "false", "master"]).is_err(), "must pause");
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])]);
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        assert!(matches!(verdict, Verdict::Stuck { .. }), "got {verdict:?}");
+        assert!(!wt.join("gate-ran").exists(), "an unfinished rebase is not gated");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
