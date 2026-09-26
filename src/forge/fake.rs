@@ -42,6 +42,11 @@ pub enum Op {
         comment_id: String,
         body: String,
     },
+    /// A comment on the pull request's own conversation, not on any thread.
+    Comment {
+        number: u64,
+        body: String,
+    },
     /// Recorded for every call, including one on a thread already resolved, so a test can
     /// count attempts as well as outcomes.
     Resolve {
@@ -79,7 +84,7 @@ struct Inner {
     /// a test that is about it scripts the set.
     on_branch: Option<HashSet<String>>,
     fail: Option<ForgeError>,
-    /// Makes `reply` alone fail: the network dropping exactly the write that carries a verdict
+    /// Makes `reply` and `comment` alone fail: the network dropping exactly the write that carries a verdict
     /// to its reviewer, while every read still answers.
     fail_reply: Option<ForgeError>,
     /// Makes `resolve_threads` alone fail.
@@ -219,15 +224,25 @@ impl FakeForge {
 
     /// A reviewer submits a review on the current head, which also clears their request.
     pub fn add_review(&self, number: u64, reviewer: &str, state: &str) {
+        self.add_summary_review(number, reviewer, state, "");
+    }
+
+    /// The same, with a summary body. Returns the review's id.
+    pub fn add_summary_review(&self, number: u64, reviewer: &str, state: &str, body: &str) -> String {
         let mut g = self.inner.lock().unwrap();
         let rec = g.prs.get_mut(&number).expect("no such pull request");
+        let id = format!("r-{}-{}", number, rec.reviews.len() + 1);
         let sha = rec.pr.head_sha.clone();
         rec.reviews.push(Review {
+            id: id.clone(),
             reviewer: reviewer.into(),
             commit_sha: sha,
             state: state.into(),
+            body: body.into(),
+            url: Some(format!("https://forge.example/pulls/{number}#{id}")),
         });
         rec.pr.requested_reviewers.retain(|r| r != reviewer);
+        id
     }
 
     /// Someone other than the orchestrator moves the head — the operator merging the base in,
@@ -252,6 +267,17 @@ impl FakeForge {
                 Op::Reply { number: n, comment_id: c, body } if n == number && c == comment_id => {
                     Some(body)
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every comment posted on the pull request's own conversation.
+    pub fn comments_on(&self, number: u64) -> Vec<String> {
+        self.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Comment { number: n, body } if n == number => Some(body),
                 _ => None,
             })
             .collect()
@@ -420,6 +446,17 @@ impl Forge for FakeForge {
             return Err(e.clone());
         }
         g.ops.push(Op::Reply { number, comment_id: comment_id.into(), body: body.into() });
+        Ok(())
+    }
+
+    /// Fails with `reply`: both are the write that carries a verdict to its reviewer.
+    fn comment(&self, number: u64, body: &str) -> Result<(), ForgeError> {
+        let mut g = self.inner.lock().unwrap();
+        Self::gate(&g)?;
+        if let Some(e) = &g.fail_reply {
+            return Err(e.clone());
+        }
+        g.ops.push(Op::Comment { number, body: body.into() });
         Ok(())
     }
 

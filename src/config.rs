@@ -73,6 +73,10 @@ fn d_delivery_base() -> String {
 fn d_delivery_remote() -> String {
     "origin".into()
 }
+fn d_summary_reviewers() -> Vec<String> {
+    // The login the reviews endpoint reports for Copilot's automatic review.
+    vec!["copilot-pull-request-reviewer[bot]".into()]
+}
 fn d_rounds_per_pr() -> u32 {
     3
 }
@@ -188,6 +192,14 @@ pub struct DeliveryConfig {
     /// failure, not a success. Empty means no review is requested and none is waited for.
     #[serde(default)]
     pub reviewers: Vec<String>,
+    /// Logins whose review *summary* is read for findings as well as their inline comments
+    /// (#126): any of their reviews on the current head whose body says more than
+    /// "Findings: None" is handed to an agent whole. A review in the `CHANGES_REQUESTED` state
+    /// is read the same way whoever wrote it, so this names only the reviewers whose
+    /// `COMMENTED` summaries count too. Defaults to the Copilot reviewer, which puts findings
+    /// there that it leaves on no line.
+    #[serde(default = "d_summary_reviewers")]
+    pub summary_reviewers: Vec<String>,
     /// Times delivery may hand the *current pull request* back to an agent — for a red CI or
     /// for review comments — before handing it to the operator instead.
     #[serde(default = "d_rounds_per_pr")]
@@ -212,6 +224,7 @@ impl Default for DeliveryConfig {
             base: d_delivery_base(),
             remote: d_delivery_remote(),
             reviewers: vec![],
+            summary_reviewers: d_summary_reviewers(),
             max_rounds_per_pr: d_rounds_per_pr(),
             max_rounds_per_issue: d_rounds_per_issue(),
             poll_interval_ms: d_delivery_poll(),
