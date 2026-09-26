@@ -49,7 +49,14 @@ pub enum Verdict {
     },
     /// The rebase stopped on conflicts. The rebase was aborted, so the branch is exactly where
     /// the agent left it: green against the old base, and safe for a human to pick up.
-    Conflict { paths: Vec<String> },
+    Conflict {
+        paths: Vec<String>,
+        /// The commit the rebase was attempted onto, resolved in `workspace.repo`. Carried
+        /// because a brief that names the base by ref sends the agent to rebase onto whatever
+        /// that ref means *in its worktree* — and with `gate.base` unset that is `HEAD`, the
+        /// agent's own branch, a no-op that leaves the conflict to recur.
+        base_sha: String,
+    },
     /// A step failed for a reason the agent can act on: a command exited non-zero, the rebase
     /// was refused (a dirty tree, most likely), or a command could not be started at all.
     /// `step` names which, and `output` is what it said — bounded, tail-first, because a

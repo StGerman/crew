@@ -234,7 +234,7 @@ impl GateRun {
                 .unwrap_or_default();
             let _ = self.git(ws, &["rebase", "--abort"]);
             if !paths.is_empty() {
-                return Verdict::Conflict { paths };
+                return Verdict::Conflict { paths, base_sha };
             }
             return Verdict::Failed { step, output: stderr, on_base: false };
         }
@@ -493,7 +493,13 @@ mod tests {
         let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])]);
         let verdict = wait(&gate.start(&issue(), &wt));
 
-        assert_eq!(verdict, Verdict::Conflict { paths: vec!["base.txt".into()] });
+        assert_eq!(
+            verdict,
+            Verdict::Conflict {
+                paths: vec!["base.txt".into()],
+                base_sha: sh_git(&repo, &["rev-parse", "master"]),
+            }
+        );
         assert_eq!(
             sh_git(&wt, &["rev-parse", "HEAD"]),
             before,

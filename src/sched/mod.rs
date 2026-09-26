@@ -74,12 +74,15 @@ fn log_tracker_failure(context: &str, e: &TrackerError) {
 /// was aborted because an agent told otherwise goes looking for a half-finished rebase that is
 /// not there; and it names the migration rule for `schema.rs` because the obvious resolution —
 /// keep both sides' v<N> — edits a released migration, which the gate's own `cargo test` would
-/// then fail on, spending a try on a rule the brief could have stated.
-fn conflict_brief(base: &str, paths: &[String], n: u32, max: u32) -> String {
+/// then fail on, spending a try on a rule the brief could have stated. The command names the
+/// commit, not the ref: a ref resolves in the agent's worktree, where an unset base's `HEAD` is
+/// the agent's own branch.
+fn conflict_brief(base: &str, base_sha: &str, paths: &[String], n: u32, max: u32) -> String {
     let mut s = format!(
-        "the handoff gate's rebase onto `{base}` conflicted in {} (failure {n} of {max}). The \
-         rebase was aborted, so the branch is where you left it. Another branch appended to \
-         the same place; resolve it yourself: `git rebase {base}`, keep both sides' additions \
+        "the handoff gate's rebase onto {base} ({base_sha}) conflicted in {} (failure {n} of \
+         {max}). The rebase was aborted, so the branch is where you left it. Another branch \
+         appended to the same place; resolve it yourself: `git rebase {base_sha}`, keep both \
+         sides' additions \
          in each conflicted file, `git rebase --continue`, check the result still builds, \
          and finish again.",
         paths.join(", ")
@@ -788,17 +791,17 @@ impl Scheduler {
                 tracing::info!(issue_id, identifier, rebased, "gate passed on the rebased branch");
                 Outcome::Done
             }
-            Verdict::Conflict { paths }
+            Verdict::Conflict { paths, base_sha }
                 if gate::agent_resolvable(&paths, &self.cfg.gate.agent_resolvable) =>
             {
-                let base = base.unwrap_or("HEAD");
+                let base = base.unwrap_or("the repository HEAD");
                 let step = format!("rebase onto {base}");
                 let detail = format!("conflicts in {}", paths.join(", "));
                 self.gate_failure(issue_id, identifier, &step, &detail, |n, max| {
-                    conflict_brief(base, &paths, n, max)
+                    conflict_brief(base, &base_sha, &paths, n, max)
                 })?
             }
-            Verdict::Conflict { paths } => {
+            Verdict::Conflict { paths, .. } => {
                 let base = base.unwrap_or("the repository HEAD");
                 tracing::warn!(
                     issue_id,
