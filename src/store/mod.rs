@@ -1338,6 +1338,10 @@ pub struct DeliveryRecord {
     pub handed_comments: Option<String>,
     pub handoff_reason: Option<String>,
     pub updated_at: i64,
+    /// The head CI is pending on and when that was first observed, on the injected clock
+    /// rather than any provider timestamp; `None` while CI is not pending. See
+    /// [`Store::set_ci_pending`].
+    pub ci_pending: Option<(String, i64)>,
 }
 
 impl Store {
@@ -1414,6 +1418,30 @@ impl Store {
                stage = 'awaiting', updated_at = ?6
              WHERE issue_id = ?1",
             params![issue_id, pr_number as i64, pr_url, base, head_sha, now],
+        )?;
+        Ok(())
+    }
+
+    /// Start, keep or stop the CI wait. `Some(head)` starts the clock at now unless it is
+    /// already running for that same head; `None` stops it. Keyed on the head the provider
+    /// reports rather than the one crewd pushed, so a head the operator pushed gets its own
+    /// full wait, and stopped whenever CI is not pending, so a check re-run hours after a
+    /// green result is timed from the re-run and not from the push (#105).
+    pub fn set_ci_pending(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        head: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delivery SET
+               ci_pending_since = CASE WHEN ?2 IS NULL THEN NULL
+                                       WHEN ci_pending_head IS ?2 THEN ci_pending_since
+                                       ELSE ?3 END,
+               ci_pending_head = ?2
+             WHERE issue_id = ?1",
+            params![issue_id, head, clock.wall().0],
         )?;
         Ok(())
     }
@@ -1629,7 +1657,8 @@ impl Store {
 
 const DELIVERY_SELECT: &str = "SELECT issue_id, stage, pr_number, pr_url, base, head_sha,
     head_pushed_at, review_requested, review_error, rounds_pr, rounds_issue, pending_feedback,
-    pending_verdicts, handed_comments, handoff_reason, updated_at FROM delivery";
+    pending_verdicts, handed_comments, handoff_reason, updated_at, ci_pending_head,
+    ci_pending_since FROM delivery";
 
 fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
     Ok(DeliveryRecord {
@@ -1649,6 +1678,10 @@ fn delivery_record(r: &rusqlite::Row) -> rusqlite::Result<DeliveryRecord> {
         handed_comments: r.get(13)?,
         handoff_reason: r.get(14)?,
         updated_at: r.get(15)?,
+        ci_pending: match (r.get::<_, Option<String>>(16)?, r.get::<_, Option<i64>>(17)?) {
+            (Some(head), Some(since)) => Some((head, since)),
+            _ => None,
+        },
     })
 }
 
