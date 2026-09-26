@@ -140,6 +140,12 @@ pub struct GateConfig {
     /// cold `cargo test`, not for a fake. `0` disables the timeout.
     #[serde(default = "d_gate_timeout")]
     pub timeout_ms: u64,
+    /// Paths whose rebase conflicts go back to the agent instead of to a human (#111): when
+    /// *every* conflicted path matches one of these, the verdict is `Continue`, counted against
+    /// `max_failures` like a failing command. `*` matches within one path segment and `**` any
+    /// number of them. Empty means every conflict is a human's, as before #111.
+    #[serde(default)]
+    pub agent_resolvable: Vec<String>,
 }
 
 impl Default for GateConfig {
@@ -150,6 +156,7 @@ impl Default for GateConfig {
             commands: Vec::new(),
             max_failures: d_gate_max_failures(),
             timeout_ms: d_gate_timeout(),
+            agent_resolvable: Vec::new(),
         }
     }
 }
@@ -625,6 +632,14 @@ impl Config {
                      [\"cargo\", \"test\"]"
                 )));
             }
+            // A blank pattern matches no path, so it reads as configured while handing nothing
+            // back — the operator would learn it only from a conflict parked for them anyway.
+            if let Some(i) = self.gate.agent_resolvable.iter().position(|p| p.trim().is_empty()) {
+                return Err(ConfigError::Invalid(format!(
+                    "gate.agent_resolvable[{i}] is blank; each entry is a path or a glob like \
+                     \"docs/**\""
+                )));
+            }
         }
         // A zero round bound would refuse the first fix round and read as delivery being
         // broken; an empty base or remote would push nowhere. Same shape as the broker check.
@@ -794,6 +809,16 @@ mod tests {
         c.gate.enabled = false;
         c.gate.max_failures = 0;
         assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_blank_agent_resolvable_pattern_is_rejected() {
+        let mut c = base();
+        c.gate.agent_resolvable = vec!["CLAUDE.md".into(), "docs/**".into()];
+        assert!(c.preflight().is_ok());
+        c.gate.agent_resolvable.push("  ".into());
+        let err = c.preflight().unwrap_err().to_string();
+        assert!(err.contains("gate.agent_resolvable[2]"), "names the entry: {err}");
     }
 
     #[test]
