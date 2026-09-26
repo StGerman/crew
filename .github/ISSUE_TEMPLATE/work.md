@@ -2,8 +2,8 @@
 name: Work
 about: A defect or a missing capability. The body is what a dispatched agent receives.
 title: ""
-labels: []
-assignees: []
+labels: ""
+assignees: ""
 ---
 
 <!--
