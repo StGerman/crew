@@ -31,7 +31,7 @@ use crate::broker::{Broker, BrokerSession};
 use crate::clock::{Clock, Mono, Wall};
 use crate::config::Config;
 use crate::forge::{Forge, Publisher};
-use crate::gate::{Gate, GateHandle, Verdict};
+use crate::gate::{self, Gate, GateHandle, Verdict};
 use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, session_id, worktree_key,
 };
@@ -68,6 +68,32 @@ fn log_tracker_failure(context: &str, e: &TrackerError) {
     } else {
         tracing::error!(error = %e, "{context}; will not resolve on its own — check tracker credentials/config");
     }
+}
+
+/// The continuation brief for a conflict handed back to the agent (#111). It says the rebase
+/// was aborted because an agent told otherwise goes looking for a half-finished rebase that is
+/// not there; and it names the migration rule for `schema.rs` because the obvious resolution —
+/// keep both sides' v<N> — edits a released migration, which the gate's own `cargo test` would
+/// then fail on, spending a try on a rule the brief could have stated. The command names the
+/// commit, not the ref: a ref resolves in the agent's worktree, where an unset base's `HEAD` is
+/// the agent's own branch.
+fn conflict_brief(base: &str, base_sha: &str, paths: &[String], n: u32, max: u32) -> String {
+    let mut s = format!(
+        "the handoff gate's rebase onto {base} ({base_sha}) conflicted in {} (failure {n} of \
+         {max}). The rebase was aborted, so the branch is where you left it. Another branch \
+         appended to the same place; resolve it yourself: `git rebase {base_sha}`, keep both \
+         sides' additions \
+         in each conflicted file, `git rebase --continue`, check the result still builds, \
+         and finish again.",
+        paths.join(", ")
+    );
+    if paths.iter().any(|p| p == "src/store/schema.rs") {
+        s.push_str(
+            " In `src/store/schema.rs`, a migration number already on the base is released and \
+             must never be edited; renumber yours after it and move its hash in `RELEASED`.",
+        );
+    }
+    s
 }
 
 struct Running {
@@ -738,10 +764,12 @@ impl Scheduler {
 
     /// What the scheduler makes of a gate's verdict.
     ///
-    /// A conflict is a human's problem and a failing command is the agent's, but the agent only
-    /// gets `max_failures` consecutive tries: without that bound a suite the agent cannot make
-    /// pass would be re-dispatched until the turn budget ran out, which is the runaway the
-    /// verdict-plus-budget design exists to prevent, arriving by a new route.
+    /// A conflict is a human's problem — unless every path in it is one `gate.agent_resolvable`
+    /// names (#111) — and a failing command is the agent's, but the agent only gets
+    /// `max_failures` consecutive tries: without that bound a suite the agent cannot make pass,
+    /// or a conflict it cannot resolve, would be re-dispatched until the turn budget ran out,
+    /// which is the runaway the verdict-plus-budget design exists to prevent, arriving by a new
+    /// route.
     fn gate_outcome(
         &self,
         issue_id: &str,
@@ -749,6 +777,7 @@ impl Scheduler {
         verdict: Verdict,
     ) -> anyhow::Result<Outcome> {
         let identifier = r.issue.identifier.as_str();
+        let base = self.cfg.gate.base.as_deref();
         Ok(match verdict {
             Verdict::NoCommits => {
                 tracing::info!(
@@ -762,8 +791,18 @@ impl Scheduler {
                 tracing::info!(issue_id, identifier, rebased, "gate passed on the rebased branch");
                 Outcome::Done
             }
-            Verdict::Conflict { paths } => {
-                let base = self.cfg.gate.base.as_deref().unwrap_or("the repository HEAD");
+            Verdict::Conflict { paths, base_sha }
+                if gate::agent_resolvable(&paths, &self.cfg.gate.agent_resolvable) =>
+            {
+                let base = base.unwrap_or("the repository HEAD");
+                let step = format!("rebase onto {base}");
+                let detail = format!("conflicts in {}", paths.join(", "));
+                self.gate_failure(issue_id, identifier, &step, &detail, |n, max| {
+                    conflict_brief(base, &base_sha, &paths, n, max)
+                })?
+            }
+            Verdict::Conflict { paths, base_sha } => {
+                let base = base.unwrap_or("the repository HEAD");
                 tracing::warn!(
                     issue_id,
                     identifier,
@@ -773,7 +812,8 @@ impl Scheduler {
                 // Queued for whichever run a human's unblocking dispatches next: `last_error`
                 // reaches the dashboard, not the prompt, and without this the resumed session
                 // is told it merely ran out of turns and reports its work already done (#109).
-                let fb = Feedback::Conflict { base: base.to_string(), paths: paths.clone() };
+                let fb =
+                    Feedback::Conflict { base: base.to_string(), base_sha, paths: paths.clone() };
                 self.store.set_pending_feedback(
                     self.clock.as_ref(),
                     issue_id,
@@ -787,31 +827,12 @@ impl Scheduler {
                     ),
                 }
             }
+            Verdict::Stuck { step, output } => {
+                tracing::error!(issue_id, identifier, step, "worktree left mid-rebase; blocking");
+                Outcome::Blocked { why: format!("the handoff gate is stuck at `{step}`: {output}") }
+            }
             Verdict::Failed { step, output, on_base } => {
-                let n = self.store.bump_gate_failures(issue_id)?;
-                let max = self.cfg.gate.max_failures;
-                if n >= max {
-                    tracing::warn!(
-                        issue_id,
-                        identifier,
-                        step,
-                        failures = n,
-                        "gate failed repeatedly; blocking"
-                    );
-                    Outcome::Blocked {
-                        why: format!(
-                            "the handoff gate failed {n} time(s) in a row; last at `{step}`:\n{output}"
-                        ),
-                    }
-                } else {
-                    tracing::info!(
-                        issue_id,
-                        identifier,
-                        step,
-                        failures = n,
-                        max,
-                        "gate failed; continuing"
-                    );
+                self.gate_failure(issue_id, identifier, &step, &output, |n, max| {
                     // Only say where the work sits when the gate actually got that far. A
                     // base that would not resolve, or a rebase that was refused and aborted,
                     // leaves the branch exactly where the agent left it — telling it to "fix
@@ -822,15 +843,44 @@ impl Scheduler {
                     } else {
                         "the branch was not rebased and is where you left it, so fix this there"
                     };
-                    Outcome::Continue {
-                        why: format!(
-                            "the handoff gate failed at `{step}` (failure {n} of {max}); \
-                             {where_it_sits} and finish again. Output:\n{output}"
-                        ),
-                    }
-                }
+                    format!(
+                        "the handoff gate failed at `{step}` (failure {n} of {max}); \
+                         {where_it_sits} and finish again. Output:\n{output}"
+                    )
+                })?
             }
         })
+    }
+
+    /// Charge one gate failure to the issue's streak: a `Continue` carrying `brief(n, max)` for
+    /// the agent, or — once the streak reaches `gate.max_failures` — `Blocked` with `detail` for
+    /// the human, who has no use for instructions addressed to the agent.
+    fn gate_failure(
+        &self,
+        issue_id: &str,
+        identifier: &str,
+        step: &str,
+        detail: &str,
+        brief: impl FnOnce(u32, u32) -> String,
+    ) -> anyhow::Result<Outcome> {
+        let n = self.store.bump_gate_failures(issue_id)?;
+        let max = self.cfg.gate.max_failures;
+        if n >= max {
+            tracing::warn!(
+                issue_id,
+                identifier,
+                step,
+                failures = n,
+                "gate failed repeatedly; blocking"
+            );
+            return Ok(Outcome::Blocked {
+                why: format!(
+                    "the handoff gate failed {n} time(s) in a row; last at `{step}`:\n{detail}"
+                ),
+            });
+        }
+        tracing::info!(issue_id, identifier, step, failures = n, max, "gate failed; continuing");
+        Ok(Outcome::Continue { why: brief(n, max) })
     }
 
     fn detect_stalls(&mut self) -> anyhow::Result<()> {
@@ -1680,6 +1730,35 @@ impl Scheduler {
     /// perform on a live claim (see [`Store::unquarantine`]).
     pub fn unquarantine(&self, issue_id: &str) -> anyhow::Result<bool> {
         Ok(self.store.unquarantine(self.clock.as_ref(), issue_id)?)
+    }
+
+    /// Operator action: hand a parked issue back once whatever parked it has been resolved.
+    ///
+    /// Reports whether a park was lifted; anything live is a no-op that says so (see
+    /// [`Store::unblock`]). The next `dispatch_new` sees the issue as live and dispatches it
+    /// onto its existing branch.
+    ///
+    /// The ticket's state is read fresh first, and a park on one that is no longer active is
+    /// kept. `dispatch_new` never sees such an issue, and `sweep_parked` — the only path that
+    /// reclaims a closed ticket's worktree and branch — only walks parked rows, so lifting the
+    /// park there would strand both. A tracker failure is an error, not a guess either way.
+    ///
+    /// The same holds for every other gate `dispatch_new` applies: an issue that has lost its
+    /// dispatch marker or spent its per-issue turn budget would be unparked and never
+    /// dispatched, invisible to the sweep, so the park is kept and the answer says no.
+    pub fn unblock(&self, issue_id: &str) -> anyhow::Result<bool> {
+        let fresh = self.tracker.by_ids(&[issue_id.to_string()])?;
+        let Some(issue) = fresh.iter().find(|i| i.id == issue_id) else {
+            return Ok(false);
+        };
+        let within_budget = self
+            .store
+            .get(issue_id)?
+            .is_some_and(|st| st.cumulative_turns < self.cfg.agent.max_turns_per_issue);
+        if !self.cfg.is_active(&issue.state_key()) || !self.routable(issue) || !within_budget {
+            return Ok(false);
+        }
+        Ok(self.store.unblock(self.clock.as_ref(), issue_id)?)
     }
 
     /// Stop every in-flight run before the process exits.

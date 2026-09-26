@@ -10,4 +10,4 @@ CREW_OUTCOME: continue: <one-sentence reason>
 If you are stuck and need a human to unblock you, end with:
 CREW_OUTCOME: blocked: <one-sentence reason>
 
-The orchestrator could not rebase your branch onto master: conflicts in src/store/schema.rs, src/store/mod.rs. The rebase was aborted, so your branch is exactly as you left it. Your job this run is to rebase onto master yourself, resolve those conflicts — the description may say how — run the project's own gate, and commit. Do not report done while the branch still conflicts with master.
+The orchestrator could not rebase your branch onto master (0123456789abcdef0123456789abcdef01234567): conflicts in src/store/schema.rs, src/store/mod.rs. The rebase was aborted, so your branch is exactly as you left it. Your job this run is to resolve that yourself — `git rebase 0123456789abcdef0123456789abcdef01234567`, resolve each conflict (the description may say how), `git rebase --continue` — then run the project's own gate and commit. Do not report done while the branch still conflicts with master.

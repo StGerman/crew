@@ -18,6 +18,12 @@ use crate::clock::{Clock, Wall};
 use crate::model::{ErrorClass, Phase, Verdict};
 use crate::worker::{ModelChoice, TokenUsage};
 
+/// The park an operator's unblock leaves behind: a state no tracker ever reports, since
+/// `state_key` is a trimmed, lowercased tracker state and never carries parentheses. It differs
+/// from every real key, so the next `dispatch_new` treats the park as stale and launches, while
+/// the row stays parked for `sweep_parked` until then (see [`Store::unblock`]).
+pub const UNBLOCKED: &str = "(unblocked)";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueState {
     pub issue_id: String,
@@ -384,6 +390,44 @@ impl Store {
                  last_fail_class = NULL, updated_at = ?2
              WHERE issue_id = ?1 AND quarantined_at IS NOT NULL",
             params![issue_id, clock.wall().0],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Lift a park an operator has resolved, reporting whether there was one to lift (#108).
+    ///
+    /// Guarded for the same reason as [`Store::unquarantine`], and in the same statement: only
+    /// a parked issue in phase `released`, unquarantined and with no retry row, is unparked.
+    /// A running or gating issue holds phase `running`, and a retry-queued one holds a retry
+    /// row, so neither matches; clearing a park on anything live would let the next tick
+    /// dispatch a second agent onto a worktree already in use. A delivery still `pending`,
+    /// `awaiting` or `ready` owns the parked `Done` too: lifting its park would let delivery push
+    /// the branch, or hand it back, in the same tick `dispatch_new` puts an agent on it. So does
+    /// a `handed_off` one, which gave the branch to the operator: a dispatch there would end in a
+    /// `Done` that restarts delivery, stepping around `max_rounds_per_issue` and the handoff
+    /// itself. Only `redispatched` and `closed` are left out, since neither pushes nor hands
+    /// back, and a re-dispatched run that ends `Blocked` keeps its row `redispatched`. The
+    /// claim is never touched — the next `dispatch_new` takes it the ordinary way. The parked
+    /// note goes too, since it names the problem the operator has just resolved.
+    ///
+    /// The park is not cleared but re-pointed at [`UNBLOCKED`], a state no ticket is ever in.
+    /// Clearing it opened a window (review on #112): a ticket that closed between the
+    /// operator's unblock and the next tick was neither dispatched — `dispatch_new` only sees
+    /// active tickets — nor swept, since `sweep_parked` walks parked rows only, stranding its
+    /// worktree and branch. Re-pointed, the row stays in the sweep's view, and `dispatch_new`'s
+    /// ordinary "the state moved" branch unparks and launches it once it is still eligible.
+    pub fn unblock(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE issue_state
+             SET parked_state = ?3, last_error = NULL, last_error_class = NULL, updated_at = ?2
+             WHERE issue_id = ?1 AND parked_state IS NOT NULL AND parked_state <> ?3
+               AND phase = 'released'
+               AND quarantined_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM retry WHERE retry.issue_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.issue_id = ?1
+                               AND delivery.stage IN ('pending', 'awaiting', 'ready', 'handed_off'))",
+            params![issue_id, clock.wall().0, UNBLOCKED],
         )?;
         Ok(n == 1)
     }
@@ -949,6 +993,32 @@ mod tests {
 
         assert_eq!(s.get("id-1").unwrap().unwrap().phase, Phase::Running, "the claim must stand");
         assert!(!s.claim(&c, "id-1").unwrap(), "and must still be exclusive");
+    }
+
+    #[test]
+    fn an_unblock_does_not_lift_a_park_a_live_delivery_still_owns() {
+        // A `Done` parks and queues delivery. Lifting that park would put an agent on the
+        // branch in the same tick delivery pushes it or hands it back.
+        let (s, c) = setup();
+        s.release(&c, "id-1").unwrap();
+        s.park(&c, "id-1", "in progress").unwrap();
+        for stage in [DeliveryStage::Pending, DeliveryStage::Awaiting, DeliveryStage::Ready] {
+            s.begin_delivery(&c, "id-1", None).unwrap();
+            s.set_delivery_stage(&c, "id-1", stage, None).unwrap();
+            assert!(!s.unblock(&c, "id-1").unwrap(), "{stage:?} delivery owns the park");
+            assert!(s.get("id-1").unwrap().unwrap().parked_state.is_some());
+        }
+
+        // A handoff gave the branch to the operator; an agent dispatched onto it would restart
+        // delivery with its `Done` and step around the bound that handed it off.
+        s.set_delivery_stage(&c, "id-1", DeliveryStage::HandedOff, Some("round bound")).unwrap();
+        assert!(!s.unblock(&c, "id-1").unwrap(), "a handoff owns the park");
+
+        // One that pushes nothing and hands nothing back does not stand in the way.
+        s.set_delivery_stage(&c, "id-1", DeliveryStage::Redispatched, None).unwrap();
+        assert!(s.unblock(&c, "id-1").unwrap());
+        assert_eq!(s.get("id-1").unwrap().unwrap().parked_state.as_deref(), Some(UNBLOCKED));
+        assert!(!s.unblock(&c, "id-1").unwrap(), "a second unblock has nothing left to lift");
     }
 
     #[test]

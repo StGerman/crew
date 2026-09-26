@@ -132,6 +132,13 @@ this file.
 - **MUST** match the comment density of the surrounding code. This codebase comments decisions,
   not lines. Why: a block of narrative in a file of terse code is a sign the narrative belongs
   in a doc. Check: review.
+- **MUST NOT** state how many members a growing set has (routes, tools, tests, packages,
+  commands, invariant rows) in a doc or a comment. Name the members, or say "every" or "the".
+  Why: every addition rewrites the sentence, so two pull requests in flight conflict on it
+  (CLAUDE.md's test count did so on #102, #103 and #104), and one addition that misses it
+  leaves a number that is silently wrong. A fixed fact (the MCP handshake's four methods, a
+  historical "the six rows from #47") is not a growing set. Check: review; the diff of a PR
+  that adds a route, tool or test should not touch prose elsewhere to renumber it.
 - **MUST** run `cargo fmt` rather than hand-wrapping. The settings are `max_width = 100` and
   `use_small_heuristics = "Max"` in [rustfmt.toml](../rustfmt.toml). Why: `rustfmt` makes
   different choices than you will. Check: `cargo fmt --check` in CI. Enforced.

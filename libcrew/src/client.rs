@@ -164,7 +164,7 @@ impl std::fmt::Display for StatusError {
 
 impl std::error::Error for StatusError {}
 
-/// The two read routes this client uses, spelled once.
+/// The read routes this client uses, spelled once.
 const SNAPSHOT: &str = "/api/v1/snapshot";
 
 fn issue_path(key: &str) -> String {
@@ -196,7 +196,7 @@ impl Client {
         self.get(&issue_path(key))
     }
 
-    /// The same two routes, unparsed, for `--json`.
+    /// The same routes, unparsed, for `--json`.
     ///
     /// They are separate methods rather than one taking a path because the first version took a
     /// path: `--json` built its own URL, skipped [`encode_segment`], and turned an identifier

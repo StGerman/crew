@@ -195,8 +195,10 @@ pub enum Feedback {
     /// The handoff gate could not rebase the branch onto `base`: the rebase stopped on
     /// conflicts in `paths` and was aborted, and the issue parked `Blocked` (#109). Carried to
     /// the run after the one that was blocked, so it is told the truth about why it exists —
-    /// not that a turn budget ran out — once a human has unblocked it.
-    Conflict { base: String, paths: Vec<String> },
+    /// not that a turn budget ran out — once a human has unblocked it. `base_sha` is the commit
+    /// the gate tried, which the agent is told to rebase onto: `base` resolves in its worktree,
+    /// where an unset base's `HEAD` is its own branch.
+    Conflict { base: String, base_sha: String, paths: Vec<String> },
 }
 
 impl Feedback {

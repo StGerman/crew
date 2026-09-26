@@ -773,13 +773,14 @@ fn feedback_help(feedback: Option<&Feedback>) -> String {
                 output.trim_end()
             ));
         }
-        Feedback::Conflict { base, paths } => {
+        Feedback::Conflict { base, base_sha, paths } => {
             s.push_str(&format!(
-                "\nThe orchestrator could not rebase your branch onto {base}: conflicts in {}. \
-                 The rebase was aborted, so your branch is exactly as you left it. Your job \
-                 this run is to rebase onto {base} yourself, resolve those conflicts — the \
-                 description may say how — run the project's own gate, and commit. Do not \
-                 report done while the branch still conflicts with {base}.\n",
+                "\nThe orchestrator could not rebase your branch onto {base} ({base_sha}): \
+                 conflicts in {}. The rebase was aborted, so your branch is exactly as you left \
+                 it. Your job this run is to resolve that yourself — `git rebase {base_sha}`, \
+                 resolve each conflict (the description may say how), `git rebase --continue` — \
+                 then run the project's own gate and commit. Do not report done while the branch \
+                 still conflicts with {base}.\n",
                 paths.join(", ")
             ));
         }
@@ -1140,6 +1141,7 @@ mod tests {
     fn a_resume_after_a_rebase_conflict_names_the_conflict_rather_than_a_turn_budget() {
         let fb = Feedback::Conflict {
             base: "master".into(),
+            base_sha: "0123456789abcdef0123456789abcdef01234567".into(),
             paths: vec!["src/store/schema.rs".into(), "src/store/mod.rs".into()],
         };
         insta::assert_snapshot!(

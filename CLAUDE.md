@@ -21,7 +21,7 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-The workspace is three packages (#45). `crewd`, at the root, is the daemon: its library is
+The workspace is split into packages (#45). `crewd`, at the root, is the daemon: its library is
 `crew` (`use crew::`), its binary `crewd`. `crewctl/` is the client, a binary that links only
 `libcrew/`, which holds what both need: the published `Snapshot`/`Row` types, the ops API's
 address and marker, and the HTTP client and renderer. The standing rule is that anything both
@@ -41,7 +41,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # 299 unit + 112 integration, all three packages
+cargo test                                 # every package; the count is in its output, never here
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -55,7 +55,7 @@ cargo run -- --max-ticks 20                # headless smoke run, then exit
 cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
 cargo run -p crewctl -- status             # what a running daemon is doing, read over that API
 cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, turns, cost, branch
-cargo run -- --mcp 127.0.0.1:8788          # the same four routes as MCP tools, for a supervising agent
+cargo run -- --mcp 127.0.0.1:8788          # the ops API's routes as MCP tools, for a supervising agent
 claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
                                            # ...and how that agent gets them. Local scope, never user
 cargo run -- init                          # register your own GitHub App: two clicks, writes ~/.crewd/
@@ -63,10 +63,11 @@ cargo run --example dashboard_preview      # render the UI to stdout, no termina
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
 
-The first three are the commit gate, and [.github/workflows/ci.yml](.github/workflows/ci.yml)
-runs them as three required checks on every pull request rather than trusting whoever
+`cargo test`, `cargo clippy` and `cargo fmt --check` are the commit gate, and
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs each as a required check on every
+pull request rather than trusting whoever
 remembers — delivery opens a pull request for every agent branch, so that is where a red gate
-can still stop a merge. `default-members` covers all three packages, so each of those commands
+can still stop a merge. `default-members` covers every package, so each of those commands
 checks the client and the library as well as the daemon, and `default-run` keeps a bare
 `cargo run` meaning `crewd`.
 
@@ -82,7 +83,7 @@ table *is* the loop):
 | `crewctl` | `cargo test -p crewctl -p libcrew` | ~0.6s |
 | before committing | `cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check` | ~9s |
 
-Most of the unit-test time is the twenty `workspace::` tests shelling out to real `git`. The
+Most of the unit-test time is the `workspace::` tests shelling out to real `git`. The
 package split bought enforcement, not build speed; `--skip workspace::` is what makes the common
 case fast. `rust-toolchain.toml`
 pins the compiler so CI, this machine and every worktree agree on what "it compiles" means, and
@@ -445,7 +446,9 @@ none, and this one inherits the operator's environment because it is the operato
 with no agent involved. The verdict is deliberately three-way and the split is the point: a
 **conflict** is a human's problem, so the rebase is aborted (the branch goes back to exactly what
 the agent committed, which is what keeps `remove`'s merged check on its side) and the issue parks
-`Blocked` naming the paths; a **failing command** is the agent's, so the verdict is `Continue` and
+`Blocked` naming the paths — unless every path is in `gate.agent_resolvable` (`CLAUDE.md`,
+`docs/**` and `src/store/schema.rs` in `crew.github.toml`), where two branches appended to the
+same list and the verdict is a `Continue` carrying the conflict as its brief (#111); a **failing command** is the agent's, so the verdict is `Continue` and
 the output rides into the next spawn as `Feedback::Gate` on `Worker::spawn` — the same
 parameter delivery's CI and review feedback travel on, so there is one channel and one rendering
 site for "why this attempt exists" — where the real worker puts it in the prompt; and `gate.max_failures` **consecutive** failures escalate to
@@ -455,17 +458,18 @@ an issue is parked instead of only the log. Setting no gate is a decision, not a
 the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
 agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
 empty command list, which makes the default a rebase and nothing more) and the scheduler tests
-attach `FakeGate` explicitly. `crew.github.toml` sets the three commands from **Commands**
+attach `FakeGate` explicitly. `crew.github.toml` sets the commit-gate commands from **Commands**
 above; the fake worker never commits, so under `crew.toml` every gate finds nothing to hand
 off.
 
 The ops API ([src/api/mod.rs](src/api/mod.rs)) is the second observer of that same published
 snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v1/refresh`,
-`POST /api/v1/unquarantine/:identifier`. `Api` holds a `watch::Receiver` and a command sender
-and no `Store`, so rule 3 is enforced by the type rather than by discipline — and the two
-`POST`s can express nothing the dashboard's `r` and `u` keys cannot. Off by default (`[api]
+`POST /api/v1/unquarantine/:identifier`, `POST /api/v1/unblock/:identifier`. `Api` holds a
+`watch::Receiver` and a command sender and no `Store`, so rule 3 is enforced by the type rather
+than by discipline — and the `POST`s can express nothing the dashboard's `r`, `u` and `b`
+keys cannot. Off by default (`[api]
 enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
-because those two routes control agent execution. Deliberately *not* validated in
+because the `POST` routes control agent execution. Deliberately *not* validated in
 `Config::preflight`: preflight gates dispatch, so a typo in an address the scheduler never uses
 must not be what stops it — `api::bind` parses it once, and a failure there is logged and
 costs the API alone. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
@@ -481,7 +485,17 @@ issues — identifiers are not unique, which is the same fact `worktree_key` exi
 `POST /unquarantine` on an issue that is not quarantined is a `200` saying so, not an error:
 the guard lives in `Store::unquarantine`'s `WHERE` clause, because an unconditional version
 would reset a *running* issue's phase to `released` and let the next tick dispatch a second
-agent onto its worktree.
+agent onto its worktree. `POST /unblock` (#108) is the same shape for a park: it is how a
+`Blocked` issue — a gate's rebase conflict, typically — is handed back once a human has resolved
+it, since with `active_states = ["open"]` the tracker has no state to move it through. It clears
+`parked_state` and the parked note and nothing else, so the next `dispatch_new` claims it the
+ordinary way and `prepare` attaches to its branch; `Store::unblock`'s `WHERE` refuses anything
+running, gating (a held claim is phase `running`), retry-queued, quarantined, or parked under a
+delivery still `pending`, `awaiting` or `ready` — which would push or hand back the branch in the
+tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. `Scheduler::unblock`
+also reads the ticket fresh and keeps a park whose ticket is no longer active, since
+`sweep_parked` — which reclaims a closed ticket's worktree — only walks parked rows. Write what
+changed into the issue's description first: that is the prompt the next run reads.
 
 `crewctl status` ([crewctl/src/main.rs](crewctl/src/main.rs), over
 [libcrew/src/client.rs](libcrew/src/client.rs) and [libcrew/src/render.rs](libcrew/src/render.rs))
@@ -507,11 +521,11 @@ and so the likelier reading) versus a daemon that answered and refused. Collapsi
 what has somebody restart a daemon that was never down, so each message names the address
 tried, where that address came from, and the way out.
 
-The ops MCP server ([src/api/mcp.rs](src/api/mcp.rs)) is the same four routes for an *agent*
+The ops MCP server ([src/api/mcp.rs](src/api/mcp.rs)) is the ops API's routes for an *agent*
 supervising the daemon — the one driving a dogfooding session, a watchdog later — which the
 `status` client left on the wrong side of the gap it closed: an agent had to spawn the CLI and
 parse a rendering built to read well to a person. One tool per route (`snapshot`, `issue`,
-`refresh`, `unquarantine`) and nothing else; each runs the *same* `Api` method the HTTP router
+`refresh`, `unquarantine`, `unblock`) and nothing else; each runs the *same* `Api` method the HTTP router
 runs and frames the same `Response` as a tool result, a status of 400 or more becoming
 `isError: true`. So it holds an `Api` and no `Store`, and it cannot express an authority the
 HTTP API lacks — new authority is a separate decision from new transport, and this module has
@@ -532,8 +546,8 @@ dispatched run of its tools.
 
 **This server must never reach a dispatched agent**, and that is the thing to hold when
 touching any of this. The broker gives a worker authority scoped to one issue; this is scoped
-to the whole daemon, and a worker that could call `unquarantine` could clear its own quarantine
-and re-dispatch itself, defeating the verdict, `max_turns_per_issue` and `parked_state`
+to the whole daemon, and a worker that could call `unquarantine` or `unblock` could clear its own
+quarantine or park and re-dispatch itself, defeating the verdict, `max_turns_per_issue` and `parked_state`
 together. What enforces it is wiring, not a check on the tool: the ops server binds **its own
 listener** (never the broker's — a shared one routed by prefix would put these tools at the
 exact `host:port` every worker is handed), answers only at `/ops`, and is never passed to
@@ -655,13 +669,13 @@ reading — check that the named test is still meaningful, not just still green.
 | Cleanup cannot discard an agent's *uncommitted* work | `remove` snapshots a dirty tree to a new ref under `refs/crew/wip/<issue key>/` (never the branch, never overwriting an earlier snapshot) before deleting it, failing closed; `prepare` reports every such ref and the next prompt names them | `a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref`, `a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed` |
 | A dead session cannot strand an issue | drop the session name after a run with zero turns | `a_run_that_took_no_turns_is_not_retried_into_the_same_conversation` |
 | A resumed session reads a description edited since it last saw one | `launch` swaps the body's `blake3` into `issue_state.session_body` (v11) and sets `Spawn::body_changed` on a resume whose hash differs or was never recorded; the continuation prompt then carries the body under a "changed since your last session" heading (#109) | `a_description_edited_after_the_session_started_reaches_the_resumed_session` (in `tests/scheduler.rs` and in the worker's snapshots) |
-| A run resumed after a rebase conflict is told the conflict, not a turn budget | `gate_outcome` queues `Feedback::Conflict { base, paths }` in `issue_state.pending_feedback`; `launch` takes it ahead of delivery's feedback and the retry reason, and the continuation prompt opens by saying the gate stopped the handoff (#109) | `a_resume_after_a_rebase_conflict_is_handed_the_conflict_rather_than_a_turn_budget`, `a_resume_after_a_rebase_conflict_names_the_conflict_rather_than_a_turn_budget` |
+| A run resumed after a rebase conflict is told the conflict, not a turn budget | `gate_outcome` queues `Feedback::Conflict { base, base_sha, paths }` in `issue_state.pending_feedback`; `launch` takes it ahead of delivery's feedback and the retry reason, and the continuation prompt opens by saying the gate stopped the handoff (#109) | `a_resume_after_a_rebase_conflict_is_handed_the_conflict_rather_than_a_turn_budget`, `a_resume_after_a_rebase_conflict_names_the_conflict_rather_than_a_turn_budget` |
 | A hard kill cannot strand a claim | startup `recover()`: a claim with no live run is stale, because `running` cannot cross a process boundary | `a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup` |
 | A hard kill cannot zero an in-flight run's progress | `observe_progress` checkpoints `run.turns` once per tick when the count moved, and `close_open_runs` keeps it and charges it to `cumulative_turns` in one transaction | `a_run_interrupted_by_a_hard_kill_reports_its_last_known_turn_count_after_restart` |
 | An agent cannot write to another ticket | no tool takes an issue id; the target comes from the per-run token | `a_call_naming_a_different_issue_is_refused_and_the_refusal_is_audited` |
 | A looping agent cannot write without bound | per-run **and** per-issue budgets, charged on attempts not successes | `a_continuation_cannot_refresh_the_budget_by_opening_a_new_session` |
 | A finished run keeps no write authority | the session is an RAII guard living in the `running` entry | `a_run_that_ends_takes_its_broker_authority_with_it` |
-| Clearing a quarantine cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL` and reports what it did | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim` |
+| Clearing a quarantine or a park cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL`, and `Store::unblock` on a park in phase `released` with no quarantine, no retry row and no delivery in a stage that pushes, hands back or has handed off — so a running, gating, retry-queued or delivering issue is untouched, and neither is one whose ticket `Scheduler::unblock` reads as no longer active — and both report what they did; unblock lifts the park and never takes or releases a claim (#108) | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim`, `unblocking_an_issue_that_is_not_parked_does_not_release_a_live_claim`, `unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch`, `an_unblock_does_not_lift_a_park_a_live_delivery_still_owns`, `unblocking_an_issue_whose_ticket_closed_leaves_it_for_the_parked_sweep`, `unblocking_an_issue_dispatch_would_refuse_keeps_its_park`, `a_ticket_that_closes_between_an_unblock_and_the_next_tick_is_still_swept` |
 | A slow HTTP client cannot delay a tick | one task per connection, a `oneshot` reply the scheduler never waits on, and a bounded read timeout | `a_client_that_never_finishes_its_request_cannot_delay_a_tick` |
 | The projection cannot become load-bearing | `publish` logs a projector error and returns `Ok`; nothing written is ever read back | `the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off` |
 | A killed run cannot record a fabricated cost | totals are read only from the `result` event; a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total` |
@@ -678,7 +692,7 @@ reading — check that the named test is still meaningful, not just still green.
 | A parked run's worktree is reclaimed once its ticket closes | `sweep_parked` re-reads parked ids on a bounded cadence, unparks what it cleans, and clears the published branch when cleanup deleted the ref | `a_parked_issue_that_is_later_closed_has_its_workspace_reclaimed_without_a_restart`, `sweeping_parked_issues_costs_tracker_traffic_bounded_by_the_interval_not_by_ticks`, `a_sweep_that_deletes_a_branch_clears_the_name_the_snapshot_publishes` |
 | One orchestrator cannot nest its worktrees inside another's | `GitWorktreeWorkspace::new` refuses a `repo` or `root` inside a linked worktree of the repository; `remove` prunes registrations beneath the path it deletes, then `branch -d`s their branches with the merged check intact | `an_orchestrator_cannot_be_started_inside_another_runs_worktree`, `removing_a_worktree_reclaims_the_worktrees_nested_inside_it_from_shared_metadata` |
 | A branch is not handed off ungated against the base it will merge into | a `Done` moves the run into `gating` with its claim held; `GitGate` rebases first and runs the commands on the rebased tree | `a_done_verdict_is_gated_in_its_own_worktree_before_the_claim_is_released`, `the_branch_is_rebased_onto_the_base_before_the_gate_runs_on_the_rebased_tree` |
-| A rebase conflict is a human's problem, not a silent failure | the rebase is aborted and the issue parks `Blocked` naming the paths, in `last_error` | `a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths`, `a_conflicting_rebase_is_aborted_and_names_the_conflicted_paths` |
+| A rebase conflict is a human's problem, not a silent failure — unless every conflicted path is one the operator listed as the agent's | the rebase is aborted first, whichever way it goes, and one left in progress after the abort is `Verdict::Stuck`, always `Blocked`; a conflict touching any path outside `gate.agent_resolvable` parks `Blocked` naming the paths, in `last_error`; one confined to it is a `Continue` whose `Feedback::Gate` brief names the base and paths, charged to `gate.max_failures` like a failing command (#111); `preflight` rejects a blank pattern | `a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths`, `a_conflicting_rebase_is_aborted_and_names_the_conflicted_paths`, `a_conflict_confined_to_agent_resolvable_paths_is_handed_back_to_the_agent`, `a_conflict_touching_any_other_path_still_blocks_for_a_human`, `repeated_unresolved_docs_conflicts_escalate_to_blocked`, `a_blank_agent_resolvable_pattern_is_rejected`, `a_rebase_the_gate_could_not_abort_blocks_for_a_human_even_on_resolvable_paths`, `a_worktree_left_mid_rebase_is_detected_and_an_aborted_one_is_not` |
 | The gate cannot become a runaway | a failing command is a `Continue` that carries its output, bounded by `gate.max_failures` consecutive failures → `Blocked`, and by `gate.timeout_ms` per gate | `a_failing_gate_continues_the_run_with_the_failing_output_in_hand`, `repeated_gate_failures_escalate_to_blocked_rather_than_looping`, `a_gate_that_hangs_is_killed_at_the_timeout_and_counts_as_a_failure` |
 | A restart cannot forgive the gate's failure streak | the streak is `issue_state.gate_failures` (v7), bumped by `Store::bump_gate_failures` and cleared exactly where a pass or a verdict ending the line of work cleared the old in-memory map | `a_gate_failure_streak_is_not_forgiven_by_restarting_the_daemon` |
 | A gate cannot outrun the concurrency limit | `global_slots` and `state_slots` count `gating` as well as `running`, because a gate is a build on this host and the claim is held across it | `a_gating_run_still_holds_its_concurrency_slot_so_gates_cannot_accumulate` |
@@ -748,7 +762,7 @@ Every seam crewd needs to dispatch against its own backlog now has a real
 implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`
 (`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`), the tool broker
 (`[broker]`, on by default), run transcripts (`[transcripts]`, likewise) and the handoff gate
-(`[gate]`, on by default with `crew.github.toml` naming the three commit-gate commands) and
+(`[gate]`, on by default with `crew.github.toml` naming the commit-gate commands) and
 delivery (`[delivery]`, off by default and on in `crew.github.toml`, for the same reason
 `worker.kind` is: it publishes under the operator's credentials). The broker is on by default where the worker is not, because the
 two switches mean opposite things: `worker.kind` decides whether an agent runs at all, while
