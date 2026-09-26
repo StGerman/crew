@@ -25,7 +25,7 @@
 //!
 //! ## The constraint that must survive review
 //!
-//! **This server must never reach a dispatched agent.** The broker exists because a worker gets
+//! **crewd must never hand this server to a dispatched agent.** The broker exists because a worker gets
 //! authority scoped to one issue; this is scoped to the whole daemon. A worker that could call
 //! `unquarantine` or `unblock` could clear its own quarantine or park and re-dispatch itself, defeating
 //! `max_turns_per_issue`, the verdict and `parked_state` in one move — the three independent
@@ -45,12 +45,15 @@
 //!   URL pointed here by mistake answers no tools.
 //!
 //! What the crate cannot control is the operator's own `claude` configuration. The worker
-//! deliberately runs without `--strict-mcp-config`, so it inherits the operator's *user-scope*
-//! MCP servers (see [`crate::worker::claude`]'s module doc for why). **Register this server in
-//! the supervising agent's project or local scope, never user scope** — `claude mcp add --scope
-//! local`, or `--mcp-config` on the supervising session — or every worker inherits it and the
-//! wiring above is bypassed by configuration. Off by default for the same reason the HTTP API
-//! is: a daemon must not grow a control plane by being upgraded.
+//! deliberately runs without `--strict-mcp-config`, so it inherits the operator's MCP servers
+//! (see [`crate::worker::claude`]'s module doc for why) — and local scope does not keep this one
+//! out, because a worker's worktree is the same project to Claude Code: a dispatched run on
+//! 2026-09-26 listed `crew_ops` connected while it was registered only at local scope. The
+//! operator accepted that (2026-09-25): workers run as the same user and are trusted as that
+//! user, and these tools add nothing a same-user process cannot already do against the
+//! loopback HTTP API that serves the same routes. Withholding them for real would take
+//! `--strict-mcp-config` with the worker's servers passed explicitly. Off by default for the same
+//! reason the HTTP API is: a daemon must not grow a control plane by being upgraded.
 //!
 //! ## Exposure
 //!

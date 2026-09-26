@@ -50,11 +50,11 @@ max_calls_per_issue = 100
 [api]
 enabled = false
 bind = "127.0.0.1:8787"
-# The same four routes as MCP tools, for the *agent* supervising this daemon (src/api/mcp.rs);
-# `--mcp 127.0.0.1:8788` flips it for one run. Its own port on purpose — never the broker's —
-# and it must never reach a dispatched worker: register it in the supervising agent's local or
-# project scope (`claude mcp add --scope local --transport http crew_ops
-# http://127.0.0.1:8788/ops`), never user scope, which every worker inherits.
+# The ops API's routes as MCP tools, for the *agent* supervising this daemon (src/api/mcp.rs);
+# `--mcp 127.0.0.1:8788` flips it for one run. Its own port on purpose — never the broker's.
+# crewd never hands it to a worker, but a worker inherits the operator's MCP config (local
+# scope included, for a worktree of the same project), so registering it there exposes it to
+# workers too; src/api/mcp.rs says why that is accepted.
 mcp_enabled = false
 mcp_bind = "127.0.0.1:8788"
 
