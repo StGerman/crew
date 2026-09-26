@@ -382,20 +382,20 @@ impl<H: Http> GithubForge<H> {
 
     /// A mutation GitHub answers without `isResolved: true` did not resolve the thread, and
     /// reading it as success would record the verdict resolved and never try again (#100). It
-    /// is permanent: the same credential asking again gets the same answer.
+    /// is permanent: the same credential asking again gets the same answer. A payload with no
+    /// thread is the exception: the thread was deleted after the listing read it, and a deleted
+    /// thread has nothing left to resolve.
     fn resolve_review_thread(&self, thread_id: &str) -> Result<(), ForgeError> {
         let data: GqlResolveData = self.graphql(RESOLVE_MUTATION, json!({ "id": thread_id }))?;
-        let applied = data
-            .resolve_review_thread
-            .and_then(|p| p.thread)
-            .and_then(|t| t.is_resolved)
-            .unwrap_or(false);
-        if applied {
-            Ok(())
-        } else {
-            Err(ForgeError::Permanent(format!(
+        let not_applied = || {
+            ForgeError::Permanent(format!(
                 "graphql: review thread {thread_id} was not resolved by resolveReviewThread"
-            )))
+            ))
+        };
+        match data.resolve_review_thread.ok_or_else(not_applied)?.thread {
+            None => Ok(()),
+            Some(GqlResolvedThread { is_resolved: Some(true) }) => Ok(()),
+            Some(_) => Err(not_applied()),
         }
     }
 
@@ -1184,6 +1184,16 @@ mod tests {
                 "isResolved {answer}: got {err:?}"
             );
         }
+    }
+
+    /// Review on #102: a thread deleted between the listing and the mutation comes back as
+    /// `thread: null`, which is the idempotent "nothing left to resolve", not a refusal.
+    #[test]
+    fn a_thread_deleted_before_the_mutation_counts_as_resolved() {
+        let http = FakeHttp::new();
+        http.push(ok(gh_threads(&[("T_mine", false, 42)], None)));
+        http.push(ok(json!({ "data": { "resolveReviewThread": { "thread": null } } })));
+        resolve_one(&forge(http), "42").unwrap();
     }
 
     /// #100: each comment paged through every thread again, so the cost was verdicts × pages.
