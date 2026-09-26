@@ -6,6 +6,19 @@ file holds the reasoning behind each subsystem. Read the section for the subsyst
 changing before you change it. #63 will move each design note into its module's `//!` doc
 and each incident story into an ADR under `docs/adr/`, leaving one-line pointers here.
 
+## Decisions recorded as ADRs
+
+A decision that shapes the architecture is recorded in [`docs/adr/`](adr/) before the code
+(the `engineering:architecture` skill), and the issue and the code cite it in one line.
+This file keeps the reasoning; an ADR records the decision and what it ruled out.
+
+| ADR | Decision |
+|---|---|
+| [1. Where new work lands](adr/0001-extension-boundaries.md) | crewd stays one daemon with one authority; new work is a trait implementation, an external `crewctl-<name>` command, a hook, or a core change that protects an invariant |
+
+The async-versus-sync decision (#57) will be ADR 2. The incident stories under **Subsystems**
+move into ADRs under #63.
+
 ## Tick order: why each step sits where it does
 
 Reconciliation runs before the gate so that a broken config stops *new* dispatch without also
