@@ -70,6 +70,12 @@ impl FakeClock {
         g.0 = g.0.saturating_add(ms);
         g.1 = g.1.saturating_add(ms as i64);
     }
+
+    /// Move the wall clock alone, as an NTP step does, leaving the monotonic clock where it is.
+    pub fn step_wall_ms(&self, ms: i64) {
+        let mut g = self.inner.lock().unwrap();
+        g.1 = g.1.saturating_add(ms);
+    }
 }
 
 impl Default for FakeClock {

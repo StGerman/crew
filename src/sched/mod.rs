@@ -159,6 +159,10 @@ pub struct Scheduler {
     /// When each open delivery was last polled, so the forge is asked at
     /// `delivery.poll_interval_ms` rather than on every tick. Monotonic, like every interval.
     delivery_polled: HashMap<String, Mono>,
+    /// The head each delivery's CI is pending on and when that wait began, on the monotonic
+    /// clock so a wall-clock step cannot hand a pull request off early (#105). Rebuilt from
+    /// the store's wall-clock record after a restart, since `Mono` does not cross one.
+    ci_waits: HashMap<String, (String, Mono)>,
     running: HashMap<String, Running>,
     /// Runs between the agent's `Done` and the verdict the gate turns it into. Disjoint from
     /// `running`; an issue is in at most one of the two.
@@ -208,6 +212,7 @@ impl Scheduler {
             forge: None,
             publisher: None,
             delivery_polled: HashMap::new(),
+            ci_waits: HashMap::new(),
             running: HashMap::new(),
             gating: HashMap::new(),
             seen: HashMap::new(),

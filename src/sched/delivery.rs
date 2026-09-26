@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 
 use super::Scheduler;
-use crate::clock::Wall;
+use crate::clock::{Mono, Wall};
 use crate::forge::{CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec};
 use crate::model::{Feedback, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
@@ -429,8 +429,11 @@ impl Scheduler {
         }
 
         let ci = forge.ci_status(&pr.head_sha)?;
-        if d.ci_pending.is_some() && !matches!(ci, CiStatus::Pending { .. }) {
-            self.store.set_ci_pending(clock.as_ref(), issue_id, None)?;
+        if !matches!(ci, CiStatus::Pending { .. }) {
+            self.ci_waits.remove(issue_id);
+            if d.ci_pending.is_some() {
+                self.store.set_ci_pending(clock.as_ref(), issue_id, None)?;
+            }
         }
         match ci {
             CiStatus::Pending { running } => {
@@ -504,16 +507,30 @@ impl Scheduler {
         running: &[String],
     ) -> Result<(), StepError> {
         let clock = self.clock.clone();
-        let now = clock.wall().0;
-        let since = match &d.ci_pending {
+        let now = clock.mono();
+        let since = match self.ci_waits.get(issue_id) {
             Some((head, since)) if *head == pr.head_sha => *since,
             _ => {
-                self.store.set_ci_pending(clock.as_ref(), issue_id, Some(&pr.head_sha))?;
-                now
+                // A record for this head that is not in memory is one a restart left: wall time
+                // is all that crosses a restart, so it alone decides how much of the wait is
+                // already spent — the same trust `retry.due_at` places in it.
+                let spent = match &d.ci_pending {
+                    Some((head, at)) if *head == pr.head_sha => {
+                        clock.wall().0.saturating_sub(*at).max(0) as u64
+                    }
+                    _ => {
+                        self.store.set_ci_pending(clock.as_ref(), issue_id, Some(&pr.head_sha))?;
+                        0
+                    }
+                };
+                let since = Mono(now.0.saturating_sub(spent));
+                self.ci_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), since));
+                since
             }
         };
         let timeout = self.cfg.delivery.ci_timeout_ms;
-        if now.saturating_sub(since).max(0) as u64 <= timeout {
+        let waited = now.saturating_since(since);
+        if waited <= timeout {
             tracing::debug!(issue_id, pr = pr.number, head = %pr.head_sha, "awaiting CI");
             return Ok(());
         }
@@ -526,7 +543,7 @@ impl Scheduler {
             "no check run completed on {} within {} of {}; {what}",
             pr.head_sha,
             fmt_ms(timeout),
-            timestamp(since)
+            timestamp(clock.wall().0 - waited as i64)
         );
         tracing::warn!(issue_id, pr = pr.number, "{reason}; handing off");
         self.hand_off(issue_id, &reason).map_err(StepError::Other)

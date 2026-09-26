@@ -2761,6 +2761,71 @@ fn a_head_the_operator_pushed_gets_its_own_ci_wait() {
     assert!(d.handoff_reason.unwrap().contains("operator-merge"), "names the head it waited on");
 }
 
+/// Review on #121: the CI wait is an interval, so it is timed on the monotonic clock — a wall
+/// clock stepped forward by NTP must not hand off a pull request whose checks are still running.
+#[test]
+fn a_wall_clock_step_does_not_cut_a_ci_wait_short() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_ci(&FakeForge::head_after_publish(1), copilot_running());
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+
+    h.clock.step_wall_ms(2 * HOUR_MS as i64);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "a second of waiting is a second, whatever the wall clock says"
+    );
+}
+
+/// `Mono` does not cross a restart, so the wait is rebuilt from the store's wall-clock record
+/// of it: a daemon restarted every half hour must still hand off CI that never reports.
+#[test]
+fn a_restart_does_not_forgive_the_ci_wait_already_spent() {
+    let dir = tmp_dir("ci-wait-restart");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    forge.set_ci(&FakeForge::head_after_publish(1), copilot_running());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        run_once(&mut h);
+        h.clock.advance_ms(HOUR_MS * 3 / 4);
+        h.sched.tick().unwrap();
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    }
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    // The new process's clock starts where the old one did; this is the time that has passed.
+    h.clock.advance_ms(HOUR_MS * 3 / 4 + 5_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(HOUR_MS / 4);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::HandedOff,
+        "the wait spent before the restart still counts"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// GETT-174120: requesting a bot reviewer over REST returns success and adds nobody. The
 /// provider's answer is not evidence; the pull request's own state is, and a request that did
 /// not take must be reported as the failure it is.
