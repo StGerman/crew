@@ -31,6 +31,7 @@ use crate::worker::TokenUsage;
 pub enum UiAction {
     ForceTick,
     Unquarantine(String),
+    Unblock(String),
     Quit,
 }
 
@@ -108,6 +109,13 @@ impl Ui {
                 (KeyCode::Char('u'), _) => {
                     if let Some(row) = snap.rows.get(self.selected).filter(|r| r.quarantined) {
                         let _ = self.actions.send(UiAction::Unquarantine(row.issue_id.clone()));
+                    }
+                }
+                (KeyCode::Char('b'), _) => {
+                    // Unfiltered, unlike `u`: the snapshot does not say whether a row is
+                    // parked, and the store's guard answers that without a race anyway.
+                    if let Some(row) = snap.rows.get(self.selected) {
+                        let _ = self.actions.send(UiAction::Unblock(row.issue_id.clone()));
                     }
                 }
                 _ => {}
@@ -191,7 +199,7 @@ fn render_footer(f: &mut Frame, area: Rect, snap: &Snapshot) {
     }
 
     let help = Span::styled(
-        "  ↑↓ select · r tick · u unquarantine · q quit",
+        "  ↑↓ select · r tick · u unquarantine · b unblock · q quit",
         Style::default().fg(Color::DarkGray),
     );
 

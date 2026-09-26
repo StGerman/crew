@@ -388,6 +388,28 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Lift a park an operator has resolved, reporting whether there was one to lift (#108).
+    ///
+    /// Guarded for the same reason as [`Store::unquarantine`], and in the same statement: only
+    /// a parked issue in phase `released`, unquarantined and with no retry row, is unparked.
+    /// A running or gating issue holds phase `running`, and a retry-queued one holds a retry
+    /// row, so neither matches; clearing a park on anything live would let the next tick
+    /// dispatch a second agent onto a worktree already in use. The claim is never touched —
+    /// the next `dispatch_new` takes it the ordinary way. The parked note goes too, since
+    /// it names the problem the operator has just resolved.
+    pub fn unblock(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE issue_state
+             SET parked_state = NULL, last_error = NULL, last_error_class = NULL, updated_at = ?2
+             WHERE issue_id = ?1 AND parked_state IS NOT NULL AND phase = 'released'
+               AND quarantined_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM retry WHERE retry.issue_id = ?1)",
+            params![issue_id, clock.wall().0],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Park an issue in its current tracker state after a `Done` or `Blocked` verdict.
     ///
     /// Releasing the claim alone is not enough: the ticket is usually still sitting in an

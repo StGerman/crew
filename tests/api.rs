@@ -176,6 +176,11 @@ impl Harness {
                 self.snap_tx.send(self.sched.snapshot().unwrap()).unwrap();
                 let _ = reply.send(cleared);
             }
+            Command::Unblock { issue_id, reply } => {
+                let cleared = self.sched.unblock(&issue_id);
+                self.snap_tx.send(self.sched.snapshot().unwrap()).unwrap();
+                let _ = reply.send(cleared);
+            }
         }
     }
 }

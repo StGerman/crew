@@ -1653,6 +1653,15 @@ impl Scheduler {
         Ok(self.store.unquarantine(self.clock.as_ref(), issue_id)?)
     }
 
+    /// Operator action: hand a parked issue back once whatever parked it has been resolved.
+    ///
+    /// Reports whether a park was lifted; anything live is a no-op that says so (see
+    /// [`Store::unblock`]). The next `dispatch_new` sees the issue as live and dispatches it
+    /// onto its existing branch.
+    pub fn unblock(&self, issue_id: &str) -> anyhow::Result<bool> {
+        Ok(self.store.unblock(self.clock.as_ref(), issue_id)?)
+    }
+
     /// Stop every in-flight run before the process exits.
     ///
     /// A worker `RunHandle` outlives the `Scheduler` that spawned it unless something kills it

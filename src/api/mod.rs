@@ -1,7 +1,7 @@
 //! A small read-mostly HTTP surface, so a running orchestrator can be inspected and nudged
 //! without a terminal attached.
 //!
-//! Four routes, all under `/api/v1`:
+//! Five routes, all under `/api/v1`:
 //!
 //! | Route | Method | Answer |
 //! |---|---|---|
@@ -9,6 +9,7 @@
 //! | `/issues/:identifier` | `GET` | one [`Row`], run history included |
 //! | `/refresh` | `POST` | the snapshot the forced tick published |
 //! | `/unquarantine/:identifier` | `POST` | whether a quarantine was actually cleared |
+//! | `/unblock/:identifier` | `POST` | whether a park was actually lifted (#108) |
 //!
 //! Four properties decide the shape of everything below:
 //!
@@ -23,14 +24,14 @@
 //!   waits on this side — its reply goes to a `oneshot` whose receiver may already be gone. A
 //!   request that stops mid-header is dropped by [`READ_TIMEOUT`] rather than holding anything
 //!   the scheduler needs.
-//! * **Loopback unless an operator says otherwise.** The two `POST` routes control agent
+//! * **Loopback unless an operator says otherwise.** The `POST` routes control agent
 //!   execution, so [`bind`] refuses a non-loopback address unless `api.allow_public` is set.
 //! * **Every response proves it came from here.** A status code and a JSON body are exactly
 //!   what an unrelated service on the same port could also produce, so every response this
 //!   module writes — success or error — carries [`API_MARKER_HEADER`], and [`client::Client`]
 //!   refuses to trust anything else in a response that lacks it.
 //!
-//! There is no framework here on purpose. Four routes, no query parameters, no content
+//! There is no framework here on purpose. Five routes, no query parameters, no content
 //! negotiation and one response type do not pay for a server stack; `ureq` covers the client
 //! side of this crate's HTTP needs and this covers the server side, both deliberately small.
 //!
@@ -70,14 +71,16 @@ use libcrew::api::{API_MARKER_HEADER, API_MARKER_VERSION, normalize_bind};
 
 /// Work only the scheduler loop may do, with a channel to answer on.
 ///
-/// Both variants are operator actions the dashboard already offers; this module deliberately
-/// cannot express anything the `r` and `u` keys cannot.
+/// Every variant is an operator action the dashboard already offers; this module deliberately
+/// cannot express anything the `r`, `u` and `b` keys cannot.
 #[derive(Debug)]
 pub enum Command {
     /// Run one tick now, and answer with the snapshot that tick published.
     Tick(oneshot::Sender<anyhow::Result<Snapshot>>),
     /// Clear a quarantine, answering whether there was one to clear.
     Unquarantine { issue_id: String, reply: oneshot::Sender<anyhow::Result<bool>> },
+    /// Lift a park, answering whether there was one to lift.
+    Unblock { issue_id: String, reply: oneshot::Sender<anyhow::Result<bool>> },
 }
 
 /// Bind the API's listener, refusing an exposure nobody asked for.
@@ -93,7 +96,7 @@ pub async fn bind(cfg: &ApiConfig) -> anyhow::Result<TcpListener> {
 /// Parse a configured bind address and apply the exposure rule.
 ///
 /// Shared with [`mcp::bind`], so the two operator surfaces cannot drift on what "loopback" or
-/// "public" means: both carry the same two write actions, so one `allow_public` governs both.
+/// "public" means: both carry the same write actions, so one `allow_public` governs both.
 /// `field` names the config key in the error, because an operator fixing a typo needs to know
 /// which of the two addresses to look at.
 pub(crate) fn resolve_bind(
@@ -185,11 +188,15 @@ impl Api {
             ("GET", ["api", "v1", "issues", key]) => self.issue(key),
             ("POST", ["api", "v1", "refresh"]) => self.refresh().await,
             ("POST", ["api", "v1", "unquarantine", key]) => self.unquarantine(key).await,
+            ("POST", ["api", "v1", "unblock", key]) => self.unblock(key).await,
 
             (_, ["api", "v1", "snapshot"] | ["api", "v1", "issues", _]) => Response::allow("GET"),
-            (_, ["api", "v1", "refresh"] | ["api", "v1", "unquarantine", _]) => {
-                Response::allow("POST")
-            }
+            (
+                _,
+                ["api", "v1", "refresh"]
+                | ["api", "v1", "unquarantine", _]
+                | ["api", "v1", "unblock", _],
+            ) => Response::allow("POST"),
             _ => Response::error(404, "no such endpoint"),
         }
     }
@@ -236,7 +243,15 @@ impl Api {
     }
 
     async fn unquarantine(&self, key: &str) -> Response {
-        match self.request_unquarantine(key) {
+        self.act(Action::Unquarantine, key).await
+    }
+
+    async fn unblock(&self, key: &str) -> Response {
+        self.act(Action::Unblock, key).await
+    }
+
+    async fn act(&self, action: Action, key: &str) -> Response {
+        match self.request_action(action, key) {
             Ok((target, rx)) => target.reply(rx.await),
             Err(refused) => refused,
         }
@@ -244,13 +259,22 @@ impl Api {
 
     /// [`Api::unquarantine`] for a caller on a plain thread; see [`Api::refresh_blocking`].
     pub(crate) fn unquarantine_blocking(&self, key: &str) -> Response {
-        match self.request_unquarantine(key) {
+        self.act_blocking(Action::Unquarantine, key)
+    }
+
+    /// [`Api::unblock`] for a caller on a plain thread; see [`Api::refresh_blocking`].
+    pub(crate) fn unblock_blocking(&self, key: &str) -> Response {
+        self.act_blocking(Action::Unblock, key)
+    }
+
+    fn act_blocking(&self, action: Action, key: &str) -> Response {
+        match self.request_action(action, key) {
             Ok((target, rx)) => target.reply(rx.blocking_recv()),
             Err(refused) => refused,
         }
     }
 
-    fn request_unquarantine(&self, key: &str) -> Result<(Target, UnquarantineReply), Response> {
+    fn request_action(&self, action: Action, key: &str) -> Result<(Target, ActionReply), Response> {
         let snap = self.latest();
         let (issue_id, identifier) = match resolve(&snap, key) {
             Resolved::One(row) => (row.issue_id.clone(), row.identifier.clone()),
@@ -260,15 +284,18 @@ impl Api {
             Resolved::Ambiguous(ids) => return Err(ambiguous(key, &ids)),
         };
 
-        // Sent even when this snapshot says the issue is not quarantined: the snapshot is as
-        // old as the last tick, and the store decides the question without a race anyway. Its
+        // Sent even when this snapshot says there is nothing to clear: the snapshot is as old
+        // as the last tick, and the store decides the question without a race anyway. Its
         // answer, not this row, is what the operator is told.
         let (tx, rx) = oneshot::channel();
-        let cmd = Command::Unquarantine { issue_id: issue_id.clone(), reply: tx };
+        let cmd = match action {
+            Action::Unquarantine => Command::Unquarantine { issue_id: issue_id.clone(), reply: tx },
+            Action::Unblock => Command::Unblock { issue_id: issue_id.clone(), reply: tx },
+        };
         if self.commands.send(cmd).is_err() {
             return Err(Response::error(503, "the scheduler is no longer accepting commands"));
         }
-        Ok((Target { issue_id, identifier }, rx))
+        Ok((Target { action, issue_id, identifier }, rx))
     }
 }
 
@@ -280,10 +307,41 @@ fn tick_reply(answer: Result<anyhow::Result<Snapshot>, oneshot::error::RecvError
     }
 }
 
-type UnquarantineReply = oneshot::Receiver<anyhow::Result<bool>>;
+type ActionReply = oneshot::Receiver<anyhow::Result<bool>>;
 
-/// The issue an unquarantine was sent for, kept so the answer can name it.
+/// The two guarded operator actions on one issue. One type, so the routes and the MCP tools
+/// share a resolution, a `409` and an answer shape rather than each growing its own.
+#[derive(Debug, Clone, Copy)]
+enum Action {
+    Unquarantine,
+    Unblock,
+}
+
+impl Action {
+    fn detail(self, cleared: bool) -> &'static str {
+        match (self, cleared) {
+            (Action::Unquarantine, true) => "quarantine cleared; the issue is dispatchable again",
+            (Action::Unquarantine, false) => "not quarantined; nothing to clear",
+            (Action::Unblock, true) => {
+                "park lifted; the next tick dispatches the issue onto its existing branch"
+            }
+            (Action::Unblock, false) => {
+                "not parked, or running, gating or waiting on a retry; nothing to unblock"
+            }
+        }
+    }
+
+    fn failed(self) -> &'static str {
+        match self {
+            Action::Unquarantine => "clearing the quarantine failed",
+            Action::Unblock => "lifting the park failed",
+        }
+    }
+}
+
+/// The issue an action was sent for, kept so the answer can name it.
 struct Target {
+    action: Action,
     issue_id: String,
     identifier: String,
 }
@@ -297,14 +355,10 @@ impl Target {
                     "issue_id": self.issue_id,
                     "identifier": self.identifier,
                     "cleared": cleared,
-                    "detail": if cleared {
-                        "quarantine cleared; the issue is dispatchable again"
-                    } else {
-                        "not quarantined; nothing to clear"
-                    },
+                    "detail": self.action.detail(cleared),
                 }),
             ),
-            Ok(Err(e)) => Response::error(500, &format!("clearing the quarantine failed: {e}")),
+            Ok(Err(e)) => Response::error(500, &format!("{}: {e}", self.action.failed())),
             Err(_) => Response::error(503, "the scheduler stopped before the action completed"),
         }
     }
@@ -427,7 +481,7 @@ fn reason(status: u16) -> &'static str {
 
 /// Read one request head, then drain whatever body followed it.
 ///
-/// Every connection is answered and closed — no keep-alive. Four routes that an operator hits
+/// Every connection is answered and closed — no keep-alive. Five routes that an operator hits
 /// by hand or from a script do not need connection reuse, and a parser that never has to find
 /// the next request on the same socket is a parser with far less to get wrong.
 async fn read_request(stream: &mut TcpStream) -> Result<Request, Response> {
@@ -611,5 +665,6 @@ mod tests {
         let api = Api::new(rx, ctx);
         assert_eq!(api.refresh().await.status, 503);
         assert_eq!(api.unquarantine("MT-1").await.status, 503);
+        assert_eq!(api.unblock("MT-1").await.status, 503);
     }
 }

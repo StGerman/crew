@@ -9,8 +9,8 @@
 //!
 //! ## What it is, exactly
 //!
-//! One tool per HTTP route and nothing else — `snapshot`, `issue`, `refresh`, `unquarantine` —
-//! each answering with the same JSON body the corresponding route writes. That is not a
+//! One tool per HTTP route and nothing else — `snapshot`, `issue`, `refresh`, `unquarantine`,
+//! `unblock` — each answering with the same JSON body the corresponding route writes. That is not a
 //! resemblance kept up by discipline: every tool runs the *same* [`Api`] method the router
 //! runs, and frames the resulting [`Response`] as a tool result instead of an HTTP response. A
 //! status below 400 is a plain result; anything else is the same body with `isError: true`, so
@@ -27,7 +27,7 @@
 //!
 //! **This server must never reach a dispatched agent.** The broker exists because a worker gets
 //! authority scoped to one issue; this is scoped to the whole daemon. A worker that could call
-//! `unquarantine` could clear its own quarantine and re-dispatch itself, defeating
+//! `unquarantine` or `unblock` could clear its own quarantine or park and re-dispatch itself, defeating
 //! `max_turns_per_issue`, the verdict and `parked_state` in one move — the three independent
 //! brakes the invariant table says to keep all of.
 //!
@@ -90,10 +90,12 @@ pub const TOOL_SNAPSHOT: &str = "snapshot";
 pub const TOOL_ISSUE: &str = "issue";
 pub const TOOL_REFRESH: &str = "refresh";
 pub const TOOL_UNQUARANTINE: &str = "unquarantine";
+pub const TOOL_UNBLOCK: &str = "unblock";
 
 /// Every tool this server offers. One place, so the wiring test and `tools/list` cannot
 /// disagree about what "an ops tool" is.
-pub const TOOLS: &[&str] = &[TOOL_SNAPSHOT, TOOL_ISSUE, TOOL_REFRESH, TOOL_UNQUARANTINE];
+pub const TOOLS: &[&str] =
+    &[TOOL_SNAPSHOT, TOOL_ISSUE, TOOL_REFRESH, TOOL_UNQUARANTINE, TOOL_UNBLOCK];
 
 /// Bind the ops MCP listener, refusing an exposure nobody asked for.
 ///
@@ -163,6 +165,19 @@ impl OpsMcp {
                                 was not quarantined. The same action as POST \
                                 /api/v1/unquarantine/:key and the dashboard's `u` key.",
                 "inputSchema": key
+            },
+            {
+                "name": TOOL_UNBLOCK,
+                "description": "Lift the park on an issue a `Done` or `Blocked` verdict left \
+                                waiting — a gate's rebase conflict, say — once its cause has \
+                                been resolved, so the next tick dispatches it onto its \
+                                existing branch. Write what changed into the issue's \
+                                description first: that is the prompt the agent reads. \
+                                Reports `cleared: false` rather than failing when the issue \
+                                is not parked or is running, gating or waiting on a retry. \
+                                The same action as POST /api/v1/unblock/:key and the \
+                                dashboard's `b` key.",
+                "inputSchema": key
             }
         ])
     }
@@ -178,6 +193,7 @@ impl OpsMcp {
             (TOOL_ISSUE, Some(key)) => self.api.issue(&key),
             (TOOL_REFRESH, None) => self.api.refresh_blocking(),
             (TOOL_UNQUARANTINE, Some(key)) => self.api.unquarantine_blocking(&key),
+            (TOOL_UNBLOCK, Some(key)) => self.api.unblock_blocking(&key),
             _ => Response::error(400, &format!("unknown tool: {tool}")),
         }
     }
@@ -191,7 +207,7 @@ impl OpsMcp {
 fn argument(tool: &str, args: &Value) -> Result<Option<String>, Response> {
     let takes_key = match tool {
         TOOL_SNAPSHOT | TOOL_REFRESH => false,
-        TOOL_ISSUE | TOOL_UNQUARANTINE => true,
+        TOOL_ISSUE | TOOL_UNQUARANTINE | TOOL_UNBLOCK => true,
         other => return Err(Response::error(400, &format!("unknown tool: {other}"))),
     };
     let obj =
@@ -322,6 +338,8 @@ mod tests {
         assert!(err.contains("no longer accepting commands"), "{err}");
         let err = svc.call(PATH, TOOL_UNQUARANTINE, &json!({ "key": "MT-1" })).unwrap_err();
         assert!(err.contains("no longer accepting commands"), "{err}");
+        let err = svc.call(PATH, TOOL_UNBLOCK, &json!({ "key": "MT-1" })).unwrap_err();
+        assert!(err.contains("no longer accepting commands"), "{err}");
     }
 
     #[test]
@@ -356,7 +374,7 @@ mod tests {
 
     #[test]
     fn every_tool_is_a_route_that_exists_and_the_list_names_each_once() {
-        // The scope rule from the issue: a tool per existing route, no more. Four routes, four
+        // The scope rule from the issue: a tool per existing route, no more. Five routes, five
         // tools, and the schemas close over their arguments.
         let tools = OpsMcp::tools_json();
         let names: Vec<&str> =
