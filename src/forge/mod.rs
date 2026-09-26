@@ -155,10 +155,13 @@ pub trait Forge: Send + Sync {
     /// the reviewer who left the comment.
     fn reply(&self, number: u64, comment_id: &str, body: &str) -> Result<(), ForgeError>;
 
-    /// Resolve the thread rooted at `comment_id`, so a settled comment reads as done to the
-    /// person merging. Idempotent: a thread already resolved is `Ok`, and so is one that no
-    /// longer exists — a deleted comment has nothing left to resolve.
-    fn resolve_thread(&self, number: u64, comment_id: &str) -> Result<(), ForgeError>;
+    /// Resolve the thread rooted at each of `comment_ids`, so a settled comment reads as done to
+    /// the person merging, answering one result per id in the same order. A batch because
+    /// finding a thread means reading every thread on the pull request, and one pass per
+    /// comment would spend that read again for each (#100). Idempotent: a thread already
+    /// resolved is `Ok`, and so is one that no longer exists — a deleted comment has nothing
+    /// left to resolve.
+    fn resolve_threads(&self, number: u64, comment_ids: &[String]) -> Vec<Result<(), ForgeError>>;
 }
 
 /// What a run leaves on its branch after `Workspace::publish` has pushed it.
