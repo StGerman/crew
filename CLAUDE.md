@@ -63,8 +63,9 @@ cargo run --example dashboard_preview      # render the UI to stdout, no termina
 cargo run --example broker_live            # real `claude` against a real broker; spends tokens
 ```
 
-The first three are the commit gate, and [.github/workflows/ci.yml](.github/workflows/ci.yml)
-runs them as three required checks on every pull request rather than trusting whoever
+`cargo test`, `cargo clippy` and `cargo fmt --check` are the commit gate, and
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs each as a required check on every
+pull request rather than trusting whoever
 remembers — delivery opens a pull request for every agent branch, so that is where a red gate
 can still stop a merge. `default-members` covers every package, so each of those commands
 checks the client and the library as well as the daemon, and `default-run` keeps a bare
@@ -458,7 +459,7 @@ The ops API ([src/api/mod.rs](src/api/mod.rs)) is the second observer of that sa
 snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v1/refresh`,
 `POST /api/v1/unquarantine/:identifier`, `POST /api/v1/unblock/:identifier`. `Api` holds a
 `watch::Receiver` and a command sender and no `Store`, so rule 3 is enforced by the type rather
-than by discipline — and the three `POST`s can express nothing the dashboard's `r`, `u` and `b`
+than by discipline — and the `POST`s can express nothing the dashboard's `r`, `u` and `b`
 keys cannot. Off by default (`[api]
 enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
 because the `POST` routes control agent execution. Deliberately *not* validated in
@@ -752,7 +753,7 @@ Every seam crewd needs to dispatch against its own backlog now has a real
 implementation: `GitWorktreeWorkspace`, `TasksProjector`, `GithubTracker`
 (`tracker.kind = "github"`), `ClaudeWorker` (`worker.kind = "claude"`), the tool broker
 (`[broker]`, on by default), run transcripts (`[transcripts]`, likewise) and the handoff gate
-(`[gate]`, on by default with `crew.github.toml` naming the three commit-gate commands) and
+(`[gate]`, on by default with `crew.github.toml` naming the commit-gate commands) and
 delivery (`[delivery]`, off by default and on in `crew.github.toml`, for the same reason
 `worker.kind` is: it publishes under the operator's credentials). The broker is on by default where the worker is not, because the
 two switches mean opposite things: `worker.kind` decides whether an agent runs at all, while

@@ -31,7 +31,7 @@
 //!   module writes — success or error — carries [`API_MARKER_HEADER`], and [`client::Client`]
 //!   refuses to trust anything else in a response that lacks it.
 //!
-//! There is no framework here on purpose. A handful of routes, no query parameters, no content
+//! There is no framework here on purpose. Plain routes, no query parameters, no content
 //! negotiation and one response type do not pay for a server stack; `ureq` covers the client
 //! side of this crate's HTTP needs and this covers the server side, both deliberately small.
 //!
@@ -309,7 +309,7 @@ fn tick_reply(answer: Result<anyhow::Result<Snapshot>, oneshot::error::RecvError
 
 type ActionReply = oneshot::Receiver<anyhow::Result<bool>>;
 
-/// The two guarded operator actions on one issue. One type, so the routes and the MCP tools
+/// The guarded operator actions on one issue. One type, so the routes and the MCP tools
 /// share a resolution, a `409` and an answer shape rather than each growing its own.
 #[derive(Debug, Clone, Copy)]
 enum Action {

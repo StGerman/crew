@@ -164,7 +164,7 @@ impl std::fmt::Display for StatusError {
 
 impl std::error::Error for StatusError {}
 
-/// The two read routes this client uses, spelled once.
+/// The read routes this client uses, spelled once.
 const SNAPSHOT: &str = "/api/v1/snapshot";
 
 fn issue_path(key: &str) -> String {
