@@ -87,6 +87,9 @@ struct Inner {
     /// `(number, comment_id)` of every thread resolved.
     resolved: HashSet<(u64, String)>,
     ops: Vec<Op>,
+    /// Every `pull_request` read, which `ops` does not record: a handed-off row is polled with
+    /// reads alone, and a test has to see that it is polled at all.
+    pr_reads: u32,
     stacked_on: Option<String>,
 }
 
@@ -115,6 +118,10 @@ impl FakeForge {
 
     pub fn ops(&self) -> Vec<Op> {
         self.inner.lock().unwrap().ops.clone()
+    }
+
+    pub fn pr_reads(&self) -> u32 {
+        self.inner.lock().unwrap().pr_reads
     }
 
     pub fn open_prs(&self) -> Vec<PullRequest> {
@@ -351,7 +358,8 @@ impl Forge for FakeForge {
     }
 
     fn pull_request(&self, number: u64) -> Result<PullRequest, ForgeError> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
+        g.pr_reads += 1;
         Self::gate(&g)?;
         g.prs
             .get(&number)
