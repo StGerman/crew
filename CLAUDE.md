@@ -99,15 +99,15 @@ the `dispatched` log line: `jq -c 'select(.type=="assistant")'` for the turns, `
 crew_run_end` for how it exited.
 
 ```bash
-GITHUB_TOKEN=$(gh auth token) cargo run -- --config crew.github.toml --max-ticks 3
+cargo run -- --config crew.github.toml --max-ticks 3
 ```
 
-points the tracker at this repo's own Issues. `crew.github.toml` is checked in, holds no token,
-and sets `tracker.dispatch_label = "agent"`: the label alone makes an issue dispatchable
-(`DispatchRule` in `src/tracker/github.rs`). `tracker.github_app` replaces `GITHUB_TOKEN` with a
-GitHub App identity (#64); it is commented out until `~/.crewd/github-app.toml` exists, because
-an uncommented key with no file stops the daemon at startup. How the App token is minted and
-reaches `git push` is in [docs/architecture.md](docs/architecture.md).
+points the tracker at this repo's own Issues as the `crew-bot` GitHub App (#64, #98): every
+write is authored by `crew-bot[bot]`, from `~/.crewd/github-app.toml` (`crewd init` writes it),
+and a missing or incomplete file stops the daemon at startup by name. With `tracker.github_app`
+commented out, `GITHUB_TOKEN=$(gh auth token)` is the fallback for a smoke run. The config
+holds no token and sets `tracker.dispatch_label = "agent"`: the label alone makes an issue
+dispatchable (`DispatchRule` in `src/tracker/github.rs`); token minting is in `docs/architecture.md`.
 
 **`worker.kind = "claude"` spawns real agents** (`claude -p --permission-mode
 bypassPermissions`, against real worktrees), so `--max-ticks` on such a config is not a dry run.

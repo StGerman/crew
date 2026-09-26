@@ -500,14 +500,23 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Parse and preflight a config, then check the host has what `tracker.github_app` names.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let cfg = Self::parse(path)?;
+        cfg.check_github_app()?;
+        Ok(cfg)
+    }
+
+    /// Everything [`Config::load`] checks that depends on the file alone, not on this host. The
+    /// App settings file and key are the operator's (#98), so a checked-in config naming them
+    /// must still parse on a machine, CI included, that has neither.
+    pub fn parse(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path)
             .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
         let mut cfg: Config = toml::from_str(&text)
             .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
         cfg.normalize();
         cfg.preflight()?;
-        cfg.check_github_app()?;
         Ok(cfg)
     }
 
@@ -933,10 +942,14 @@ mod tests {
     fn the_checked_in_configs_load() {
         for name in ["crew.toml", "crew.github.toml"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
-            if let Err(e) = Config::load(&path) {
+            if let Err(e) = Config::parse(&path) {
                 panic!("{name}: {e}");
             }
         }
+        // The dogfooding config writes as the App by default (#98); its settings file is the
+        // host's, so only `load` checks it.
+        let github = Config::parse(&Path::new(env!("CARGO_MANIFEST_DIR")).join("crew.github.toml"));
+        assert!(github.unwrap().tracker.github_app.is_some());
     }
 
     #[test]
