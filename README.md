@@ -129,9 +129,9 @@ keyboard, and the documentation is split to match:
 
 - **[CLAUDE.md](CLAUDE.md)** is the working surface — every command, the core rules, and the
   traps that are expensive to rediscover. It points to
-  **[docs/invariants.md](docs/invariants.md)**, read before changing anything under
-  `src/sched/`, and **[docs/architecture.md](docs/architecture.md)**, the reasoning behind each
-  subsystem.
+  **[docs/invariants.md](docs/invariants.md)**, read before changing `src/sched/`, `src/store/`,
+  `src/broker/`, `src/gate/` or delivery, and **[docs/architecture.md](docs/architecture.md)**,
+  the reasoning behind each subsystem.
 - **[docs/coding-guidelines.md](docs/coding-guidelines.md)** is how code is written here, with
   a named check for every rule. Read it before your first edit.
 
