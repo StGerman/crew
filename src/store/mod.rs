@@ -1392,6 +1392,18 @@ impl Store {
         Ok(())
     }
 
+    /// Clear what `note_error` or `set_note` left on the issue's row, once what it reported is
+    /// over — a delivery whose pull request the operator merged or closed.
+    pub fn clear_note(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET last_error = NULL, last_error_class = NULL, updated_at = ?2
+             WHERE issue_id = ?1",
+            params![issue_id, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
     /// Settle one review comment. Insert-or-ignore: the first verdict stands, and a later run
     /// re-arguing a settled thread changes nothing here — that is the point of recording it.
     pub fn record_verdict(

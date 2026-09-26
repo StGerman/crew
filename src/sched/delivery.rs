@@ -137,6 +137,10 @@ impl Scheduler {
 
     /// Poll every delivery that is waiting on the outside world.
     ///
+    /// A handed-off row is polled too, for its pull request's state alone: the operator owns
+    /// it from there, but a row never polled again keeps publishing the handoff as a live
+    /// failure after the operator has merged it (#101).
+    ///
     /// Skips issues that anything else owns — a live run, a claim, a retry timer — because a
     /// push from under a running agent, or a hand-back racing a dispatch, is exactly the kind
     /// of double-ownership the claim exists to rule out. Each delivery is polled at
@@ -150,7 +154,10 @@ impl Scheduler {
         for d in self.store.deliveries()? {
             if !matches!(
                 d.stage,
-                DeliveryStage::Pending | DeliveryStage::Awaiting | DeliveryStage::Ready
+                DeliveryStage::Pending
+                    | DeliveryStage::Awaiting
+                    | DeliveryStage::Ready
+                    | DeliveryStage::HandedOff
             ) {
                 continue;
             }
@@ -179,6 +186,9 @@ impl Scheduler {
         else {
             return Ok(());
         };
+        if d.stage == DeliveryStage::HandedOff {
+            return self.watch_handoff(issue_id, &d);
+        }
         match self.step_delivery(issue_id, &st, &d) {
             Ok(()) => Ok(()),
             Err(StepError::Forge(e)) if e.retryable() => {
@@ -206,6 +216,44 @@ impl Scheduler {
             Some(reason),
         )?;
         self.store.note_error(self.clock.as_ref(), issue_id, reason)?;
+        Ok(())
+    }
+
+    /// Read a handed-off pull request's state and nothing else: no push, no review request, no
+    /// hand-back to an agent, because the handoff gave the branch to the operator. A failed read
+    /// is logged and tried again next poll rather than handed off a second time, which would
+    /// overwrite the reason the operator was handed it with one about a status read.
+    fn watch_handoff(&mut self, issue_id: &str, d: &DeliveryRecord) -> anyhow::Result<()> {
+        let Some(number) = d.pr_number else { return Ok(()) };
+        let forge = self.forge.clone().expect("checked by delivery_on");
+        match forge.pull_request(number) {
+            Ok(p) if p.state != PrState::Open => self.close_delivery(issue_id, &p),
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(issue_id, pr = number, error = %e, "handed-off pull request unreadable; will retry next poll");
+                Ok(())
+            }
+        }
+    }
+
+    /// The operator merged or closed the pull request, which ends the delivery however it got
+    /// there. The issue's error is cleared with it: a handoff reason left on the row would keep
+    /// a merged issue on every observer as a live failure (#101).
+    fn close_delivery(&mut self, issue_id: &str, p: &PullRequest) -> anyhow::Result<()> {
+        let how = if p.state == PrState::Merged { "merged" } else { "closed" };
+        tracing::info!(
+            issue_id,
+            pr = p.number,
+            how,
+            "pull request is no longer open; delivery over"
+        );
+        self.store.set_delivery_stage(
+            self.clock.as_ref(),
+            issue_id,
+            DeliveryStage::Closed,
+            Some(how),
+        )?;
+        self.store.clear_note(self.clock.as_ref(), issue_id)?;
         Ok(())
     }
 
@@ -239,20 +287,7 @@ impl Scheduler {
         if let Some(p) = &pr
             && p.state != PrState::Open
         {
-            let how = if p.state == PrState::Merged { "merged" } else { "closed" };
-            tracing::info!(
-                issue_id,
-                pr = p.number,
-                how,
-                "pull request is no longer open; delivery over"
-            );
-            self.store.set_delivery_stage(
-                clock.as_ref(),
-                issue_id,
-                DeliveryStage::Closed,
-                Some(how),
-            )?;
-            return Ok(());
+            return self.close_delivery(issue_id, p).map_err(StepError::Other);
         }
 
         if d.stage == DeliveryStage::Pending {

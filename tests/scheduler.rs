@@ -3234,6 +3234,64 @@ fn a_merged_pull_request_whose_branch_cleanup_deleted_closes_delivery_rather_tha
     );
 }
 
+/// A handed-off pull request is the operator's, and the operator merging it is the end of the
+/// story. A row never polled again kept publishing the handoff as a live failure for an issue
+/// that was merged and closed (#101).
+#[test]
+fn a_handed_off_pull_request_the_operator_merged_is_reported_closed_not_failed() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()],
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::HandedOff);
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().last_error.is_some());
+    let sessions = h.worker.sessions_for("iss-1").len();
+
+    forge.set_state(forge.open_prs()[0].number, PrState::Merged);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Closed, "{d:?}");
+    assert_eq!(d.handoff_reason.as_deref(), Some("merged"));
+    let row = &h.sched.snapshot().unwrap().rows[0];
+    assert!(row.last_error.is_none(), "a merged pull request is not a failure: {row:?}");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), sessions, "and no agent is dispatched");
+}
+
+/// The handoff gave the branch to the operator, so a handed-off row that stays open is read and
+/// nothing else: no push, no review request, no hand-back to an agent.
+#[test]
+fn a_handed_off_pull_request_that_stays_open_is_polled_for_its_state_only() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |c| c.delivery.reviewers = vec!["copilot-pull-request-reviewer[bot]".into()],
+    );
+    forge.set_attach_reviewers(false);
+    run_once(&mut h);
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff);
+    let ops = forge.ops();
+    let reads = forge.pr_reads();
+    let feedback = h.worker.feedback_for("iss-1");
+
+    for _ in 0..3 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+
+    assert!(forge.pr_reads() > reads, "the handed-off row is still polled");
+    assert_eq!(forge.ops(), ops, "and polling it writes nothing");
+    assert_eq!(h.worker.feedback_for("iss-1"), feedback, "nor hands it back to an agent");
+    let after = delivery_of(&h, "iss-1");
+    assert_eq!(after.stage, crew::store::DeliveryStage::HandedOff);
+    assert_eq!(after.handoff_reason, d.handoff_reason, "the operator's reason is kept");
+}
+
 /// The stack is gate first, delivery second (#44). A `Done` with both attached goes to the gate
 /// before anything is pushed: a failing gate sends the issue back to an agent and the forge sees
 /// nothing at all, and only the gate's pass hands the branch — rebased and re-gated — to
