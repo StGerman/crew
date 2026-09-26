@@ -192,6 +192,11 @@ pub enum Feedback {
     /// this crate wrote. The day the gate records its output on its own column, this grows a
     /// field; until then a second field would be a second spelling of the same string.
     Gate { output: String },
+    /// The handoff gate could not rebase the branch onto `base`: the rebase stopped on
+    /// conflicts in `paths` and was aborted, and the issue parked `Blocked` (#109). Carried to
+    /// the run after the one that was blocked, so it is told the truth about why it exists —
+    /// not that a turn budget ran out — once a human has unblocked it.
+    Conflict { base: String, paths: Vec<String> },
 }
 
 impl Feedback {
@@ -200,6 +205,7 @@ impl Feedback {
             Feedback::Ci { .. } => "ci",
             Feedback::Review { .. } => "review",
             Feedback::Gate { .. } => "gate",
+            Feedback::Conflict { .. } => "conflict",
         }
     }
 }

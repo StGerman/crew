@@ -216,6 +216,9 @@ pub struct Spawn<'a> {
     /// through the prompt: the worktree it is handed is clean, and applying a snapshot is the
     /// agent's call.
     pub wip: &'a [WipSnapshot],
+    /// On a resumed session, whether the issue body differs from the one the session was last
+    /// handed (#109). The continuation prompt otherwise leaves the body out, as already held.
+    pub body_changed: bool,
 }
 
 impl<'a> Spawn<'a> {
@@ -229,6 +232,7 @@ impl<'a> Spawn<'a> {
             transcript: None,
             feedback: None,
             wip: &[],
+            body_changed: false,
         }
     }
 }

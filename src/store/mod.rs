@@ -431,6 +431,75 @@ impl Store {
         Ok(())
     }
 
+    /// Record `body_hash` as what this issue's session has now been shown, and return what it
+    /// had been shown before — `None` when nothing was recorded (#109).
+    ///
+    /// One call rather than a read and a write, so the comparison and the update cannot be
+    /// split by another launch of the same issue.
+    pub fn swap_session_body(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        body_hash: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let before: Option<String> = conn
+            .query_row(
+                "SELECT session_body FROM issue_state WHERE issue_id = ?1",
+                params![issue_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        conn.execute(
+            "UPDATE issue_state SET session_body = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, body_hash, clock.wall().0],
+        )?;
+        Ok(before)
+    }
+
+    /// Queue `feedback_json` for this issue's next run: why the last one ended, when neither a
+    /// retry reason nor delivery carries it — a rebase conflict that parked the issue (#109).
+    pub fn set_pending_feedback(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+        feedback_json: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE issue_state SET pending_feedback = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![issue_id, feedback_json, clock.wall().0],
+        )?;
+        Ok(())
+    }
+
+    /// Read what `set_pending_feedback` queued and clear it, in one step, so exactly one run is
+    /// told about it.
+    pub fn take_pending_feedback(
+        &self,
+        clock: &dyn Clock,
+        issue_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let fb: Option<String> = conn
+            .query_row(
+                "SELECT pending_feedback FROM issue_state WHERE issue_id = ?1",
+                params![issue_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if fb.is_some() {
+            conn.execute(
+                "UPDATE issue_state SET pending_feedback = NULL, updated_at = ?2
+                 WHERE issue_id = ?1",
+                params![issue_id, clock.wall().0],
+            )?;
+        }
+        Ok(fb)
+    }
+
     /// Record the branch `Workspace::prepare` actually checked out, or clear it once cleanup
     /// deletes that ref.
     ///
