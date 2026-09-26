@@ -692,7 +692,7 @@ async fn the_ops_tools_answer_the_same_snapshot_the_http_api_serves() {
     assert_eq!(mcp_row, http_row);
     assert_eq!(mcp_row["issue_id"], "iss-2");
 
-    // And the list is exactly the four routes, no more.
+    // And the list is exactly the routes, no more.
     let addr = h.mcp_addr;
     let names = tokio::task::spawn_blocking(move || McpConn::open(addr, mcp::PATH).tool_names())
         .await

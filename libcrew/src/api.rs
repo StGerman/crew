@@ -44,7 +44,7 @@ pub struct ApiConfig {
     /// write actions.
     #[serde(default)]
     pub allow_public: bool,
-    /// The same five routes as MCP tools, for a supervising agent (`crewd`'s `api::mcp`). Off
+    /// The ops API's routes as MCP tools, for a supervising agent (`crewd`'s `api::mcp`). Off
     /// by default like `enabled`, and independent of it: a daemon watched by a person needs the
     /// HTTP API and a daemon watched by an agent needs this, and neither should have to carry
     /// the other. **Never reachable by a dispatched worker** — see that module's doc for what

@@ -6,14 +6,14 @@
 # opens it, so a pull request is where a red gate can still stop a merge. A push with no pull
 # request behind it is checked locally or not at all.
 #
-# Each gate is its own job, so a pull request shows three checks that pass or fail separately
+# Each gate is its own job, so a pull request shows a check per gate, each passing or failing separately
 # and run in parallel. None waits on another: ordering them would only delay the answer, since
 # each one fails for reasons the others cannot see.
 #
 # The suite is unusually well suited to a runner and that is not an accident. Time only moves
 # when a test moves it (`FakeClock`), every external seam has a fake, and there are no sleeps
 # anywhere -- the properties that make `tests/scheduler.rs` worth having are the same ones
-# that make it non-flaky here. 143 tests, about two seconds.
+# that make it non-flaky here, and fast.
 #
 # ---------------------------------------------------------------------------------------
 # DO NOT MAKE THIS JOB RUN AN EXAMPLE.

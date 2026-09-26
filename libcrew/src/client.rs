@@ -196,7 +196,7 @@ impl Client {
         self.get(&issue_path(key))
     }
 
-    /// The same two routes, unparsed, for `--json`.
+    /// The same routes, unparsed, for `--json`.
     ///
     /// They are separate methods rather than one taking a path because the first version took a
     /// path: `--json` built its own URL, skipped [`encode_segment`], and turned an identifier

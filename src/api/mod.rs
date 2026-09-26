@@ -1,7 +1,7 @@
 //! A small read-mostly HTTP surface, so a running orchestrator can be inspected and nudged
 //! without a terminal attached.
 //!
-//! Five routes, all under `/api/v1`:
+//! The routes, all under `/api/v1`:
 //!
 //! | Route | Method | Answer |
 //! |---|---|---|
@@ -31,7 +31,7 @@
 //!   module writes — success or error — carries [`API_MARKER_HEADER`], and [`client::Client`]
 //!   refuses to trust anything else in a response that lacks it.
 //!
-//! There is no framework here on purpose. Five routes, no query parameters, no content
+//! There is no framework here on purpose. A handful of routes, no query parameters, no content
 //! negotiation and one response type do not pay for a server stack; `ureq` covers the client
 //! side of this crate's HTTP needs and this covers the server side, both deliberately small.
 //!
@@ -481,7 +481,7 @@ fn reason(status: u16) -> &'static str {
 
 /// Read one request head, then drain whatever body followed it.
 ///
-/// Every connection is answered and closed — no keep-alive. Five routes that an operator hits
+/// Every connection is answered and closed — no keep-alive. Routes that an operator hits
 /// by hand or from a script do not need connection reuse, and a parser that never has to find
 /// the next request on the same socket is a parser with far less to get wrong.
 async fn read_request(stream: &mut TcpStream) -> Result<Request, Response> {

@@ -395,8 +395,8 @@ mod tests {
 
     #[test]
     fn every_tool_is_a_route_that_exists_and_the_list_names_each_once() {
-        // The scope rule from the issue: a tool per existing route, no more. Five routes, five
-        // tools, and the schemas close over their arguments.
+        // The scope rule from the issue: a tool per existing route, no more, and the
+        // schemas close over their arguments.
         let tools = OpsMcp::tools_json();
         let names: Vec<&str> =
             tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();

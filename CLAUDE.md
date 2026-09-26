@@ -21,7 +21,7 @@ found several concrete defects in that design.
 A lot of this code exists specifically in order *not* to have those defects. Read
 **Invariants** before changing anything in `src/sched/`.
 
-The workspace is three packages (#45). `crewd`, at the root, is the daemon: its library is
+The workspace is split into packages (#45). `crewd`, at the root, is the daemon: its library is
 `crew` (`use crew::`), its binary `crewd`. `crewctl/` is the client, a binary that links only
 `libcrew/`, which holds what both need: the published `Snapshot`/`Row` types, the ops API's
 address and marker, and the HTTP client and renderer. The standing rule is that anything both
@@ -41,7 +41,7 @@ front of it for the agent supervising the daemon.
 ## Commands
 
 ```bash
-cargo test                                 # all three packages; the count is in its output, never here
+cargo test                                 # every package; the count is in its output, never here
 cargo test --lib                           # unit only
 cargo test --test scheduler                # scheduler integration only
 cargo test --test api                      # ops API integration only
@@ -55,7 +55,7 @@ cargo run -- --max-ticks 20                # headless smoke run, then exit
 cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
 cargo run -p crewctl -- status             # what a running daemon is doing, read over that API
 cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, turns, cost, branch
-cargo run -- --mcp 127.0.0.1:8788          # the same five routes as MCP tools, for a supervising agent
+cargo run -- --mcp 127.0.0.1:8788          # the ops API's routes as MCP tools, for a supervising agent
 claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
                                            # ...and how that agent gets them. Local scope, never user
 cargo run -- init                          # register your own GitHub App: two clicks, writes ~/.crewd/
@@ -66,7 +66,7 @@ cargo run --example broker_live            # real `claude` against a real broker
 The first three are the commit gate, and [.github/workflows/ci.yml](.github/workflows/ci.yml)
 runs them as three required checks on every pull request rather than trusting whoever
 remembers — delivery opens a pull request for every agent branch, so that is where a red gate
-can still stop a merge. `default-members` covers all three packages, so each of those commands
+can still stop a merge. `default-members` covers every package, so each of those commands
 checks the client and the library as well as the daemon, and `default-run` keeps a bare
 `cargo run` meaning `crewd`.
 
@@ -82,7 +82,7 @@ table *is* the loop):
 | `crewctl` | `cargo test -p crewctl -p libcrew` | ~0.6s |
 | before committing | `cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check` | ~9s |
 
-Most of the unit-test time is the twenty `workspace::` tests shelling out to real `git`. The
+Most of the unit-test time is the `workspace::` tests shelling out to real `git`. The
 package split bought enforcement, not build speed; `--skip workspace::` is what makes the common
 case fast. `rust-toolchain.toml`
 pins the compiler so CI, this machine and every worktree agree on what "it compiles" means, and
@@ -450,7 +450,7 @@ an issue is parked instead of only the log. Setting no gate is a decision, not a
 the broker or the projector, a scheduler without one hands a `Done` to a human exactly as the
 agent left it, so `main.rs` attaches one whenever `gate.enabled` is true (the default, with an
 empty command list, which makes the default a rebase and nothing more) and the scheduler tests
-attach `FakeGate` explicitly. `crew.github.toml` sets the three commands from **Commands**
+attach `FakeGate` explicitly. `crew.github.toml` sets the commit-gate commands from **Commands**
 above; the fake worker never commits, so under `crew.toml` every gate finds nothing to hand
 off.
 
@@ -461,7 +461,7 @@ snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v
 than by discipline — and the three `POST`s can express nothing the dashboard's `r`, `u` and `b`
 keys cannot. Off by default (`[api]
 enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
-because those routes control agent execution. Deliberately *not* validated in
+because the `POST` routes control agent execution. Deliberately *not* validated in
 `Config::preflight`: preflight gates dispatch, so a typo in an address the scheduler never uses
 must not be what stops it — `api::bind` parses it once, and a failure there is logged and
 costs the API alone. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
@@ -513,7 +513,7 @@ and so the likelier reading) versus a daemon that answered and refused. Collapsi
 what has somebody restart a daemon that was never down, so each message names the address
 tried, where that address came from, and the way out.
 
-The ops MCP server ([src/api/mcp.rs](src/api/mcp.rs)) is the same five routes for an *agent*
+The ops MCP server ([src/api/mcp.rs](src/api/mcp.rs)) is the ops API's routes for an *agent*
 supervising the daemon — the one driving a dogfooding session, a watchdog later — which the
 `status` client left on the wrong side of the gap it closed: an agent had to spawn the CLI and
 parse a rendering built to read well to a person. One tool per route (`snapshot`, `issue`,
