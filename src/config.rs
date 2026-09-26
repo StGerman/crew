@@ -945,6 +945,58 @@ mod tests {
         assert!(blank.preflight().is_err(), "a blank name would reach the child as --model ''");
     }
 
+    /// #119: a config with no `[[workers]]` is the one-element list of `[worker]` at
+    /// `agent.max_concurrent`, which is what lets every scheduler test and `crew.toml` run
+    /// unchanged.
+    #[test]
+    fn a_single_worker_config_behaves_exactly_as_before() {
+        let mut c = base();
+        c.agent.max_concurrent = 3;
+        let ws = c.workers();
+        assert_eq!(ws.len(), 1);
+        assert_eq!((ws[0].name(), ws[0].max_concurrent), ("fake".to_string(), Some(3)));
+        assert_eq!(c.capacity(), 3);
+        assert_eq!(c.state_limit("anything"), 3);
+        assert!(c.preflight().is_ok());
+    }
+
+    #[test]
+    fn workers_are_listed_in_dispatch_order_and_capacity_is_their_sum() {
+        let text = "[tracker]\nkind = \"fake\"\nactive_states = [\"open\"]\n\
+                    terminal_states = [\"closed\"]\n\
+                    [[workers]]\nkind = \"claude\"\nmax_concurrent = 1\neffort = \"high\"\n\
+                    [[workers]]\nkind = \"fake\"\nname = \"grok\"\nmax_concurrent = 2\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert!(c.preflight().is_ok());
+        let names: Vec<_> = c.workers().iter().map(|w| w.name()).collect();
+        assert_eq!(names, ["claude", "grok"]);
+        assert_eq!(c.capacity(), 3);
+    }
+
+    /// A pause and a pinned session are keyed by worker name, so two sources for the list, a
+    /// shared name or a worker with no slots are each refused at load.
+    #[test]
+    fn an_ambiguous_worker_list_is_refused() {
+        let pool = |name: &str, max: usize| WorkerConfig {
+            kind: "fake".into(),
+            name: Some(name.into()),
+            max_concurrent: Some(max),
+            ..Default::default()
+        };
+        let mut both = base();
+        both.worker.kind = "claude".into();
+        both.workers = vec![pool("a", 1)];
+        assert!(both.preflight().is_err(), "[worker] and [[workers]] together");
+
+        let mut shared = base();
+        shared.workers = vec![pool("a", 1), pool("a", 1)];
+        assert!(shared.preflight().is_err(), "two workers named alike");
+
+        let mut empty = base();
+        empty.workers = vec![pool("a", 0)];
+        assert!(empty.preflight().is_err(), "a worker with no slots");
+    }
+
     #[test]
     fn states_are_normalized_for_comparison() {
         let c = base();

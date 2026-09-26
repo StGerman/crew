@@ -1159,7 +1159,10 @@ impl Scheduler {
             .chain(reserved.values().map(|r| r.state.clone()))
             .filter(|k| k == state_key)
             .count();
-        self.cfg.state_limit(state_key).saturating_sub(used)
+        // Unset falls back to the workers' capacity rather than `Config::state_limit`'s, which
+        // cannot see pools `set_workers` attached.
+        let limit = self.cfg.agent.max_concurrent_by_state.get(state_key).copied();
+        limit.unwrap_or_else(|| self.capacity()).saturating_sub(used)
     }
 
     /// Continuations holding a slot, read from the retry rows themselves so a reservation
