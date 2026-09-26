@@ -326,7 +326,7 @@ impl Action {
                 "park lifted; the next tick dispatches the issue onto its existing branch"
             }
             (Action::Unblock, false) => {
-                "not parked, or running, gating, waiting on a retry or being delivered; nothing to unblock"
+                "not parked, or running, gating, retry-queued or owned by its delivery; nothing to unblock"
             }
         }
     }

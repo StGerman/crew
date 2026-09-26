@@ -916,7 +916,7 @@ async fn unblocking_a_parked_issue_over_the_api_returns_it_to_service() {
     assert_eq!(body["cleared"], false);
     assert_eq!(
         body["detail"],
-        "not parked, or running, gating, waiting on a retry or being delivered; nothing to unblock"
+        "not parked, or running, gating, retry-queued or owned by its delivery; nothing to unblock"
     );
     h.tick();
     assert_eq!(h.sched.running_count(), 1, "the live run is untouched");

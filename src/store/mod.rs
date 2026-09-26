@@ -394,11 +394,13 @@ impl Store {
     /// a parked issue in phase `released`, unquarantined and with no retry row, is unparked.
     /// A running or gating issue holds phase `running`, and a retry-queued one holds a retry
     /// row, so neither matches; clearing a park on anything live would let the next tick
-    /// dispatch a second agent onto a worktree already in use. A delivery in a stage
-    /// `advance_deliveries` acts on — `pending`, `awaiting`, `ready` — owns the parked `Done`
-    /// too: lifting its park would let delivery push the branch, or hand it back, in the same
-    /// tick `dispatch_new` puts an agent on it. `redispatched`, `handed_off` and `closed` are
-    /// left out because none pushes or hands back. The claim is never touched —
+    /// dispatch a second agent onto a worktree already in use. A delivery still `pending`,
+    /// `awaiting` or `ready` owns the parked `Done` too: lifting its park would let delivery push
+    /// the branch, or hand it back, in the same tick `dispatch_new` puts an agent on it. So does
+    /// a `handed_off` one, which gave the branch to the operator: a dispatch there would end in a
+    /// `Done` that restarts delivery, stepping around `max_rounds_per_issue` and the handoff
+    /// itself. Only `redispatched` and `closed` are left out, since neither pushes nor hands
+    /// back, and a re-dispatched run that ends `Blocked` keeps its row `redispatched`. The claim is never touched —
     /// the next `dispatch_new` takes it the ordinary way. The parked note goes too, since
     /// it names the problem the operator has just resolved.
     pub fn unblock(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
@@ -410,7 +412,7 @@ impl Store {
                AND quarantined_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM retry WHERE retry.issue_id = ?1)
                AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.issue_id = ?1
-                               AND delivery.stage IN ('pending', 'awaiting', 'ready'))",
+                               AND delivery.stage IN ('pending', 'awaiting', 'ready', 'handed_off'))",
             params![issue_id, clock.wall().0],
         )?;
         Ok(n == 1)
@@ -924,8 +926,13 @@ mod tests {
             assert!(s.get("id-1").unwrap().unwrap().parked_state.is_some());
         }
 
-        // One that pushes nothing and hands nothing back does not stand in the way.
+        // A handoff gave the branch to the operator; an agent dispatched onto it would restart
+        // delivery with its `Done` and step around the bound that handed it off.
         s.set_delivery_stage(&c, "id-1", DeliveryStage::HandedOff, Some("round bound")).unwrap();
+        assert!(!s.unblock(&c, "id-1").unwrap(), "a handoff owns the park");
+
+        // One that pushes nothing and hands nothing back does not stand in the way.
+        s.set_delivery_stage(&c, "id-1", DeliveryStage::Redispatched, None).unwrap();
         assert!(s.unblock(&c, "id-1").unwrap());
         assert_eq!(s.get("id-1").unwrap().unwrap().parked_state, None);
     }

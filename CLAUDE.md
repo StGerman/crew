@@ -482,7 +482,7 @@ it, since with `active_states = ["open"]` the tracker has no state to move it th
 ordinary way and `prepare` attaches to its branch; `Store::unblock`'s `WHERE` refuses anything
 running, gating (a held claim is phase `running`), retry-queued, quarantined, or parked under a
 delivery still `pending`, `awaiting` or `ready` — which would push or hand back the branch in the
-tick an agent is dispatched onto it. Write what
+tick an agent is dispatched onto it — or `handed_off`, whose branch is the operator's. Write what
 changed into the issue's description first: that is the prompt the next run reads.
 
 `crewctl status` ([crewctl/src/main.rs](crewctl/src/main.rs), over
@@ -661,7 +661,7 @@ reading — check that the named test is still meaningful, not just still green.
 | An agent cannot write to another ticket | no tool takes an issue id; the target comes from the per-run token | `a_call_naming_a_different_issue_is_refused_and_the_refusal_is_audited` |
 | A looping agent cannot write without bound | per-run **and** per-issue budgets, charged on attempts not successes | `a_continuation_cannot_refresh_the_budget_by_opening_a_new_session` |
 | A finished run keeps no write authority | the session is an RAII guard living in the `running` entry | `a_run_that_ends_takes_its_broker_authority_with_it` |
-| Clearing a quarantine or a park cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL`, and `Store::unblock` on a park in phase `released` with no quarantine, no retry row and no delivery in a stage that pushes or hands back — so a running, gating, retry-queued or delivering issue is untouched — and both report what they did; unblock lifts the park and never takes or releases a claim (#108) | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim`, `unblocking_an_issue_that_is_not_parked_does_not_release_a_live_claim`, `unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch`, `an_unblock_does_not_lift_a_park_a_live_delivery_still_owns` |
+| Clearing a quarantine or a park cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL`, and `Store::unblock` on a park in phase `released` with no quarantine, no retry row and no delivery in a stage that pushes, hands back or has handed off — so a running, gating, retry-queued or delivering issue is untouched — and both report what they did; unblock lifts the park and never takes or releases a claim (#108) | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim`, `unblocking_an_issue_that_is_not_parked_does_not_release_a_live_claim`, `unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch`, `an_unblock_does_not_lift_a_park_a_live_delivery_still_owns` |
 | A slow HTTP client cannot delay a tick | one task per connection, a `oneshot` reply the scheduler never waits on, and a bounded read timeout | `a_client_that_never_finishes_its_request_cannot_delay_a_tick` |
 | The projection cannot become load-bearing | `publish` logs a projector error and returns `Ok`; nothing written is ever read back | `the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off` |
 | A killed run cannot record a fabricated cost | totals are read only from the `result` event; a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total` |
