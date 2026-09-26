@@ -1658,7 +1658,16 @@ impl Scheduler {
     /// Reports whether a park was lifted; anything live is a no-op that says so (see
     /// [`Store::unblock`]). The next `dispatch_new` sees the issue as live and dispatches it
     /// onto its existing branch.
+    ///
+    /// The ticket's state is read fresh first, and a park on one that is no longer active is
+    /// kept. `dispatch_new` never sees such an issue, and `sweep_parked` — the only path that
+    /// reclaims a closed ticket's worktree and branch — only walks parked rows, so lifting the
+    /// park there would strand both. A tracker failure is an error, not a guess either way.
     pub fn unblock(&self, issue_id: &str) -> anyhow::Result<bool> {
+        let fresh = self.tracker.by_ids(&[issue_id.to_string()])?;
+        if !fresh.iter().any(|i| i.id == issue_id && self.cfg.is_active(&i.state_key())) {
+            return Ok(false);
+        }
         Ok(self.store.unblock(self.clock.as_ref(), issue_id)?)
     }
 

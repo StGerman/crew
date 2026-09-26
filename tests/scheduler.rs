@@ -3463,3 +3463,34 @@ fn unblocking_an_issue_that_is_not_parked_does_not_release_a_live_claim() {
     assert_eq!(h.sched.running_count(), 1, "no second agent is dispatched onto iss-1");
     assert_eq!(h.sched.gating_count(), 1);
 }
+
+/// #108. `sweep_parked` only walks parked rows, and `dispatch_new` never sees a closed ticket,
+/// so a park lifted from an issue whose ticket has since closed would strand its worktree and
+/// branch for good. The unblock reads the ticket fresh and leaves such a park to the sweep.
+#[test]
+fn unblocking_an_issue_whose_ticket_closed_leaves_it_for_the_parked_sweep() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |c| {
+        c.agent.parked_sweep_interval_ms = 60_000;
+    });
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Blocked { why: "conflict".into() }),
+    );
+    h.sched.tick().unwrap();
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+
+    h.tracker.fail_by_ids(Some(TrackerError::Request("down".into())));
+    assert!(h.sched.unblock("iss-1").is_err(), "an unread ticket is not a guess either way");
+    h.tracker.fail_by_ids(None);
+
+    h.tracker.set_state("iss-1", "Done");
+    assert!(!h.sched.unblock("iss-1").unwrap(), "a closed ticket's park is kept, and says so");
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state, None);
+    assert!(!ws.exists(), "the sweep reclaimed the worktree the park kept in view");
+}
