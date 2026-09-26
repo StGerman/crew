@@ -2,8 +2,8 @@
 name: Work
 about: A capability we want, and the outcome that will show we have it. The body states that intention, and it is what a dispatched agent receives.
 title: ""
-labels: []
-assignees: []
+labels: ""
+assignees: ""
 ---
 
 <!--
