@@ -1214,6 +1214,28 @@ fn a_conflict_brief_with_no_configured_base_names_the_commit_not_head() {
     assert!(!output.contains("git rebase HEAD"), "{output}");
 }
 
+/// A rebase the gate could not abort leaves the worktree mid-rebase — not the branch the agent
+/// left, and not a tree any brief describes — so it is a human's even when every conflicted
+/// path is on the agent's list.
+#[test]
+fn a_rebase_the_gate_could_not_abort_blocks_for_a_human_even_on_resolvable_paths() {
+    let (mut h, gate) = gated_harness(resolvable);
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Stuck {
+        step: "rebase onto master".into(),
+        output: "`git rebase --abort` left it in progress: index.lock exists".into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"), "parked Blocked");
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "no continuation into it");
+    let note = st.last_error.expect("the reason must reach the dashboard");
+    assert!(note.contains("index.lock"), "{note}");
+}
+
 /// A renumbering is mechanical, but a migration is a one-way door: the brief states the rule
 /// the gate's own `a_released_migration_is_never_edited` would otherwise teach by failing.
 #[test]

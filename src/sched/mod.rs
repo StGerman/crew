@@ -817,6 +817,10 @@ impl Scheduler {
                     ),
                 }
             }
+            Verdict::Stuck { step, output } => {
+                tracing::error!(issue_id, identifier, step, "worktree left mid-rebase; blocking");
+                Outcome::Blocked { why: format!("the handoff gate is stuck at `{step}`: {output}") }
+            }
             Verdict::Failed { step, output, on_base } => {
                 self.gate_failure(issue_id, identifier, &step, &output, |n, max| {
                     // Only say where the work sits when the gate actually got that far. A

@@ -232,7 +232,20 @@ impl GateRun {
                 .git(ws, &["diff", "--name-only", "--diff-filter=U"])
                 .map(|s| s.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
                 .unwrap_or_default();
-            let _ = self.git(ws, &["rebase", "--abort"]);
+            // The abort's own exit code cannot say whether it worked: it also fails, harmlessly,
+            // after a rebase that was refused before it began. Whether a rebase is still in
+            // progress afterwards is the question every verdict below depends on.
+            let abort = self.git(ws, &["rebase", "--abort"]);
+            if self.rebase_in_progress(ws) {
+                return Verdict::Stuck {
+                    step,
+                    output: format!(
+                        "the rebase stopped ({stderr}) and `git rebase --abort` left it in \
+                         progress: {}",
+                        abort.err().unwrap_or_default()
+                    ),
+                };
+            }
             if !paths.is_empty() {
                 return Verdict::Conflict { paths, base_sha };
             }
@@ -297,6 +310,16 @@ impl GateRun {
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
+    }
+
+    /// Whether `ws` is mid-rebase. A `git-path` that cannot be read counts as yes: this answers
+    /// whether it is safe to tell an agent the branch is where it left it, and not knowing is
+    /// not safe.
+    fn rebase_in_progress(&self, ws: &Path) -> bool {
+        ["rebase-merge", "rebase-apply"].iter().any(|d| {
+            self.git(ws, &["rev-parse", "--path-format=absolute", "--git-path", d])
+                .map_or(true, |p| Path::new(&p).exists())
+        })
     }
 
     /// One gate command, to completion. `Err` carries what the agent should see.
@@ -510,6 +533,31 @@ mod tests {
             "no rebase may be left in progress"
         );
         assert!(!wt.join("gate-ran").exists(), "a conflict stops everything downstream");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe `Verdict::Stuck` rests on: it must see a rebase stopped on a conflict, and
+    /// stop seeing it once the rebase is aborted — otherwise every conflict would read as stuck,
+    /// or a stuck one as a clean hand-back.
+    #[test]
+    fn a_worktree_left_mid_rebase_is_detected_and_an_aborted_one_is_not() {
+        let (dir, repo, wt) = repo_and_worktree("mid-rebase");
+        commit(&wt, "base.txt", "agent's version\n", "agent edits base");
+        commit(&repo, "base.txt", "master's version\n", "master edits base");
+        let run = GateRun {
+            state: Arc::new((Mutex::new(Inner::default()), Condvar::new())),
+            repo: repo.clone(),
+            base: None,
+            commands: Vec::new(),
+            workspace: wt.clone(),
+            identifier: "MT-1".into(),
+        };
+        assert!(!run.rebase_in_progress(&wt), "a clean worktree is not mid-rebase");
+        assert!(git(&wt, &["rebase", "master"]).is_err(), "the rebase must stop on the conflict");
+        assert!(run.rebase_in_progress(&wt), "a stopped rebase is in progress");
+        git(&wt, &["rebase", "--abort"]).unwrap();
+        assert!(!run.rebase_in_progress(&wt), "an aborted one is not");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

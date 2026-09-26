@@ -57,6 +57,10 @@ pub enum Verdict {
         /// agent's own branch, a no-op that leaves the conflict to recur.
         base_sha: String,
     },
+    /// The rebase stopped and could not be aborted: the worktree is still mid-rebase, so it is
+    /// neither the branch the agent left nor a tree any brief describes. A human's, always —
+    /// an agent resumed into it would build on gate state or trip over a second rebase.
+    Stuck { step: String, output: String },
     /// A step failed for a reason the agent can act on: a command exited non-zero, the rebase
     /// was refused (a dirty tree, most likely), or a command could not be started at all.
     /// `step` names which, and `output` is what it said — bounded, tail-first, because a
