@@ -102,6 +102,7 @@ fn harness_full(
         workspace: WorkspaceConfig { root: Some(root.clone()), repo: None },
         agent: AgentConfig::default(),
         worker: Default::default(),
+        workers: Default::default(),
         broker: Default::default(),
         api: Default::default(),
         transcripts: Default::default(),
@@ -920,7 +921,14 @@ fn a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupt
         "no per-issue retry timer owns this — dispatch itself is what pauses"
     );
 
-    let pause = h.sched.snapshot().unwrap().rate_limit_pause.expect("the pause must be published");
+    let pause = h
+        .sched
+        .snapshot()
+        .unwrap()
+        .rate_limit_pauses
+        .first()
+        .cloned()
+        .expect("the pause must be published");
     assert_eq!(pause.kind, "five_hour");
 
     // Before the reset: dispatch stays paused, account-wide.
@@ -932,7 +940,7 @@ fn a_rate_limit_pauses_dispatch_rather_than_quarantining_the_issues_it_interrupt
     h.clock.advance_ms(60_000);
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 2, "dispatch resumes once the window resets");
-    assert!(h.sched.snapshot().unwrap().rate_limit_pause.is_none());
+    assert!(h.sched.snapshot().unwrap().rate_limit_pauses.is_empty());
 
     for (id, first) in [("iss-1", &first_sessions[0]), ("iss-2", &first_sessions[1])] {
         let seen = h.worker.sessions_for(id);
@@ -982,7 +990,10 @@ fn a_rate_limit_pause_does_not_disturb_runs_already_in_flight() {
     h.sched.tick().unwrap();
     assert_eq!(h.sched.running_count(), 0);
     assert_eq!(h.sched.store().get("iss-2").unwrap().unwrap().phase, Phase::Released);
-    assert!(h.sched.snapshot().unwrap().rate_limit_pause.is_some(), "the pause itself outlives it");
+    assert!(
+        !h.sched.snapshot().unwrap().rate_limit_pauses.is_empty(),
+        "the pause itself outlives it"
+    );
 }
 
 /// A `resets_at` the scheduler cannot trust — missing, or already behind the clock — must not
@@ -1007,7 +1018,7 @@ fn a_rate_limit_with_no_usable_resets_at_degrades_to_ordinary_backoff() {
         h.sched.tick().unwrap();
 
         assert!(
-            h.sched.snapshot().unwrap().rate_limit_pause.is_none(),
+            h.sched.snapshot().unwrap().rate_limit_pauses.is_empty(),
             "resets_at {resets_at:?} must not pause anything"
         );
         let st = h.sched.store().get("iss-1").unwrap().unwrap();

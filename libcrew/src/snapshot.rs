@@ -45,6 +45,10 @@ pub struct Row {
     /// Where the branch is on its way to a mergeable pull request, once a run has reported
     /// done with delivery on. `None` before that, and always for a deployment without a forge.
     pub delivery: Option<DeliveryView>,
+    /// The worker running this issue, or else the one that ran its latest run (#119). `None`
+    /// for an issue never dispatched, or last dispatched by a daemon that did not record it.
+    #[serde(default)]
+    pub worker: Option<String>,
 }
 
 /// Immutable view published to observers. The TUI renders this and never touches the store,
@@ -76,16 +80,21 @@ pub struct Snapshot {
     pub ticks: u64,
     pub last_tick_at: Option<i64>,
     pub last_error: Option<String>,
-    /// Set while dispatch is paused for an account-wide rate limit the agent CLI itself
-    /// reported (#37). `None` when dispatch is not paused for this reason — which is not the
-    /// same as "nothing is wrong"; see `last_error` for an ordinary failure.
-    pub rate_limit_pause: Option<RateLimitPause>,
+    /// One entry per worker whose dispatch is paused for an account-wide rate limit its agent
+    /// CLI reported (#37), in dispatch order; a pause on one worker leaves the others
+    /// dispatching (#119). Empty when nothing is paused for this reason — which is not the same
+    /// as "nothing is wrong"; see `last_error` for an ordinary failure.
+    #[serde(default)]
+    pub rate_limit_pauses: Vec<RateLimitPause>,
 }
 
 /// An account-wide dispatch pause, published so an operator sees *why* nothing is running
 /// rather than an idle daemon with no explanation (#37).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitPause {
+    /// The worker whose account is limited, and the only one that stops dispatching (#119).
+    #[serde(default)]
+    pub worker: String,
     /// Whatever the CLI named the exhausted window — `"five_hour"`, `"seven_day"`, or a name
     /// this crate has never seen.
     pub kind: String,
@@ -137,6 +146,10 @@ pub struct RunRecord {
     /// `Effort`, stops offering it.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The worker that ran it (#119), and so the one holding its session. `None` for a run
+    /// recorded before workers were named.
+    #[serde(default)]
+    pub worker: Option<String>,
 }
 
 impl RunRecord {
