@@ -33,8 +33,8 @@
 //!
 //! What the crate controls, it enforces by wiring rather than by a check on the tool:
 //!
-//! * A worker learns of MCP servers from one file, the `--mcp-config` the broker writes in
-//!   [`Broker::open`](crate::broker::Broker::open). That file names the broker's own listener
+//! * The only MCP servers crewd hands a worker are named in one file, the `--mcp-config` the
+//!   broker writes in [`Broker::open`](crate::broker::Broker::open). That file names the broker's own listener
 //!   and nothing else, and no code path hands this type to the broker or the broker's address
 //!   to this type. `a_dispatched_worker_is_not_handed_the_ops_tools` reads the file a real
 //!   session produces and connects to what it names.

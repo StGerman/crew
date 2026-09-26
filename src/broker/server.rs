@@ -34,8 +34,10 @@
 //! nothing else), and the two **never share a listener**. They could have — one accept loop,
 //! routed by prefix — and it was not done, because the per-run token path and the operator path
 //! would then answer at the same address, which is exactly the address every dispatched worker
-//! is handed. Keeping them on separate ports is what makes "the ops tools are not reachable
-//! from a worker" a property of the wiring rather than of a prefix check.
+//! is handed. Keeping them on separate ports is what makes "crewd never hands a worker the ops
+//! tools" a property of the wiring rather than of a prefix check. It does not make them
+//! unreachable: a worker inherits the operator's MCP config, and that is accepted (see
+//! [`crate::api::mcp`]).
 //!
 //! ## What the real client does
 //!
