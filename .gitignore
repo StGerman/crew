@@ -4,3 +4,4 @@ target
 *.db-wal
 *.db-shm
 .claude/settings.local.json
+.DS_Store
