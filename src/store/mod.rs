@@ -843,9 +843,19 @@ impl Store {
         rows.collect()
     }
 
-    /// [`Store::session_workers`] for one issue.
+    /// [`Store::session_workers`] for one issue, as one indexed lookup: dispatch asks this per
+    /// candidate, and rebuilding the whole map each time made a tick quadratic.
     pub fn session_worker(&self, issue_id: &str) -> rusqlite::Result<Option<String>> {
-        Ok(self.session_workers()?.remove(issue_id))
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT r.worker FROM issue_state s JOIN run r
+               ON r.issue_id = s.issue_id AND r.session_id = s.session_id
+             WHERE s.issue_id = ?1 AND r.worker IS NOT NULL
+             ORDER BY r.started_at DESC, r.run_id DESC LIMIT 1",
+            params![issue_id],
+            |r| r.get(0),
+        )
+        .optional()
     }
 
     /// Sums over the runs that reported a total, and counts the finished ones that did not. The
@@ -925,6 +935,35 @@ mod tests {
             &RunStart { run_id, issue_id, session_id, transcript, model: &model, worker: "fake" },
         )
         .unwrap();
+    }
+
+    /// The pin is whichever worker ran the issue's *current* session: one a run under an earlier
+    /// session names does not count, and each lookup agrees with the whole map.
+    #[test]
+    fn a_session_is_pinned_to_the_worker_of_its_own_runs_only() {
+        let (s, c) = setup();
+        let model = ModelChoice::default();
+        let run = |run_id: &str, session_id: &str, worker: &str| {
+            let r = RunStart {
+                run_id,
+                issue_id: "id-1",
+                session_id,
+                transcript: None,
+                model: &model,
+                worker,
+            };
+            s.start_run(&c, &r).unwrap();
+        };
+        assert_eq!(s.session_worker("id-1").unwrap(), None, "no session, no pin");
+
+        run("r1", "old", "claude");
+        s.set_session(&c, "id-1", Some("new")).unwrap();
+        assert_eq!(s.session_worker("id-1").unwrap(), None, "the old session's run pins nothing");
+
+        c.advance_ms(1);
+        run("r2", "new", "grok");
+        assert_eq!(s.session_worker("id-1").unwrap().as_deref(), Some("grok"));
+        assert_eq!(s.session_workers().unwrap().get("id-1").map(String::as_str), Some("grok"));
     }
 
     #[test]
