@@ -184,7 +184,7 @@ agent will pick up, and the `issue-triage` skill decides which carry it.
 
 **Filing an issue.** Write the body from
 [.github/ISSUE_TEMPLATE/work.md](.github/ISSUE_TEMPLATE/work.md). The title is one sentence
-naming the failure or the gap. The body is the only text a dispatched agent sees, so a
+naming the outcome we want. The body is the only text a dispatched agent sees, so a
 decision, a scope cut and an acceptance criterion go there, and the template's HTML comments
 come out before filing. File it with no milestone and no `agent` label.
 

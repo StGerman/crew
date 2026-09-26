@@ -1,13 +1,13 @@
 ---
 name: Work
-about: A defect or a missing capability. The body is what a dispatched agent receives.
+about: A capability we want, and the outcome that will show we have it. The body states that intention, and it is what a dispatched agent receives.
 title: ""
 labels: []
 assignees: []
 ---
 
 <!--
-Title: one sentence naming the failure or the gap as it is today.
+Title: one sentence naming the outcome we want.
 File with no milestone and no `agent` label. The issue-triage skill places it.
 Delete every HTML comment before filing. A comment left here is part of the
 body, and the body is the only text a dispatched agent sees.
@@ -15,13 +15,13 @@ body, and the body is the only text a dispatched agent sees.
 
 ## Why
 
-<!-- What is true today, and the mechanism that makes it so. -->
+<!-- The intention: what we want to be true, and why this work is worth doing. -->
 
 **Boundary:** <!-- One of: trait implementation, external command, hook, core change. Then "because <reason>". A core change names the invariant row it adds or protects, or says why it needs none. -->
 
 ## What
 
-<!-- The change. -->
+<!-- The work that reaches that outcome. -->
 
 ## Acceptance criteria
 
