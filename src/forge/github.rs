@@ -612,7 +612,7 @@ impl<H: Http> Forge for GithubForge<H> {
         // for this head and a repo mid-run are indistinguishable from here, and the module doc
         // says the scheduler, not this trait, bounds that with a timeout.
         if runs.is_empty() {
-            return Ok(CiStatus::Pending);
+            return Ok(CiStatus::Pending { running: vec![] });
         }
 
         const FAILING: &[&str] =
@@ -626,8 +626,10 @@ impl<H: Http> Forge for GithubForge<H> {
             return Ok(CiStatus::Failure { failures });
         }
 
-        if runs.iter().any(|r| r.status != "completed") {
-            return Ok(CiStatus::Pending);
+        let running: Vec<String> =
+            runs.iter().filter(|r| r.status != "completed").map(|r| r.name.clone()).collect();
+        if !running.is_empty() {
+            return Ok(CiStatus::Pending { running });
         }
 
         Ok(CiStatus::Success)
@@ -1021,15 +1023,21 @@ mod tests {
         let http = FakeHttp::new();
         http.push(ok(json!({ "check_runs": [] })));
         let f = forge(http);
-        assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Pending);
+        assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Pending { running: vec![] });
     }
 
     #[test]
-    fn a_still_running_check_with_no_failure_is_pending() {
+    fn a_still_running_check_with_no_failure_is_pending_and_named() {
         let http = FakeHttp::new();
-        http.push(ok(json!({ "check_runs": [gh_check_run("build", "in_progress", None, None)] })));
+        http.push(ok(json!({ "check_runs": [
+            gh_check_run("build", "in_progress", None, None),
+            gh_check_run("lint", "completed", Some("success"), None),
+        ] })));
         let f = forge(http);
-        assert_eq!(f.ci_status("sha").unwrap(), CiStatus::Pending);
+        assert_eq!(
+            f.ci_status("sha").unwrap(),
+            CiStatus::Pending { running: vec!["build".into()] }
+        );
     }
 
     #[test]

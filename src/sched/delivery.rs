@@ -51,6 +51,7 @@ use crate::model::{Feedback, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
 
 pub use libcrew::DeliveryView;
+use libcrew::fmt::{fmt_ms, timestamp};
 
 impl From<&DeliveryRecord> for DeliveryView {
     fn from(d: &DeliveryRecord) -> Self {
@@ -427,21 +428,13 @@ impl Scheduler {
             }
         }
 
-        match forge.ci_status(&pr.head_sha)? {
-            CiStatus::Pending => {
-                let pushed = d.head_pushed_at.unwrap_or(clock.wall().0);
-                let waited = clock.wall().0.saturating_sub(pushed);
-                if waited as u64 > self.cfg.delivery.ci_timeout_ms {
-                    let reason = format!(
-                        "CI reported nothing for {} within {} ms",
-                        pr.head_sha, self.cfg.delivery.ci_timeout_ms
-                    );
-                    tracing::warn!(issue_id, pr = number, "{reason}; handing off");
-                    self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
-                } else {
-                    tracing::debug!(issue_id, pr = number, head = %pr.head_sha, "awaiting CI");
-                }
-                return Ok(());
+        let ci = forge.ci_status(&pr.head_sha)?;
+        if d.ci_pending.is_some() && !matches!(ci, CiStatus::Pending { .. }) {
+            self.store.set_ci_pending(clock.as_ref(), issue_id, None)?;
+        }
+        match ci {
+            CiStatus::Pending { running } => {
+                return self.await_ci(issue_id, &d, &pr, &running);
             }
             CiStatus::Failure { failures } => {
                 let named: Vec<String> = failures.iter().map(|f| f.name.clone()).collect();
@@ -497,6 +490,46 @@ impl Scheduler {
             self.store.set_delivery_stage(clock.as_ref(), issue_id, DeliveryStage::Ready, None)?;
         }
         Ok(())
+    }
+
+    /// CI is pending on `pr`'s head: wait, or hand off once nothing has completed for
+    /// `ci_timeout_ms`. The wait is timed from when this head was first seen pending, never
+    /// from crewd's own push — that clock handed off a ready pull request the moment a check
+    /// re-ran on it, or the operator pushed a head of their own (#105).
+    fn await_ci(
+        &mut self,
+        issue_id: &str,
+        d: &DeliveryRecord,
+        pr: &PullRequest,
+        running: &[String],
+    ) -> Result<(), StepError> {
+        let clock = self.clock.clone();
+        let now = clock.wall().0;
+        let since = match &d.ci_pending {
+            Some((head, since)) if *head == pr.head_sha => *since,
+            _ => {
+                self.store.set_ci_pending(clock.as_ref(), issue_id, Some(&pr.head_sha))?;
+                now
+            }
+        };
+        let timeout = self.cfg.delivery.ci_timeout_ms;
+        if now.saturating_sub(since).max(0) as u64 <= timeout {
+            tracing::debug!(issue_id, pr = pr.number, head = %pr.head_sha, "awaiting CI");
+            return Ok(());
+        }
+        let what = if running.is_empty() {
+            "none has started".to_string()
+        } else {
+            format!("still running: {}", running.join(", "))
+        };
+        let reason = format!(
+            "no check run completed on {} within {} of {}; {what}",
+            pr.head_sha,
+            fmt_ms(timeout),
+            timestamp(since)
+        );
+        tracing::warn!(issue_id, pr = pr.number, "{reason}; handing off");
+        self.hand_off(issue_id, &reason).map_err(StepError::Other)
     }
 
     /// Hand the issue back to an agent with `feedback`, or to the operator if the rounds are

@@ -2674,6 +2674,93 @@ fn a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_
     assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
 }
 
+const HOUR_MS: u64 = 60 * 60 * 1_000;
+
+fn copilot_running() -> CiStatus {
+    CiStatus::Pending { running: vec!["copilot-pull-request-reviewer".into()] }
+}
+
+/// #105: a ready pull request was handed off for "CI reported nothing" a minute into a check
+/// re-run, because the wait was timed from crewd's push hours earlier. The wait belongs to the
+/// re-run, and a re-run that finishes green stops it, so the next one starts from zero too.
+#[test]
+fn a_check_re_run_on_a_ready_pull_request_does_not_hand_it_off() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let head = FakeForge::head_after_publish(1);
+
+    h.clock.advance_ms(6 * HOUR_MS);
+    forge.set_ci(&head, copilot_running());
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Ready,
+        "a check that starts again is not CI that reported nothing"
+    );
+
+    // Green again, then a second re-run: the first re-run's wait does not carry over.
+    h.clock.advance_ms(HOUR_MS * 3 / 4);
+    h.sched.tick().unwrap();
+    forge.set_ci(&head, CiStatus::Success);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    forge.set_ci(&head, copilot_running());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(HOUR_MS * 3 / 4);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    h.clock.advance_ms(HOUR_MS / 4 + 1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "the timeout still holds");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains("no check run completed"), "says what was observed: {why}");
+    assert!(why.contains("copilot-pull-request-reviewer"), "names the pending run: {why}");
+}
+
+/// #105: a head the operator pushed — a merge of the base to clear a conflict — was handed
+/// off ninety seconds into its CI run, timed from crewd's own earlier push of another head.
+/// Here crewd's head is already most of the way through its wait when the operator's lands.
+#[test]
+fn a_head_the_operator_pushed_gets_its_own_ci_wait() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_ci(&FakeForge::head_after_publish(1), CiStatus::Pending { running: vec![] });
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    let number = forge.open_prs()[0].number;
+
+    h.clock.advance_ms(HOUR_MS * 3 / 4);
+    h.sched.tick().unwrap();
+    forge.push_head(number, "operator-merge");
+    forge.set_ci("operator-merge", CiStatus::Pending { running: vec!["ci".into()] });
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(HOUR_MS - 1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the operator's head is waited on for the full timeout, not what was left of crewd's"
+    );
+
+    h.clock.advance_ms(2_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff);
+    assert!(d.handoff_reason.unwrap().contains("operator-merge"), "names the head it waited on");
+}
+
 /// GETT-174120: requesting a bot reviewer over REST returns success and adds nobody. The
 /// provider's answer is not evidence; the pull request's own state is, and a request that did
 /// not take must be reported as the failure it is.
