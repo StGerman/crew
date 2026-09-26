@@ -29,7 +29,7 @@ dispatch_label = "agent"
 # the reason this comment sits next to it rather than next to the budget it spends — see the
 # rate-limit budget math in src/tracker/github.rs's module doc before tightening either.
 [polling]
-interval_ms = 30000
+interval_ms = 15000
 
 [workspace]
 root = ".crew/workspaces"

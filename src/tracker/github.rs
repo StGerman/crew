@@ -33,7 +33,7 @@
 //! primary limit of 5000 requests/hour, `interval_ms` should keep
 //! `(1 + agent.max_concurrent) * (3_600_000 / interval_ms)` comfortably under that — a 30s
 //! interval at `max_concurrent = 2` is `3 * 120 = 360/hour`, nowhere near the ceiling.
-//! `crew.github.toml` uses that combination. A 403/429 with a rate-limit signal still
+//! `crew.github.toml` polls every 15s at `max_concurrent = 1`: `2 * 240 = 480/hour`. A 403/429 with a rate-limit signal still
 //! classifies as [`crate::model::ErrorClass::RateLimited`] and backs off rather than escalates,
 //! but a tight interval against a real repo will find that path often enough to be worth
 //! avoiding up front.
