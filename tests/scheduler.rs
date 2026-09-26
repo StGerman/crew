@@ -3562,7 +3562,7 @@ fn unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch() {
     gate.set_default(GateScript::passes_in(1_000));
     assert!(h.sched.unblock("iss-1").unwrap(), "a parked issue is unblocked, and says so");
     let st = h.sched.store().get("iss-1").unwrap().unwrap();
-    assert_eq!(st.parked_state, None);
+    assert_eq!(st.parked_state.as_deref(), Some(crew::store::UNBLOCKED));
     assert_eq!(st.phase, Phase::Released, "unblock lifts the park; it takes no claim");
     assert_eq!(st.last_error, None, "the parked note names a problem now resolved");
 
@@ -3691,4 +3691,31 @@ fn unblocking_an_issue_dispatch_would_refuse_keeps_its_park() {
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().cumulative_turns >= 5);
     assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
     assert!(!h.sched.unblock("iss-1").unwrap(), "a spent turn budget keeps the park");
+}
+
+/// Review on #112: the unblock reads the ticket, then lifts the park, and the next dispatch is
+/// up to a tick later. A ticket that closed in between was neither dispatched nor swept, which
+/// stranded its worktree and branch. The park is re-pointed rather than cleared, so the sweep
+/// still sees it.
+#[test]
+fn a_ticket_that_closes_between_an_unblock_and_the_next_tick_is_still_swept() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |c| {
+        c.agent.parked_sweep_interval_ms = 60_000;
+    });
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Blocked { why: "conflict".into() }),
+    );
+    h.sched.tick().unwrap();
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert!(h.sched.unblock("iss-1").unwrap());
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.sched.running_count(), 0, "a closed ticket is not dispatched");
+    assert!(!ws.exists(), "and the sweep still reclaimed the worktree the unblock left parked");
+    assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state, None);
 }
