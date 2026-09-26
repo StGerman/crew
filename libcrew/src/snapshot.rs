@@ -19,6 +19,10 @@ pub struct Row {
     pub tokens: Option<TokenUsage>,
     pub age_ms: u64,
     pub retry_in_ms: Option<i64>,
+    /// A continuation waiting out its delay with its concurrency slot held (#86): counted in
+    /// [`Snapshot::reserved`], and named here so a saturated daemon says who holds the slot.
+    #[serde(default)]
+    pub holds_slot: bool,
     pub quarantined: bool,
     pub last_error: Option<String>,
     pub last_event: Option<String>,
@@ -54,7 +58,13 @@ pub struct Row {
 pub struct Snapshot {
     pub generated_at: i64,
     pub rows: Vec<Row>,
+    /// Runs holding a slot, gating ones included — the scheduler's own count, not the agents
+    /// alive right now.
     pub running: usize,
+    /// Slots held by continuations between sessions (#86). `running + reserved` is what the
+    /// scheduler compares with `limit`; defaulted so a client reads an older daemon.
+    #[serde(default)]
+    pub reserved: usize,
     pub limit: usize,
     pub retrying: usize,
     pub quarantined: usize,

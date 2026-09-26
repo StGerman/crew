@@ -140,11 +140,16 @@ pub fn render_snapshot(f: &mut Frame, snap: &Snapshot, selected: usize) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, snap: &Snapshot) {
-    let saturated = snap.running >= snap.limit && snap.limit > 0;
+    let taken = snap.running + snap.reserved;
+    let saturated = taken >= snap.limit && snap.limit > 0;
     let mut spans = vec![
         Span::styled("running ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}/{}", snap.running, snap.limit),
+            if snap.reserved > 0 {
+                format!("{}/{} ({} reserved)", taken, snap.limit, snap.reserved)
+            } else {
+                format!("{}/{}", taken, snap.limit)
+            },
             Style::default()
                 .fg(if saturated { Color::Yellow } else { Color::Green })
                 .add_modifier(Modifier::BOLD),

@@ -172,6 +172,16 @@ pub(super) const MIGRATIONS: &[&str] = &[
     -- human re-opening the thread is their conversation, not a reason to resolve it again.
     ALTER TABLE review_verdict ADD COLUMN resolved_at INTEGER;
     "#,
+    // v10
+    r#"
+    -- The state whose slot a continuation holds while it waits out its delay (#86). Without it
+    -- the slot freed by a `Continue` went to whatever `dispatch_new` found first, so a
+    -- continuing issue lost its place in the milestone order at every session boundary. Kept on
+    -- the retry row rather than beside it, so a reservation cannot outlive the retry it belongs
+    -- to: every path that deletes the row ends the reservation with it. NULL for a failure
+    -- backoff, which must not hold capacity hostage.
+    ALTER TABLE retry ADD COLUMN reserved_state TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -263,6 +273,7 @@ mod tests {
         "0fe2a0bfac334b97916fbd74b2bbe95bc849095d7c114180d8bf6700819d88b6", // v7
         "ed7f6925c75fac094be75380ad40f558d6ba9be90f69924168a970c358393593", // v8
         "c0f411b768e640dee5cfa9e4703d8af27c23a7e322bcac4c3e5585fdf083fca7", // v9
+        "6a9665ba56edbe4ceccb6d168c317ca59b6b7f100e03790a66323dda541c5caf", // v10
     ];
 
     #[test]

@@ -25,7 +25,11 @@ const NONE: &str = "-";
 pub fn snapshot(snap: &Snapshot, addr: &str) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!("crewd @ {addr}  —  {} running / {} limit", snap.running, snap.limit));
+    out.push_str(&format!("crewd @ {addr}  —  {} running", snap.running));
+    if snap.reserved > 0 {
+        out.push_str(&format!(" + {} reserved", snap.reserved));
+    }
+    out.push_str(&format!(" / {} limit", snap.limit));
     if snap.retrying > 0 {
         out.push_str(&format!(", {} retrying", snap.retrying));
     }
@@ -139,7 +143,8 @@ fn table(rows: &[Row]) -> String {
     for r in rows {
         if let Some(due) = r.retry_in_ms {
             let when = if due > 0 { format!("in {}", fmt_ms(due as u64)) } else { "now".into() };
-            notes.push_str(&format!("  {} retries {when}\n", r.identifier));
+            let held = if r.holds_slot { ", holding its slot" } else { "" };
+            notes.push_str(&format!("  {} retries {when}{held}\n", r.identifier));
         }
         if let Some(err) = &r.last_error {
             notes.push_str(&format!("  {} last error: {err}\n", r.identifier));
@@ -227,10 +232,9 @@ pub fn issue(r: &Row) -> String {
         field("url", url.clone());
     }
     if let Some(due) = r.retry_in_ms {
-        field(
-            "retry",
-            if due > 0 { format!("in {}", fmt_ms(due as u64)) } else { "due now".into() },
-        );
+        let when = if due > 0 { format!("in {}", fmt_ms(due as u64)) } else { "due now".into() };
+        let held = if r.holds_slot { ", holding its slot" } else { "" };
+        field("retry", format!("{when}{held}"));
     }
     if let Some(ev) = &r.last_event {
         field("last event", ev.clone());
@@ -402,6 +406,7 @@ mod tests {
             last_tick_at: Some(1_789_205_450_000),
             ticks: 47,
             running: 2,
+            reserved: 0,
             limit: 3,
             retrying: 1,
             quarantined: 1,
@@ -422,6 +427,20 @@ mod tests {
         assert!(out.contains("at least 1.2M in / 48.3k out"), "{out}");
         assert!(out.contains("2 finished runs reported none"), "a floor, not a total: {out}");
         assert!(out.contains("MT-601"), "{out}");
+    }
+
+    /// #86: a continuation holding its slot is capacity in use, so a full daemon with nothing
+    /// running must say which issue holds the slot rather than read as idle.
+    #[test]
+    fn a_reserved_slot_reads_as_taken_and_names_the_issue_holding_it() {
+        let mut held = row("MT-64", Phase::RetryQueued);
+        held.retry_in_ms = Some(5_000);
+        held.holds_slot = true;
+        let snap = Snapshot { reserved: 1, limit: 1, rows: vec![held], ..Default::default() };
+
+        let out = snapshot(&snap, "127.0.0.1:8787");
+        assert!(out.contains("0 running + 1 reserved / 1 limit"), "{out}");
+        assert!(out.contains("MT-64 retries in 5s, holding its slot"), "{out}");
     }
 
     /// #37: an idle daemon and a daemon waiting out an account-wide rate limit must not read

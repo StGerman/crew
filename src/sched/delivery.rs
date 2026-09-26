@@ -537,6 +537,8 @@ impl Scheduler {
             Wall(self.clock.wall().0),
             0,
             &format!("delivery: {what}"),
+            // Due now, so there is no delay for a reservation to bridge.
+            None,
         )?;
         tracing::info!(
             issue_id, pr = ?d.pr_number, kind = feedback.label(), rounds_pr = rp, rounds_issue = ri,

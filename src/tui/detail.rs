@@ -86,10 +86,9 @@ pub fn render(f: &mut Frame, area: Rect, row: Option<&Row>) {
         lines.push(field("url", url.clone()));
     }
     if let Some(due) = r.retry_in_ms {
-        lines.push(field(
-            "retry",
-            if due > 0 { format!("in {}", fmt_ms(due as u64)) } else { "due now".into() },
-        ));
+        let when = if due > 0 { format!("in {}", fmt_ms(due as u64)) } else { "due now".into() };
+        let held = if r.holds_slot { ", holding its slot" } else { "" };
+        lines.push(field("retry", format!("{when}{held}")));
     }
     if let Some(err) = &r.last_error {
         lines.push(Line::from(vec![
