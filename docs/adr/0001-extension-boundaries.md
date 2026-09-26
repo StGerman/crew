@@ -21,7 +21,7 @@ Three runtime plugin mechanisms were considered and rejected:
 - **WASM** (wasmtime, extism). This adds around a hundred crates and a host API to design and
   version. It pays off only for untrusted third-party plugins, and crewd has none.
 - **Splitting the daemon into cooperating processes.** "The scheduler is the only authority"
-  is what makes the invariant table in CLAUDE.md possible. Spreading that authority across
+  is what makes the invariant table (`docs/invariants.md`, CLAUDE.md's until #92) possible. Spreading that authority across
   processes would turn every row into a distributed-systems problem.
 
 ## Decision

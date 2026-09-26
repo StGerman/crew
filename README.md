@@ -127,9 +127,11 @@ worked by crewd.
 Because of that, most development here is done by an agent rather than by a person at a
 keyboard, and the documentation is split to match:
 
-- **[CLAUDE.md](CLAUDE.md)** is the working surface — every command, the architecture, the
-  invariant table, and the traps that are expensive to rediscover. Read it before changing
-  anything under `src/sched/`.
+- **[CLAUDE.md](CLAUDE.md)** is the working surface — every command, the core rules, and the
+  traps that are expensive to rediscover. It points to
+  **[docs/invariants.md](docs/invariants.md)**, read before changing `src/sched/`, `src/store/`,
+  `src/broker/`, `src/gate/` or delivery, and **[docs/architecture.md](docs/architecture.md)**,
+  the reasoning behind each subsystem.
 - **[docs/coding-guidelines.md](docs/coding-guidelines.md)** is how code is written here, with
   a named check for every rule. Read it before your first edit.
 
@@ -137,7 +139,7 @@ The commit gate is `cargo test`, `cargo clippy --all-targets -- -D warnings` and
 `cargo fmt --check`. CI runs all three on every push and pull request.
 
 If you are opening an issue you would like an agent to work, it needs the `agent` label and
-enough context to act on — the invariant table in CLAUDE.md is the standard the codebase holds
+enough context to act on — the invariant table in `docs/invariants.md` is the standard the codebase holds
 itself to, and an issue that names which invariant is at stake is one an agent can finish.
 
 ## Status

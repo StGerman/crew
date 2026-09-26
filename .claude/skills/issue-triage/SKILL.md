@@ -112,7 +112,7 @@ Apply this rule top-down; the first match wins.
 
 1. **It breaks dogfooding or an invariant** — a wrong scheduling decision, lost work, a
    stranded claim, credentials or rate limits that stop the daemon, anything that would fail a
-   row of the invariant table in CLAUDE.md. → the **current** milestone. Dispatchable if it meets
+   row of the invariant table in docs/invariants.md. → the **current** milestone. Dispatchable if it meets
    the bar above.
 2. **It unblocks the current milestone.** → the current milestone.
 3. **It fits a future milestone's outcome.** → that milestone.
