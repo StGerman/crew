@@ -1154,6 +1154,12 @@ impl Scheduler {
 
         for entry in pending {
             let Some(issue) = by_id.get(&entry.issue_id) else {
+                // One omission is not proof the ticket is gone (`refresh_miss_grace` exists for
+                // exactly that), so a reservation still waiting keeps its slot and its retry;
+                // only the entry that is due acts on the omission, as it did before #86.
+                if entry.due_at > now {
+                    continue;
+                }
                 // Gone from the tracker: release rather than inventing a state for it.
                 tracing::info!(issue_id = %entry.issue_id, "retry target not visible; releasing");
                 reserved.remove(&entry.issue_id);

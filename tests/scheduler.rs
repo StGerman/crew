@@ -629,6 +629,38 @@ fn a_continuation_holds_its_slot_in_its_own_state_limit() {
     assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "A continues in the slot it held");
 }
 
+/// Re-reading a waiting reservation must not turn one tracker omission into a cancelled
+/// continuation: an id `by_ids` briefly misses is the blip `refresh_miss_grace` exists for.
+#[test]
+fn a_waiting_continuation_survives_one_tracker_omission_with_its_slot() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |c| {
+            c.agent.max_concurrent = 1;
+        });
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    h.tracker.hide("iss-1");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.store().all_retries().unwrap().len(), 1, "the continuation is kept");
+    assert!(h.worker.sessions_for("iss-2").is_empty(), "and so is its slot");
+
+    h.tracker.unhide("iss-1");
+    h.clock.advance_ms(4_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "A continues once it is visible again");
+    assert!(h.worker.sessions_for("iss-2").is_empty());
+}
+
 /// A failure backoff grows to minutes, so a reservation there would let one failing issue hold
 /// capacity hostage (#86): only a continuation keeps its slot.
 #[test]
