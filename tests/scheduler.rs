@@ -13,6 +13,7 @@ use crew::clock::{Clock, FakeClock};
 use crew::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceConfig};
 use crew::gate::Verdict as GateVerdict;
 use crew::gate::fake::{FakeGate, GateScript};
+use crew::gate::{Gate, GateHandle, GitGate};
 use crew::model::{ErrorClass, Issue, Outcome, Phase};
 use crew::project::{NoopProjector, Projector, TasksProjector};
 use crew::sched::Scheduler;
@@ -1189,6 +1190,82 @@ fn a_conflict_confined_to_agent_resolvable_paths_is_handed_back_to_the_agent() {
     assert!(!output.contains("RELEASED"), "the migration rule only when schema.rs conflicts");
 }
 
+/// A real `GitGate` whose `start` returns only once its verdict is in, so the scheduler sees it
+/// on the next tick without the test waiting on the gate's thread against the wall clock.
+struct SettledGate(GitGate);
+
+impl Gate for SettledGate {
+    fn start(&self, issue: &Issue, workspace: &Path) -> Arc<dyn GateHandle> {
+        let h = self.0.start(issue, workspace);
+        while h.finished().is_none() {
+            std::thread::yield_now();
+        }
+        h
+    }
+}
+
+/// #122 end to end: a conflict handed back (#111), resolved the way an agent told to bring its
+/// branch up to date commonly does — by merging the base in — must pass the gate. Rebasing that
+/// branch replays only the agent's own commit, drops the merge that held the resolution, and
+/// parks the issue on the same conflict again, forever.
+#[test]
+fn a_conflict_resolved_by_merging_the_base_is_not_re_raised_by_the_gate() {
+    let dir = tmp_dir("merge-resolves-conflict");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+    commit_in(&repo, "CLAUDE.md", "base\n");
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open_in_memory().unwrap(),
+        Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+        |c| {
+            resolvable(c);
+            c.gate.base = Some("main".into());
+        },
+    );
+    h.sched.set_gate(Some(Arc::new(SettledGate(GitGate::new(&repo, Some("main".into()), vec![])))));
+    h.worker.set_default(Script::succeeds_in(1_000));
+
+    h.sched.tick().unwrap();
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    commit_in(&ws, "CLAUDE.md", "the agent's line\n");
+    commit_in(&repo, "CLAUDE.md", "another branch's line\n");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.sched.tick().unwrap();
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::RetryQueued, "the conflict is handed back to the agent");
+
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "the continuation is dispatched");
+    let Some(Feedback::Gate { output }) = &h.worker.feedback_for("iss-1")[1] else {
+        panic!("the continuation must be told about the conflict");
+    };
+    assert!(output.contains("git merge "), "a merge is offered as a resolution: {output}");
+
+    assert!(git_out(&ws, &["merge", "-q", "main"]).is_none(), "the merge must conflict");
+    std::fs::write(ws.join("CLAUDE.md"), "the agent's line\nanother branch's line\n").unwrap();
+    git(&ws, &["add", "CLAUDE.md"]);
+    git(&ws, &["commit", "-q", "--no-edit"]);
+    let merged = git_out(&ws, &["rev-parse", "HEAD"]).unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.phase, Phase::Released);
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"), "parked Done, not Blocked");
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "and not handed back again");
+    let runs = h.sched.store().runs_for("iss-1").unwrap();
+    assert_eq!(runs[0].outcome.as_deref(), Some("done"), "the latest run is a Done: {runs:?}");
+    assert_eq!(git_out(&ws, &["rev-parse", "HEAD"]), Some(merged), "the merge commit survives");
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// With `gate.base` unset the gate rebased onto `workspace.repo`'s HEAD; in the agent's own
 /// worktree `HEAD` is its branch, so a brief saying `git rebase HEAD` is a no-op that leaves
 /// the conflict to recur. The brief names the commit the gate actually tried.
@@ -1348,11 +1425,12 @@ fn a_failing_gate_continues_the_run_with_the_failing_output_in_hand() {
     assert!(output.contains("cargo test"), "which step: {output}");
     assert!(output.contains("a_thing ... FAILED"), "and what it said: {output}");
     assert!(output.contains("1 of 3"), "and how many tries are left: {output}");
+    assert!(output.contains("sits on the base"), "and where the work now is: {output}");
 }
 
 /// The brief must describe the tree the agent will actually find. A base that will not
 /// resolve, and a rebase refused and therefore aborted, both leave the branch exactly where the
-/// agent left it — so a brief that says "the branch has been rebased, fix this on top of it"
+/// agent left it — so a brief that says "the branch now sits on the base, fix this on top of it"
 /// sends it looking for a state that does not exist. An agent that cannot reconcile the
 /// instruction with what it sees reports `Done` again unchanged, and the gate fails it again,
 /// which spends the `max_failures` allowance on a sentence rather than on the work.
@@ -1376,8 +1454,8 @@ fn a_gate_that_failed_before_rebasing_does_not_tell_the_agent_its_branch_was_reb
         other => panic!("the continuation must be told why it exists, got {other:?}"),
     };
     assert!(
-        !brief.contains("has been rebased"),
-        "nothing was rebased, so the brief must not claim it was: {brief}"
+        !brief.contains("sits on the base"),
+        "nothing was rebased, so the brief must not claim the branch is on the base: {brief}"
     );
     assert!(
         brief.contains("where you left it"),

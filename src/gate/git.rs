@@ -220,10 +220,39 @@ impl GateRun {
             return stopped("count commits", false);
         }
 
-        let step = format!("rebase onto {base_label}");
+        // A branch that already contains the base's tip is on the base, and rebasing it would
+        // replay only its own commits and drop any merge of the base — which is where an agent
+        // that resolved a conflict by merging put the resolution, so the conflict came back
+        // (#122). A failed probe falls through to the rebase, which is what ran before.
+        let rebased = if self.git(ws, &["merge-base", "--is-ancestor", &base_sha, "HEAD"]).is_ok() {
+            false
+        } else {
+            match self.rebase(ws, &base_sha, format!("rebase onto {base_label}")) {
+                Ok(rebased) => rebased,
+                Err(verdict) => return verdict,
+            }
+        };
+        tracing::debug!(issue = %self.identifier, base = base_label, rebased, "branch is on the base");
+
+        for argv in &self.commands {
+            if self.killed() {
+                return stopped(argv.join(" "), true);
+            }
+            let step = argv.join(" ");
+            self.set_step(&step);
+            if let Err(output) = self.run_command(argv) {
+                return Verdict::Failed { step, output, on_base: true };
+            }
+        }
+        Verdict::Passed { rebased }
+    }
+
+    /// Rebase the worktree onto `base_sha`: whether that moved any commits, or the verdict a
+    /// rebase that stopped ends the gate with.
+    fn rebase(&self, ws: &Path, base_sha: &str, step: String) -> Result<bool, Verdict> {
         self.set_step(&step);
         let before = self.git(ws, &["rev-parse", "HEAD"]).unwrap_or_default();
-        if let Err(stderr) = self.git(ws, &["rebase", &base_sha]) {
+        if let Err(stderr) = self.git(ws, &["rebase", base_sha]) {
             // Conflicted paths are read *before* the abort, which is what clears them. The
             // abort itself is what makes a conflict safe to report: the branch goes back to
             // exactly the commits the agent made, so `Workspace::remove`'s merged check still
@@ -237,35 +266,22 @@ impl GateRun {
             // progress afterwards is the question every verdict below depends on.
             let abort = self.git(ws, &["rebase", "--abort"]);
             if self.rebase_in_progress(ws) {
-                return Verdict::Stuck {
+                return Err(Verdict::Stuck {
                     step,
                     output: format!(
                         "the rebase stopped ({stderr}) and `git rebase --abort` left it in \
                          progress: {}",
                         abort.err().unwrap_or_default()
                     ),
-                };
+                });
             }
             if !paths.is_empty() {
-                return Verdict::Conflict { paths, base_sha };
+                return Err(Verdict::Conflict { paths, base_sha: base_sha.to_string() });
             }
-            return Verdict::Failed { step, output: stderr, on_base: false };
+            return Err(Verdict::Failed { step, output: stderr, on_base: false });
         }
         let after = self.git(ws, &["rev-parse", "HEAD"]).unwrap_or_default();
-        let rebased = before != after;
-        tracing::debug!(issue = %self.identifier, base = base_label, rebased, "rebase clean");
-
-        for argv in &self.commands {
-            if self.killed() {
-                return stopped(argv.join(" "), true);
-            }
-            let step = argv.join(" ");
-            self.set_step(&step);
-            if let Err(output) = self.run_command(argv) {
-                return Verdict::Failed { step, output, on_base: true };
-            }
-        }
-        Verdict::Passed { rebased }
+        Ok(before != after)
     }
 
     /// Spawn `cmd` in its own process group and record its pid as `pgid` for as long as it is
@@ -502,6 +518,55 @@ mod tests {
             git(&wt, &["merge-base", "--is-ancestor", &master, "HEAD"]).is_ok(),
             "master must be an ancestor of the rebased branch"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard for #122: the agent resolved a conflict by merging the base into its branch.
+    /// A rebase replays the branch's own commits and drops that merge, so the same conflict
+    /// comes back; a branch that already contains the base's tip is gated as it stands.
+    #[test]
+    fn a_branch_that_already_merged_the_base_is_gated_without_a_rebase() {
+        let (dir, repo, wt) = repo_and_worktree("merged-base");
+        commit(&wt, "base.txt", "agent's version\n", "agent edits base");
+        commit(&repo, "base.txt", "master's version\n", "master edits base");
+        assert!(git(&wt, &["merge", "-q", "master"]).is_err(), "the merge must conflict");
+        std::fs::write(wt.join("base.txt"), "both versions\n").unwrap();
+        sh_git(&wt, &["add", "base.txt"]);
+        sh_git(&wt, &["commit", "-q", "--no-edit"]);
+        let merged = sh_git(&wt, &["rev-parse", "HEAD"]);
+
+        let gate = GitGate::new(
+            &repo,
+            Some("master".into()),
+            vec![argv(&["git", "cat-file", "-e", "HEAD^2"]), argv(&["touch", "gate-ran"])],
+        );
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        assert_eq!(verdict, Verdict::Passed { rebased: false });
+        assert_eq!(sh_git(&wt, &["rev-parse", "HEAD"]), merged, "the merge commit must survive");
+        assert_eq!(std::fs::read_to_string(wt.join("base.txt")).unwrap(), "both versions\n");
+        assert!(wt.join("gate-ran").exists(), "the commands still run on the merged branch");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A merge of the base is only a reason to skip the rebase while it is the base's tip: once
+    /// the base moves past it, the branch is behind again and is rebased as before.
+    #[test]
+    fn a_branch_behind_the_base_is_still_rebased() {
+        let (dir, repo, wt) = repo_and_worktree("merged-stale-base");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        commit(&repo, "first.txt", "first\n", "master moves once");
+        sh_git(&wt, &["merge", "-q", "--no-edit", "master"]);
+        commit(&repo, "second.txt", "second\n", "master moves again");
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![]);
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        assert_eq!(verdict, Verdict::Passed { rebased: true });
+        assert!(wt.join("second.txt").exists(), "the branch must now sit on master's tip");
+        assert!(wt.join("agent.txt").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -74,17 +74,18 @@ fn log_tracker_failure(context: &str, e: &TrackerError) {
 /// was aborted because an agent told otherwise goes looking for a half-finished rebase that is
 /// not there; and it names the migration rule for `schema.rs` because the obvious resolution —
 /// keep both sides' v<N> — edits a released migration, which the gate's own `cargo test` would
-/// then fail on, spending a try on a rule the brief could have stated. The command names the
+/// then fail on, spending a try on a rule the brief could have stated. The commands name the
 /// commit, not the ref: a ref resolves in the agent's worktree, where an unset base's `HEAD` is
-/// the agent's own branch.
+/// the agent's own branch. It offers a merge as well as a rebase because the gate accepts a
+/// branch that already contains the base without rebasing it (#122).
 fn conflict_brief(base: &str, base_sha: &str, paths: &[String], n: u32, max: u32) -> String {
     let mut s = format!(
         "the handoff gate's rebase onto {base} ({base_sha}) conflicted in {} (failure {n} of \
          {max}). The rebase was aborted, so the branch is where you left it. Another branch \
-         appended to the same place; resolve it yourself: `git rebase {base_sha}`, keep both \
-         sides' additions \
-         in each conflicted file, `git rebase --continue`, check the result still builds, \
-         and finish again.",
+         appended to the same place; resolve it yourself, either way: `git rebase {base_sha}` \
+         and `git rebase --continue`, or `git merge {base_sha}` and commit — keeping both \
+         sides' additions in each conflicted file. Check the result still builds, and finish \
+         again.",
         paths.join(", ")
     );
     if paths.iter().any(|p| p == "src/store/schema.rs") {
@@ -793,7 +794,7 @@ impl Scheduler {
                 Outcome::Done
             }
             Verdict::Passed { rebased } => {
-                tracing::info!(issue_id, identifier, rebased, "gate passed on the rebased branch");
+                tracing::info!(issue_id, identifier, rebased, "gate passed on the base");
                 Outcome::Done
             }
             Verdict::Conflict { paths, base_sha }
@@ -834,7 +835,7 @@ impl Scheduler {
                     // this on top of" a rebase that never happened describes a tree it will
                     // not find, and the usual result is a `Done` repeated unchanged.
                     let where_it_sits = if on_base {
-                        "the branch has been rebased onto the base, so fix this on top of it"
+                        "the branch now sits on the base, so fix this on top of it"
                     } else {
                         "the branch was not rebased and is where you left it, so fix this there"
                     };

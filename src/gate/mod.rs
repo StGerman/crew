@@ -7,7 +7,9 @@
 //! agent could have seen them. So a `Done` verdict is not applied until the run's branch has
 //! been rebased onto the configured base *and* the gate commands have passed on the rebased
 //! tree, in that order, in the agent's own worktree. The rebase has to come first because a
-//! gate run against a stale base answers a question nobody asked.
+//! gate run against a stale base answers a question nobody asked. A branch that already
+//! contains the base's tip is on it and is not rebased: a rebase would drop a merge of the base,
+//! and with it the conflict resolution an agent made that way (#122).
 //!
 //! Like the worker, a gate is a process the scheduler supervises rather than a call it makes:
 //! `cargo test` in a real worktree runs for minutes, and a tick that blocked on it would stall
@@ -72,8 +74,8 @@ pub enum Verdict {
         ///
         /// False for every step that runs before the rebase — resolving the base, counting
         /// commits — and for a rebase that was refused and therefore aborted. True only once
-        /// the rebase has completed, which is the case where a command failed *on the rebased
-        /// tree*. The scheduler needs the distinction because it tells the agent where its work
+        /// the branch is on the base — rebased, or already containing its tip — which is the
+        /// case where a command failed *on the base*. The scheduler needs the distinction because it tells the agent where its work
         /// now sits: saying "the branch has been rebased, fix this on top of it" when nothing
         /// was rebased describes a tree the agent will not find, and an agent that cannot
         /// reconcile the instruction with what it sees tends to report `Done` again unchanged.
