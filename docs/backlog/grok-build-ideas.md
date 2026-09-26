@@ -3,7 +3,7 @@
 Features, ideas, and patterns found in [grok-build](https://github.com/xai-org/grok-build) that crewd could copy.
 **This list is untriaged.** It makes no fit assessment and no comparison with crewd. Triage, grooming, and prioritization happen in separate sessions.
 
-- Source: grok-build @ `SOURCE_REV 036a5d8348cd744767cd0b08518ab17bf608fa7f`, harvested 2026-09-26
+- Source: grok-build @ `f0e3be1100ef5252488e3be8bb0e91cf68d8c305` (upstream `SOURCE_REV`: `036a5d8348cd744767cd0b08518ab17bf608fa7f`), harvested 2026-09-26
 - Paths are relative to the grok-build repo root. `…/user-guide/` = `crates/codegen/xai-grok-pager/docs/user-guide/`
 - IDs (`GB-nn`) are stable handles for triage. Don't renumber; strike or annotate instead.
 
