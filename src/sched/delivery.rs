@@ -45,8 +45,11 @@
 use std::collections::HashMap;
 
 use super::Scheduler;
+use super::review_summary::{summary_findings, verdict_comment};
 use crate::clock::{Mono, Wall};
-use crate::forge::{CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec};
+use crate::forge::{
+    CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec, Review, summary_review_id,
+};
 use crate::model::{Feedback, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
 
@@ -453,12 +456,17 @@ impl Scheduler {
             CiStatus::Success => {}
         }
 
+        // Inline comments, then the findings reviewers left only in a review's summary (#126):
+        // both are settled by the same verdict table, so a summary is handed back once and a
+        // review arriving after `ready` takes the pull request out of it.
         let settled = self.store.verdicts_for(issue_id)?;
-        let open: Vec<_> = forge
-            .review_comments(number)?
-            .into_iter()
-            .filter(|c| !settled.contains_key(&c.id))
-            .collect();
+        let mut open = forge.review_comments(number)?;
+        open.extend(summary_findings(
+            &forge.reviews(number)?,
+            &pr.head_sha,
+            &self.cfg.delivery.summary_reviewers,
+        ));
+        open.retain(|c| !settled.contains_key(&c.id));
         if !open.is_empty() {
             let handed_before: Vec<String> = d
                 .handed_comments
@@ -475,6 +483,7 @@ impl Scheduler {
                 .iter()
                 .map(|c| match &c.path {
                     Some(p) => format!("{} ({p})", c.id),
+                    None if summary_review_id(&c.id).is_some() => format!("{} (summary)", c.id),
                     None => c.id.clone(),
                 })
                 .collect();
@@ -617,6 +626,8 @@ impl Scheduler {
         let settled = self.store.verdicts_for(issue_id)?;
         let mut unapplied: Vec<ReviewVerdict> = Vec::new();
         let mut failure: Option<ForgeError> = None;
+        // Read once, and only if a summary is answered: its verdict quotes the finding.
+        let mut reviews: Option<Result<Vec<Review>, ForgeError>> = None;
         for v in verdicts {
             if settled.contains_key(&v.comment_id) {
                 // Settled by an earlier round; the first verdict stands and is not re-argued.
@@ -626,7 +637,18 @@ impl Scheduler {
                 Verdict::Accepted => format!("**Accepted** — resolved in {}.", v.detail),
                 Verdict::Rejected => format!("**Rejected** — {}", v.detail),
             };
-            match forge.reply(pr.number, &v.comment_id, &body) {
+            let posted = match summary_review_id(&v.comment_id) {
+                // A summary has no thread to reply on, so the verdict goes on the pull request.
+                Some(review_id) => match reviews.get_or_insert_with(|| forge.reviews(pr.number)) {
+                    Ok(all) => {
+                        let r = all.iter().find(|r| r.id == review_id);
+                        forge.comment(pr.number, &verdict_comment(&v.comment_id, r, &body))
+                    }
+                    Err(e) => Err(e.clone()),
+                },
+                None => forge.reply(pr.number, &v.comment_id, &body),
+            };
+            match posted {
                 Ok(()) => {
                     self.store.record_verdict(
                         self.clock.as_ref(),
@@ -668,7 +690,15 @@ impl Scheduler {
     /// logged at `error`, since it will keep failing until the operator fixes the credential.
     fn resolve_settled_threads(&mut self, issue_id: &str, number: u64) -> Result<(), StepError> {
         let forge = self.forge.clone().expect("checked by delivery_on");
-        let comments = self.store.unresolved_verdicts(issue_id, number)?;
+        let (summaries, comments): (Vec<String>, Vec<String>) = self
+            .store
+            .unresolved_verdicts(issue_id, number)?
+            .into_iter()
+            .partition(|c| summary_review_id(c).is_some());
+        // A review's summary has no thread; its verdict's comment is all there is to see.
+        for s in summaries {
+            self.store.mark_thread_resolved(self.clock.as_ref(), issue_id, &s)?;
+        }
         if comments.is_empty() {
             return Ok(());
         }

@@ -156,7 +156,7 @@ this file.
   crate that is not in it fails `cargo deny check`. `Not yet enforced: #53`.
 - **MUST** prefer a crate for platform-specific plumbing over a direct syscall or a device
   file. Why: a `/dev/urandom` read or a raw `libc::kill` works on the developer machine and
-  fails silently elsewhere. Check: `unsafe_code = "forbid"` covers the syscall half;
+  fails silently elsewhere. Check: `unsafe_code = "deny"` covers the syscall half;
   `clippy::disallowed_methods` on `std::fs::File::open` with a `/dev/` literal is not
   expressible, so the device-file half is review (#51 removed the last `/dev/urandom` read).
 - **MUST** keep `Cargo.lock` committed and build with `--locked` in CI. Why: a drifted lock
@@ -173,7 +173,7 @@ this file.
 | `clap` | Command line, derive style | |
 | `crossterm` | Terminal backend for the TUI | |
 | `insta` (dev) | Snapshot tests for rendered text, first used for the worker's prompts | Rolls out to the rest with #56 |
-| `libc` | Process-group signals in `src/worker/claude.rs` | Leaves with #50 |
+| `nix` (`signal` only) | Signals to a process group in `src/worker/claude.rs` and `src/gate/git.rs`, without `unsafe` | Replaced `libc` (#50) |
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
 | `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
@@ -201,7 +201,6 @@ linked issue.
 | Crate | Purpose | Issue |
 | :---- | :---- | :---- |
 | `parking_lot` | Non-poisoning locks, removes every `lock().unwrap()` | #49 |
-| `nix` | Safe `kill` to a process group, removes every `unsafe` block | #50 |
 | `tempfile` | Temp directories in tests with automatic cleanup | #54 |
 | `rstest` | Shared fixtures for the test harness | #54 |
 | `tiny_http` | One HTTP/1.1 server for both listeners | #57 or its follow-ups |
@@ -286,9 +285,12 @@ why they were rejected so far.
   `clippy.toml`, so that a local `cargo clippy` and rust-analyzer report the same errors CI
   does. Why: a bar that lives only in a CI command line is invisible in the editor.
   `Not yet enforced: #52`.
-- **MUST** keep the crate free of `unsafe`, with `unsafe_code = "forbid"` in `[lints.rust]`.
-  Why: the only `unsafe` today is `libc::kill`, and `nix` provides the same call safely.
-  Check: the compiler, once the lint is set. `Not yet enforced: #50`.
+- **MUST** keep the crate free of `unsafe`, with `unsafe_code = "deny"` in
+  `[workspace.lints.rust]`. Why: `nix` signals a process group safely, so nothing here needs
+  `unsafe`. `deny` rather than `forbid` because the one exception, `std::env::set_var` in
+  `no_tracker_credential_reaches_the_child_environment`, is `unsafe` in Rust 2024 and carries a
+  local `#[allow(unsafe_code)]` with a `// SAFETY:` line; `forbid` cannot be lifted locally.
+  Check: the compiler. Enforced.
 - **MUST** run `cargo deny check` and `cargo machete` in CI, run the tests through
   `cargo nextest` for per-test timeouts, and run the grep checks this file names. Why: a
   RUSTSEC advisory, an unused dependency or a stray `tokio::` import has no other signal.

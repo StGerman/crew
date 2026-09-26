@@ -100,6 +100,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+
 use super::{
     KillResult, ModelChoice, Progress, RateLimitSignal, RunHandle, Session, Spawn, TokenUsage,
     ToolEndpoint, Worker,
@@ -240,7 +243,7 @@ impl RunHandle for ClaudeRun {
         // A run that already has a verdict is exiting on its own; do not signal it, just wait
         // for the reader thread to reap it. One still in flight gets SIGTERM, once.
         if !already_finished && !self.sent_term.swap(true, Ordering::SeqCst) {
-            unsafe { libc::kill(-self.pid, libc::SIGTERM) };
+            let _ = kill(Pid::from_raw(-self.pid), Signal::SIGTERM);
         }
 
         let g = lock.lock().unwrap();
@@ -254,7 +257,7 @@ impl RunHandle for ClaudeRun {
         // Still not reaped after the grace period: escalate. SIGKILL cannot be caught, ignored
         // or blocked, so the reader thread's `wait()` should return promptly; this second wait
         // is a bound against something having gone very wrong, not an expected path.
-        unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+        let _ = kill(Pid::from_raw(-self.pid), Signal::SIGKILL);
         let g = lock.lock().unwrap();
         let _ = cvar.wait_timeout_while(g, Duration::from_secs(5), |g| !g.reaped).unwrap();
         KillResult::Forced
@@ -485,7 +488,7 @@ fn run_reader(
                     // SIGTERM only: this is this module's own budget, not a failure, and the
                     // caller (the scheduler) still owns the decision to hard-kill on a grace
                     // timeout via `RunHandle::kill`.
-                    unsafe { libc::kill(-pid, libc::SIGTERM) };
+                    let _ = kill(Pid::from_raw(-pid), Signal::SIGTERM);
                     break;
                 }
             }
@@ -822,6 +825,9 @@ fn feedback_help(feedback: Option<&Feedback>) -> String {
                 let at = match (&c.path, c.line) {
                     (Some(p), Some(l)) => format!("{p}:{l}"),
                     (Some(p), None) => p.clone(),
+                    _ if crate::forge::summary_review_id(&c.id).is_some() => {
+                        "(review summary)".into()
+                    }
                     _ => "(general)".into(),
                 };
                 s.push_str(&format!("\n[{}] {} — {}\n{}\n", c.id, at, c.author, c.body.trim()));
@@ -1281,7 +1287,7 @@ mod tests {
 
         // Assert on the pid, not just the return value: signal 0 checks existence without
         // sending a real one.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let alive = kill(Pid::from_raw(pid), None).is_ok();
         assert!(!alive, "the process must actually be gone after a forced kill");
 
         std::fs::remove_dir_all(&ws).ok();
@@ -1383,6 +1389,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn no_tracker_credential_reaches_the_child_environment() {
         let ws = tmp_workspace("env-leak");
         // SAFETY: a unique key nothing else reads or writes, scoped to this one test.
