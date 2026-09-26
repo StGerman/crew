@@ -7,7 +7,7 @@
 //!
 //! * `rmcp`'s `transport-streamable-http-server` is a `tower::Service`, not a server. It ships
 //!   no listener, so it does not remove the need for an HTTP stack — it adds ~35 crates *and*
-//!   still requires axum or hyper on top of them. The dependency footprint for three tools
+//!   still requires axum or hyper on top of them. The dependency footprint for the broker's tools
 //!   would roughly double this crate's tree.
 //! * It is async, and everything it would sit between is not. [`Tracker`] and
 //!   [`TrackerWrites`] are blocking by deliberate choice (see [`crate::tracker::github`]'s note

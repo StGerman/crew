@@ -1702,6 +1702,35 @@ impl Scheduler {
         Ok(self.store.unquarantine(self.clock.as_ref(), issue_id)?)
     }
 
+    /// Operator action: hand a parked issue back once whatever parked it has been resolved.
+    ///
+    /// Reports whether a park was lifted; anything live is a no-op that says so (see
+    /// [`Store::unblock`]). The next `dispatch_new` sees the issue as live and dispatches it
+    /// onto its existing branch.
+    ///
+    /// The ticket's state is read fresh first, and a park on one that is no longer active is
+    /// kept. `dispatch_new` never sees such an issue, and `sweep_parked` — the only path that
+    /// reclaims a closed ticket's worktree and branch — only walks parked rows, so lifting the
+    /// park there would strand both. A tracker failure is an error, not a guess either way.
+    ///
+    /// The same holds for every other gate `dispatch_new` applies: an issue that has lost its
+    /// dispatch marker or spent its per-issue turn budget would be unparked and never
+    /// dispatched, invisible to the sweep, so the park is kept and the answer says no.
+    pub fn unblock(&self, issue_id: &str) -> anyhow::Result<bool> {
+        let fresh = self.tracker.by_ids(&[issue_id.to_string()])?;
+        let Some(issue) = fresh.iter().find(|i| i.id == issue_id) else {
+            return Ok(false);
+        };
+        let within_budget = self
+            .store
+            .get(issue_id)?
+            .is_some_and(|st| st.cumulative_turns < self.cfg.agent.max_turns_per_issue);
+        if !self.cfg.is_active(&issue.state_key()) || !self.routable(issue) || !within_budget {
+            return Ok(false);
+        }
+        Ok(self.store.unblock(self.clock.as_ref(), issue_id)?)
+    }
+
     /// Stop every in-flight run before the process exits.
     ///
     /// A worker `RunHandle` outlives the `Scheduler` that spawned it unless something kills it
