@@ -798,11 +798,13 @@ async fn clearing_a_quarantine_over_mcp_returns_the_issue_to_service() {
 #[tokio::test]
 async fn a_dispatched_worker_is_not_handed_the_ops_tools() {
     // The constraint issue #34 says must survive review, tested on the wiring rather than on
-    // the tool. A worker learns of MCP servers from exactly one file the crate writes — the
-    // `--mcp-config` from `Broker::open` — so the test is: run both servers the way `main`
-    // does, open a real broker session, read the file a worker would be handed, and connect to
-    // whatever it names. A version of this that only asked the ops server to refuse an unknown
-    // caller would pass just as well if the server were reachable from the worker after all.
+    // the tool. The MCP servers crewd hands a worker are named in exactly one file the crate
+    // writes — the `--mcp-config` from `Broker::open` — so the test is: run both servers the
+    // way `main` does, open a real broker session, read the file a worker would be handed, and
+    // connect to whatever it names. A version that only asked the ops server to refuse an
+    // unknown caller would pass just as well if crewd handed the worker the ops address after
+    // all. What a worker inherits from the operator's own MCP config is outside this test, and
+    // accepted (see `api::mcp`).
     let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
     h.tick();
 

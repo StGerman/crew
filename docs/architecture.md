@@ -354,19 +354,26 @@ reconnects rather than dribbles pays nothing for a deadline. The broker's own li
 both for free and keeps a separate count, so a flood at the public address cannot starve a
 dispatched run of its tools.
 
-**This server must never reach a dispatched agent**, and that is the thing to hold when
-touching any of this. The broker gives a worker authority scoped to one issue; this is scoped
-to the whole daemon, and a worker that could call `unquarantine` or `unblock` could clear its own
-quarantine or park and re-dispatch itself, defeating the verdict, `max_turns_per_issue` and `parked_state`
-together. What enforces it is wiring, not a check on the tool: the ops server binds **its own
-listener** (never the broker's — a shared one routed by prefix would put these tools at the
-exact `host:port` every worker is handed), answers only at `/ops`, and is never passed to
-`Broker`, whose `open` writes the only `--mcp-config` a worker receives.
-`a_dispatched_worker_is_not_handed_the_ops_tools` reads that file from a real session and
-connects to what it names. What wiring cannot enforce is the operator's own `claude` config:
-the worker runs without `--strict-mcp-config` on purpose, so it inherits *user-scope* MCP
-servers. Register this one in the supervising agent's **local or project scope, never user
-scope**, or every worker inherits it and the wiring is bypassed by configuration.
+**crewd never hands this server to a dispatched agent** — but a dispatched agent on the
+operator's machine can still reach it, and that is an accepted trade, not an oversight. The
+broker gives a worker authority scoped to one issue; this is scoped to the whole daemon, and a
+worker that calls `unquarantine` or `unblock` can clear its own quarantine or park and
+re-dispatch itself, defeating the verdict, `max_turns_per_issue` and `parked_state` together.
+What crewd controls it enforces by wiring: the ops server binds **its own listener** (never the
+broker's — a shared one routed by prefix would put these tools at the exact `host:port` every
+worker is handed), answers only at `/ops`, and is never passed to `Broker`, whose `open` writes
+the only `--mcp-config` crewd gives a worker. `a_dispatched_worker_is_not_handed_the_ops_tools`
+reads that file from a real session and connects to what it names.
+
+What wiring cannot control is the operator's own `claude` config. The worker runs without
+`--strict-mcp-config` on purpose, so it inherits the operator's MCP servers — and **local scope
+does not keep this one out**: a worker's cwd is a worktree of the same repository, which Claude
+Code treats as the same project. On 2026-09-26 a dispatched run's `init` event listed `crew_ops`
+connected while it was registered only at local scope. The operator accepted this (2026-09-25,
+"option 2"): workers run as the same user and are trusted as that user, and the ops tools add
+nothing such a process cannot already do by sending a request to the loopback HTTP API the same
+routes live on. The way to actually withhold them is `--strict-mcp-config` with the worker's
+servers passed explicitly (rust-analyzer from `.mcp.json` among them); it was not taken.
 
 
 **`crewd init`** ([src/init/](../src/init/)) registers the operator's own GitHub App through the
