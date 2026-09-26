@@ -89,14 +89,31 @@ pub enum PrState {
     Merged,
 }
 
-/// One submitted review, enough to tell whether a requested reviewer has answered and for
-/// which commit.
+/// One submitted review: enough to tell whether a requested reviewer has answered and for
+/// which commit, and the summary it was submitted with, which can carry a finding no inline
+/// comment does (#126).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Review {
+    /// Provider id, stable across polls.
+    pub id: String,
     pub reviewer: String,
     pub commit_sha: String,
     /// The provider's own word for it: `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`.
     pub state: String,
+    /// The review's summary text. Empty for a review that is only its inline comments.
+    pub body: String,
+    pub url: Option<String>,
+}
+
+/// The prefix that marks a [`ReviewComment`] id as a review's summary rather than an inline
+/// comment. A summary has no thread: its verdict is posted as a comment on the pull request,
+/// and there is nothing to resolve. Review and comment ids are separate id spaces on the
+/// provider, so the prefix is also what keeps the two from colliding in `review_verdict`.
+pub const SUMMARY_PREFIX: &str = "review-";
+
+/// The review id a summary finding's key names, or `None` for an inline comment's id.
+pub fn summary_review_id(comment_id: &str) -> Option<&str> {
+    comment_id.strip_prefix(SUMMARY_PREFIX)
 }
 
 /// The CI verdict for one head commit.
@@ -163,6 +180,10 @@ pub trait Forge: Send + Sync {
     /// Reply on the thread rooted at `comment_id`. This is how a verdict becomes visible to
     /// the reviewer who left the comment.
     fn reply(&self, number: u64, comment_id: &str, body: &str) -> Result<(), ForgeError>;
+
+    /// Post `body` on the pull request's own conversation. How a verdict on a review's summary
+    /// reaches its reviewer, since a summary has no thread to reply on.
+    fn comment(&self, number: u64, body: &str) -> Result<(), ForgeError>;
 
     /// Resolve the thread rooted at each of `comment_ids`, so a settled comment reads as done to
     /// the person merging, answering one result per id in the same order. A batch because

@@ -399,7 +399,13 @@ before; delivery is then a row in the store advanced on the tick — after recon
 before the dispatch gate, at `delivery.poll_interval_ms` — through: push the branch
 (`Publisher`, implemented by `GitWorktreeWorkspace`, from the worktree), open or find the pull
 request (`Forge`, `GithubForge` over the tracker's `Http` seam), request the configured
-reviewers *and read back whether they attached*, read CI, read the review threads. A red CI or
+reviewers *and read back whether they attached*, read CI, read the review threads — and the
+reviews' summaries, since a reviewer can leave a finding on no line (#126). A summary on the
+current head from a `delivery.summary_reviewers` login (Copilot by default), or in the
+`CHANGES_REQUESTED` state from anyone, that says more than "Findings: None" is handed back whole
+as one more comment keyed `review-<id>`: no parser for its sections, whose format is nobody's
+contract, and noise costs one `rejected` verdict, posted as a pull request comment since a
+summary has no thread. A red CI or
 an open comment sends the issue back to an agent by the same path a `Continue` takes — a retry
 due now, the session resumed, and the failure in the prompt as `Feedback::Ci` or
 `Feedback::Review` — which is the literal form of "a red gate is a `Continue`, never a `Done`".

@@ -825,6 +825,9 @@ fn feedback_help(feedback: Option<&Feedback>) -> String {
                 let at = match (&c.path, c.line) {
                     (Some(p), Some(l)) => format!("{p}:{l}"),
                     (Some(p), None) => p.clone(),
+                    _ if crate::forge::summary_review_id(&c.id).is_some() => {
+                        "(review summary)".into()
+                    }
                     _ => "(general)".into(),
                 };
                 s.push_str(&format!("\n[{}] {} — {}\n{}\n", c.id, at, c.author, c.body.trim()));
