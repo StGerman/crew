@@ -424,9 +424,13 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!(issue_id = %id, cleared, "operator cleared quarantine");
                         let _ = snap_tx.send(sched.snapshot()?);
                     }
+                    // Unlike unquarantine, an unblock reads the tracker, so it can fail on an
+                    // outage; a keypress must not take the daemon down with it.
                     UiAction::Unblock(id) => {
-                        let cleared = sched.unblock(&id)?;
-                        tracing::info!(issue_id = %id, cleared, "operator lifted a park");
+                        match sched.unblock(&id) {
+                            Ok(cleared) => tracing::info!(issue_id = %id, cleared, "operator lifted a park"),
+                            Err(e) => tracing::error!(issue_id = %id, error = %e, "unblock failed; the park is kept"),
+                        }
                         let _ = snap_tx.send(sched.snapshot()?);
                     }
                 }

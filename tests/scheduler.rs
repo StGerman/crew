@@ -3537,10 +3537,10 @@ fn unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch() {
     );
     let gate = Arc::new(FakeGate::new(h.clock.clone()));
     h.sched.set_gate(Some(gate.clone()));
-    gate.set_default(
-        GateScript::passes_in(1_000)
-            .with_verdict(GateVerdict::Conflict { paths: vec!["src/store/schema.rs".into()] }),
-    );
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["src/store/schema.rs".into()],
+        base_sha: BASE.into(),
+    }));
     h.worker.set_default(Script::succeeds_in(1_000));
 
     h.sched.tick().unwrap();
@@ -3661,4 +3661,34 @@ fn unblocking_an_issue_whose_ticket_closed_leaves_it_for_the_parked_sweep() {
     h.sched.tick().unwrap();
     assert_eq!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state, None);
     assert!(!ws.exists(), "the sweep reclaimed the worktree the park kept in view");
+}
+
+/// Review on #112: an unblock that lifts a park `dispatch_new` would then refuse — the issue
+/// lost its dispatch marker, or spent its turn budget — reports success and leaves the issue
+/// neither parked nor dispatchable. Every gate dispatch applies is checked before lifting.
+#[test]
+fn unblocking_an_issue_dispatch_would_refuse_keeps_its_park() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |c| {
+        c.agent.max_turns_per_issue = 5; // the fake burns 3 turns per run
+    });
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Blocked { why: "conflict".into() }),
+    );
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+
+    h.tracker.set_dispatchable("iss-1", false);
+    assert!(!h.sched.unblock("iss-1").unwrap(), "no dispatch marker, no unblock");
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+    h.tracker.set_dispatchable("iss-1", true);
+
+    assert!(h.sched.unblock("iss-1").unwrap(), "eligible again: the park lifts");
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().cumulative_turns >= 5);
+    assert!(h.sched.store().get("iss-1").unwrap().unwrap().parked_state.is_some());
+    assert!(!h.sched.unblock("iss-1").unwrap(), "a spent turn budget keeps the park");
 }
