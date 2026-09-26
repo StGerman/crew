@@ -1,6 +1,6 @@
-# Points at this repo's own real GitHub Issues backlog. Requires GITHUB_TOKEN in the
-# environment unless `tracker.github_app` is set below — never put a token in this file, it is
-# checked in.
+# Points at this repo's own real GitHub Issues backlog, as the crew-bot GitHub App
+# (`tracker.github_app` below). Comment that key out to fall back to GITHUB_TOKEN in the
+# environment — never put a token in this file, it is checked in.
 #
 # The backlog has not adopted the `state:<name>` label convention yet (see
 # src/tracker/github.rs's module doc), so every open, `agent`-labelled issue reports as
@@ -19,10 +19,10 @@ terminal_states = ["closed"]
 # an agent. The poll filters on it too, so its cost follows the labelled issues, not the backlog.
 dispatch_label = "agent"
 # Every write — comments, `state:*` labels, pull requests, pushes — authored by the Crew GitHub
-# App rather than by whoever's GITHUB_TOKEN this is. Uncomment once ~/.crewd/github-app.toml
-# exists (app_id, installation_id, private_key_path): with the key set and the file absent,
-# the daemon refuses to start.
-# github_app = "~/.crewd/github-app.toml"
+# App (crew-bot[bot]) rather than by whoever's GITHUB_TOKEN this is. The file holds app_id,
+# installation_id and private_key_path (`crewd init` writes it); with the key set and the file
+# absent or incomplete, the daemon refuses to start, naming what is missing (#98).
+github_app = "~/.crewd/github-app.toml"
 
 # A poll costs one `by_states` request plus one `by_ids` per running issue, so the hourly cost
 # is (1 + max_concurrent) * 120 at this interval. That scales with the worker count, which is
