@@ -230,6 +230,14 @@ impl FakeForge {
         rec.pr.requested_reviewers.retain(|r| r != reviewer);
     }
 
+    /// Someone other than the orchestrator moves the head — the operator merging the base in,
+    /// or the provider's "Update branch" — so the pull request's head is one no `publish` made.
+    pub fn push_head(&self, number: u64, head_sha: &str) {
+        if let Some(rec) = self.inner.lock().unwrap().prs.get_mut(&number) {
+            rec.pr.head_sha = head_sha.to_string();
+        }
+    }
+
     /// The operator closes or merges it outside the orchestrator.
     pub fn set_state(&self, number: u64, state: PrState) {
         if let Some(rec) = self.inner.lock().unwrap().prs.get_mut(&number) {
@@ -396,7 +404,7 @@ impl Forge for FakeForge {
             .get(head_sha)
             .cloned()
             .or_else(|| g.ci_default.clone())
-            .unwrap_or(CiStatus::Pending))
+            .unwrap_or(CiStatus::Pending { running: vec![] }))
     }
 
     fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>, ForgeError> {

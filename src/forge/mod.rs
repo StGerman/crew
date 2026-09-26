@@ -98,7 +98,11 @@ pub struct Review {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CiStatus {
     /// No check has failed yet and at least one has not finished — or none has started.
-    Pending,
+    /// `running` names the checks not yet completed, empty when none has started, so a handoff
+    /// for silence can say what it was waiting on (#105).
+    Pending {
+        running: Vec<String>,
+    },
     Success,
     /// At least one check failed. `failures` is what the agent will be handed.
     Failure {

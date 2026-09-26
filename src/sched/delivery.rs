@@ -45,12 +45,13 @@
 use std::collections::HashMap;
 
 use super::Scheduler;
-use crate::clock::Wall;
+use crate::clock::{Mono, Wall};
 use crate::forge::{CiStatus, Forge, ForgeError, PrState, PullRequest, PullRequestSpec};
 use crate::model::{Feedback, ReviewVerdict, Verdict};
 use crate::store::{DeliveryRecord, DeliveryStage, IssueState};
 
 pub use libcrew::DeliveryView;
+use libcrew::fmt::{fmt_ms, timestamp};
 
 impl From<&DeliveryRecord> for DeliveryView {
     fn from(d: &DeliveryRecord) -> Self {
@@ -427,21 +428,16 @@ impl Scheduler {
             }
         }
 
-        match forge.ci_status(&pr.head_sha)? {
-            CiStatus::Pending => {
-                let pushed = d.head_pushed_at.unwrap_or(clock.wall().0);
-                let waited = clock.wall().0.saturating_sub(pushed);
-                if waited as u64 > self.cfg.delivery.ci_timeout_ms {
-                    let reason = format!(
-                        "CI reported nothing for {} within {} ms",
-                        pr.head_sha, self.cfg.delivery.ci_timeout_ms
-                    );
-                    tracing::warn!(issue_id, pr = number, "{reason}; handing off");
-                    self.hand_off(issue_id, &reason).map_err(StepError::Other)?;
-                } else {
-                    tracing::debug!(issue_id, pr = number, head = %pr.head_sha, "awaiting CI");
-                }
-                return Ok(());
+        let ci = forge.ci_status(&pr.head_sha)?;
+        if !matches!(ci, CiStatus::Pending { .. }) {
+            self.ci_waits.remove(issue_id);
+            if d.ci_pending.is_some() {
+                self.store.set_ci_pending(clock.as_ref(), issue_id, None)?;
+            }
+        }
+        match ci {
+            CiStatus::Pending { running } => {
+                return self.await_ci(issue_id, &d, &pr, &running);
             }
             CiStatus::Failure { failures } => {
                 let named: Vec<String> = failures.iter().map(|f| f.name.clone()).collect();
@@ -497,6 +493,60 @@ impl Scheduler {
             self.store.set_delivery_stage(clock.as_ref(), issue_id, DeliveryStage::Ready, None)?;
         }
         Ok(())
+    }
+
+    /// CI is pending on `pr`'s head: wait, or hand off once nothing has completed for
+    /// `ci_timeout_ms`. The wait is timed from when this head was first seen pending, never
+    /// from crewd's own push — that clock handed off a ready pull request the moment a check
+    /// re-ran on it, or the operator pushed a head of their own (#105).
+    fn await_ci(
+        &mut self,
+        issue_id: &str,
+        d: &DeliveryRecord,
+        pr: &PullRequest,
+        running: &[String],
+    ) -> Result<(), StepError> {
+        let clock = self.clock.clone();
+        let now = clock.mono();
+        let since = match self.ci_waits.get(issue_id) {
+            Some((head, since)) if *head == pr.head_sha => *since,
+            _ => {
+                // A record for this head that is not in memory is one a restart left: wall time
+                // is all that crosses a restart, so it alone decides how much of the wait is
+                // already spent — the same trust `retry.due_at` places in it.
+                let spent = match &d.ci_pending {
+                    Some((head, at)) if *head == pr.head_sha => {
+                        clock.wall().0.saturating_sub(*at).max(0) as u64
+                    }
+                    _ => {
+                        self.store.set_ci_pending(clock.as_ref(), issue_id, Some(&pr.head_sha))?;
+                        0
+                    }
+                };
+                let since = Mono(now.0.saturating_sub(spent));
+                self.ci_waits.insert(issue_id.to_string(), (pr.head_sha.clone(), since));
+                since
+            }
+        };
+        let timeout = self.cfg.delivery.ci_timeout_ms;
+        let waited = now.saturating_since(since);
+        if waited <= timeout {
+            tracing::debug!(issue_id, pr = pr.number, head = %pr.head_sha, "awaiting CI");
+            return Ok(());
+        }
+        let what = if running.is_empty() {
+            "none has started".to_string()
+        } else {
+            format!("still running: {}", running.join(", "))
+        };
+        let reason = format!(
+            "no check run completed on {} within {} of {}; {what}",
+            pr.head_sha,
+            fmt_ms(timeout),
+            timestamp(clock.wall().0 - waited as i64)
+        );
+        tracing::warn!(issue_id, pr = pr.number, "{reason}; handing off");
+        self.hand_off(issue_id, &reason).map_err(StepError::Other)
     }
 
     /// Hand the issue back to an agent with `feedback`, or to the operator if the rounds are

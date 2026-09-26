@@ -182,6 +182,15 @@ pub(super) const MIGRATIONS: &[&str] = &[
     -- backoff, which must not hold capacity hostage.
     ALTER TABLE retry ADD COLUMN reserved_state TEXT;
     "#,
+    // v11
+    r#"
+    -- The head CI was last seen pending on, and when it was first seen so (#105). Timing the
+    -- wait from `head_pushed_at` handed off a ready pull request the moment a check re-ran on
+    -- it, or the operator pushed a head of their own, because that clock had started hours
+    -- earlier on crewd's own push. NULL whenever CI is not pending, so a re-run starts afresh.
+    ALTER TABLE delivery ADD COLUMN ci_pending_head TEXT;
+    ALTER TABLE delivery ADD COLUMN ci_pending_since INTEGER;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -274,6 +283,7 @@ mod tests {
         "ed7f6925c75fac094be75380ad40f558d6ba9be90f69924168a970c358393593", // v8
         "c0f411b768e640dee5cfa9e4703d8af27c23a7e322bcac4c3e5585fdf083fca7", // v9
         "6a9665ba56edbe4ceccb6d168c317ca59b6b7f100e03790a66323dda541c5caf", // v10
+        "3a74fa83ec2e66ebeb9a2231b6086493884f40fdabed03608e3608f2a9cd0a5d", // v11
     ];
 
     #[test]

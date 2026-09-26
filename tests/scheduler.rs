@@ -2674,6 +2674,158 @@ fn a_red_ci_gate_re_dispatches_the_issue_with_the_failure_in_the_prompt_and_the_
     assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 1);
 }
 
+const HOUR_MS: u64 = 60 * 60 * 1_000;
+
+fn copilot_running() -> CiStatus {
+    CiStatus::Pending { running: vec!["copilot-pull-request-reviewer".into()] }
+}
+
+/// #105: a ready pull request was handed off for "CI reported nothing" a minute into a check
+/// re-run, because the wait was timed from crewd's push hours earlier. The wait belongs to the
+/// re-run, and a re-run that finishes green stops it, so the next one starts from zero too.
+#[test]
+fn a_check_re_run_on_a_ready_pull_request_does_not_hand_it_off() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    let head = FakeForge::head_after_publish(1);
+
+    h.clock.advance_ms(6 * HOUR_MS);
+    forge.set_ci(&head, copilot_running());
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Ready,
+        "a check that starts again is not CI that reported nothing"
+    );
+
+    // Green again, then a second re-run: the first re-run's wait does not carry over.
+    h.clock.advance_ms(HOUR_MS * 3 / 4);
+    h.sched.tick().unwrap();
+    forge.set_ci(&head, CiStatus::Success);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    forge.set_ci(&head, copilot_running());
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(HOUR_MS * 3 / 4);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    h.clock.advance_ms(HOUR_MS / 4 + 1_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff, "the timeout still holds");
+    let why = d.handoff_reason.expect("a reason");
+    assert!(why.contains("no check run completed"), "says what was observed: {why}");
+    assert!(why.contains("copilot-pull-request-reviewer"), "names the pending run: {why}");
+}
+
+/// #105: a head the operator pushed — a merge of the base to clear a conflict — was handed
+/// off ninety seconds into its CI run, timed from crewd's own earlier push of another head.
+/// Here crewd's head is already most of the way through its wait when the operator's lands.
+#[test]
+fn a_head_the_operator_pushed_gets_its_own_ci_wait() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_ci(&FakeForge::head_after_publish(1), CiStatus::Pending { running: vec![] });
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    let number = forge.open_prs()[0].number;
+
+    h.clock.advance_ms(HOUR_MS * 3 / 4);
+    h.sched.tick().unwrap();
+    forge.push_head(number, "operator-merge");
+    forge.set_ci("operator-merge", CiStatus::Pending { running: vec!["ci".into()] });
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(HOUR_MS - 1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "the operator's head is waited on for the full timeout, not what was left of crewd's"
+    );
+
+    h.clock.advance_ms(2_000);
+    h.sched.tick().unwrap();
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::HandedOff);
+    assert!(d.handoff_reason.unwrap().contains("operator-merge"), "names the head it waited on");
+}
+
+/// Review on #121: the CI wait is an interval, so it is timed on the monotonic clock — a wall
+/// clock stepped forward by NTP must not hand off a pull request whose checks are still running.
+#[test]
+fn a_wall_clock_step_does_not_cut_a_ci_wait_short() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    forge.set_ci(&FakeForge::head_after_publish(1), copilot_running());
+    run_once(&mut h);
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+
+    h.clock.step_wall_ms(2 * HOUR_MS as i64);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::Awaiting,
+        "a second of waiting is a second, whatever the wall clock says"
+    );
+}
+
+/// `Mono` does not cross a restart, so the wait is rebuilt from the store's wall-clock record
+/// of it: a daemon restarted every half hour must still hand off CI that never reports.
+#[test]
+fn a_restart_does_not_forgive_the_ci_wait_already_spent() {
+    let dir = tmp_dir("ci-wait-restart");
+    let db = dir.join("crew.db");
+    let forge = Arc::new(FakeForge::new());
+    forge.set_ci(&FakeForge::head_after_publish(1), copilot_running());
+    {
+        let (mut h, _) = delivery_harness_with(
+            vec![issue(1, "In Progress", Some(1))],
+            Store::open(&db).unwrap(),
+            forge.clone(),
+            |_| {},
+        );
+        run_once(&mut h);
+        h.clock.advance_ms(HOUR_MS * 3 / 4);
+        h.sched.tick().unwrap();
+        assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Awaiting);
+    }
+
+    let (mut h, _) = delivery_harness_with(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open(&db).unwrap(),
+        forge.clone(),
+        |_| {},
+    );
+    // The new process's clock starts where the old one did; this is the time that has passed.
+    h.clock.advance_ms(HOUR_MS * 3 / 4 + 5_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(HOUR_MS / 4);
+    h.sched.tick().unwrap();
+    assert_eq!(
+        delivery_of(&h, "iss-1").stage,
+        crew::store::DeliveryStage::HandedOff,
+        "the wait spent before the restart still counts"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// GETT-174120: requesting a bot reviewer over REST returns success and adds nobody. The
 /// provider's answer is not evidence; the pull request's own state is, and a request that did
 /// not take must be reported as the failure it is.
