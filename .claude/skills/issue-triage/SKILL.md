@@ -78,6 +78,12 @@ description the moment it is made, not left in a comment or in this conversation
 - Edit with `gh issue view <n> --json body --jq .body > <file>`, change the file, then
   `gh issue edit <n> --body-file <file>`, so the rest of the body survives byte for byte.
 
+This holds for an issue that already has a live session too. A resumed session's prompt
+leaves the body out while it is unchanged, and sends it again, under a heading saying it
+changed, whenever its hash differs from the body the session last saw (#109). Editing the
+description is therefore the way to reach a running or parked issue's agent. A comment still
+does not reach it.
+
 An issue whose body still has an unanswered question is not ready to be made dispatchable,
 whatever its milestone.
 
