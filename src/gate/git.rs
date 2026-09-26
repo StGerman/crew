@@ -224,7 +224,19 @@ impl GateRun {
         // replay only its own commits and drop any merge of the base — which is where an agent
         // that resolved a conflict by merging put the resolution, so the conflict came back
         // (#122). A failed probe falls through to the rebase, which is what ran before.
-        let rebased = if self.git(ws, &["merge-base", "--is-ancestor", &base_sha, "HEAD"]).is_ok() {
+        let contains_base =
+            self.git(ws, &["merge-base", "--is-ancestor", &base_sha, "HEAD"]).is_ok();
+        if self.killed() {
+            // A probe killed mid-flight reads as "not an ancestor"; without this the stop
+            // request would be answered by starting a rebase.
+            return stopped("check the branch against the base", false);
+        }
+        let rebased = if contains_base {
+            // Skipping the rebase skips its refusal of a dirty tree too, and delivery pushes
+            // `HEAD` alone: a tracked edit left uncommitted would pass the gate and never ship.
+            if let Some(verdict) = self.uncommitted(ws) {
+                return verdict;
+            }
             false
         } else {
             match self.rebase(ws, &base_sha, format!("rebase onto {base_label}")) {
@@ -250,6 +262,9 @@ impl GateRun {
     /// Rebase the worktree onto `base_sha`: whether that moved any commits, or the verdict a
     /// rebase that stopped ends the gate with.
     fn rebase(&self, ws: &Path, base_sha: &str, step: String) -> Result<bool, Verdict> {
+        if self.killed() {
+            return Err(stopped(step, false));
+        }
         self.set_step(&step);
         let before = self.git(ws, &["rev-parse", "HEAD"]).unwrap_or_default();
         if let Err(stderr) = self.git(ws, &["rebase", base_sha]) {
@@ -282,6 +297,22 @@ impl GateRun {
         }
         let after = self.git(ws, &["rev-parse", "HEAD"]).unwrap_or_default();
         Ok(before != after)
+    }
+
+    /// The failure for a worktree holding uncommitted changes to tracked files — the policy
+    /// `git rebase` enforces by refusing, stated for the path that does not rebase. Untracked
+    /// files pass, as they do for the rebase.
+    fn uncommitted(&self, ws: &Path) -> Option<Verdict> {
+        let step = "check the worktree is clean".to_string();
+        let output = match self.git(ws, &["status", "--porcelain", "--untracked-files=no"]) {
+            Ok(changes) if changes.is_empty() => return None,
+            Ok(changes) => format!(
+                "uncommitted changes to tracked files would not be handed off; commit or \
+                 discard them:\n{changes}"
+            ),
+            Err(e) => format!("cannot read the worktree's status: {e}"),
+        };
+        Some(Verdict::Failed { step, output, on_base: false })
     }
 
     /// Spawn `cmd` in its own process group and record its pid as `pgid` for as long as it is
@@ -547,6 +578,59 @@ mod tests {
         assert_eq!(sh_git(&wt, &["rev-parse", "HEAD"]), merged, "the merge commit must survive");
         assert_eq!(std::fs::read_to_string(wt.join("base.txt")).unwrap(), "both versions\n");
         assert!(wt.join("gate-ran").exists(), "the commands still run on the merged branch");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Skipping the rebase must not skip its refusal of a dirty tree: delivery pushes `HEAD`,
+    /// so an uncommitted edit that passed the gate would be dropped from the handoff unseen.
+    #[test]
+    fn a_dirty_worktree_already_on_the_base_fails_rather_than_passing_without_its_edit() {
+        let (dir, repo, wt) = repo_and_worktree("dirty-on-base");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        std::fs::write(wt.join("agent.txt"), "uncommitted edit\n").unwrap();
+        std::fs::write(wt.join("scratch.txt"), "untracked\n").unwrap();
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])]);
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        match verdict {
+            Verdict::Failed { step, output, on_base } => {
+                assert_eq!(step, "check the worktree is clean");
+                assert!(output.contains("agent.txt"), "names the edit: {output}");
+                assert!(!output.contains("scratch.txt"), "untracked files pass: {output}");
+                assert!(!on_base, "nothing moved, so the brief says where the agent left it");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!wt.join("gate-ran").exists(), "the commands do not run on an unshippable tree");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kill` may land while an earlier probe runs, which reads as the probe failing; the rebase
+    /// must still see the stop and not begin rewriting a worktree cleanup is about to remove.
+    #[test]
+    fn a_gate_stopped_before_its_rebase_starts_does_not_rebase() {
+        let (dir, repo, wt) = repo_and_worktree("stopped-before-rebase");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        commit(&repo, "from_master.txt", "moved\n", "master moved on");
+        let before = sh_git(&wt, &["rev-parse", "HEAD"]);
+        let run = GateRun {
+            state: Arc::new((Mutex::new(Inner::default()), Condvar::new())),
+            repo: repo.clone(),
+            base: None,
+            commands: Vec::new(),
+            workspace: wt.clone(),
+            identifier: "MT-1".into(),
+        };
+        run.state.0.lock().unwrap().killed = true;
+
+        let base = sh_git(&repo, &["rev-parse", "master"]);
+        let result = run.rebase(&wt, &base, "rebase onto master".into());
+
+        assert!(matches!(result, Err(Verdict::Failed { on_base: false, .. })), "got {result:?}");
+        assert_eq!(sh_git(&wt, &["rev-parse", "HEAD"]), before, "the branch must not move");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
