@@ -174,7 +174,8 @@ impl OpsMcp {
                                 existing branch. Write what changed into the issue's \
                                 description first: that is the prompt the agent reads. \
                                 Reports `cleared: false` rather than failing when the issue \
-                                is not parked or is running, gating or waiting on a retry. \
+                                is not parked or is running, gating, waiting on a retry or being \
+                                delivered. \
                                 The same action as POST /api/v1/unblock/:key and the \
                                 dashboard's `b` key.",
                 "inputSchema": key

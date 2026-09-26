@@ -394,7 +394,11 @@ impl Store {
     /// a parked issue in phase `released`, unquarantined and with no retry row, is unparked.
     /// A running or gating issue holds phase `running`, and a retry-queued one holds a retry
     /// row, so neither matches; clearing a park on anything live would let the next tick
-    /// dispatch a second agent onto a worktree already in use. The claim is never touched —
+    /// dispatch a second agent onto a worktree already in use. A delivery in a stage
+    /// `advance_deliveries` acts on — `pending`, `awaiting`, `ready` — owns the parked `Done`
+    /// too: lifting its park would let delivery push the branch, or hand it back, in the same
+    /// tick `dispatch_new` puts an agent on it. `redispatched`, `handed_off` and `closed` are
+    /// left out because none pushes or hands back. The claim is never touched —
     /// the next `dispatch_new` takes it the ordinary way. The parked note goes too, since
     /// it names the problem the operator has just resolved.
     pub fn unblock(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
@@ -404,7 +408,9 @@ impl Store {
              SET parked_state = NULL, last_error = NULL, last_error_class = NULL, updated_at = ?2
              WHERE issue_id = ?1 AND parked_state IS NOT NULL AND phase = 'released'
                AND quarantined_at IS NULL
-               AND NOT EXISTS (SELECT 1 FROM retry WHERE retry.issue_id = ?1)",
+               AND NOT EXISTS (SELECT 1 FROM retry WHERE retry.issue_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM delivery WHERE delivery.issue_id = ?1
+                               AND delivery.stage IN ('pending', 'awaiting', 'ready'))",
             params![issue_id, clock.wall().0],
         )?;
         Ok(n == 1)
@@ -902,6 +908,26 @@ mod tests {
 
         assert_eq!(s.get("id-1").unwrap().unwrap().phase, Phase::Running, "the claim must stand");
         assert!(!s.claim(&c, "id-1").unwrap(), "and must still be exclusive");
+    }
+
+    #[test]
+    fn an_unblock_does_not_lift_a_park_a_live_delivery_still_owns() {
+        // A `Done` parks and queues delivery. Lifting that park would put an agent on the
+        // branch in the same tick delivery pushes it or hands it back.
+        let (s, c) = setup();
+        s.release(&c, "id-1").unwrap();
+        s.park(&c, "id-1", "in progress").unwrap();
+        for stage in [DeliveryStage::Pending, DeliveryStage::Awaiting, DeliveryStage::Ready] {
+            s.begin_delivery(&c, "id-1", None).unwrap();
+            s.set_delivery_stage(&c, "id-1", stage, None).unwrap();
+            assert!(!s.unblock(&c, "id-1").unwrap(), "{stage:?} delivery owns the park");
+            assert!(s.get("id-1").unwrap().unwrap().parked_state.is_some());
+        }
+
+        // One that pushes nothing and hands nothing back does not stand in the way.
+        s.set_delivery_stage(&c, "id-1", DeliveryStage::HandedOff, Some("round bound")).unwrap();
+        assert!(s.unblock(&c, "id-1").unwrap());
+        assert_eq!(s.get("id-1").unwrap().unwrap().parked_state, None);
     }
 
     #[test]
