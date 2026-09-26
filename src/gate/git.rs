@@ -17,6 +17,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+
 use super::{Gate, GateHandle, Verdict};
 use crate::model::Issue;
 use crate::worker::KillResult;
@@ -87,7 +90,7 @@ impl GateHandle for GitGateRun {
         // steps, which is what stops a *next* step from starting, but the signal below is what
         // stops the one already in flight instead of leaving it to run to completion unwatched.
         if let Some(pgid) = pgid {
-            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+            let _ = kill(Pid::from_raw(-pgid), Signal::SIGTERM);
         }
         let g = lock.lock().unwrap();
         let (g, timeout) = cvar
@@ -99,7 +102,7 @@ impl GateHandle for GitGateRun {
         let pgid = g.pgid;
         drop(g);
         if let Some(pgid) = pgid {
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
         }
         let g = lock.lock().unwrap();
         let _ = cvar.wait_timeout_while(g, Duration::from_secs(5), |g| g.verdict.is_none());
@@ -913,9 +916,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let hook_pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
-        assert_eq!(
-            unsafe { libc::kill(hook_pid, 0) },
-            0,
+        assert!(
+            kill(Pid::from_raw(hook_pid), None).is_ok(),
             "the hook must actually be alive to prove anything by killing it"
         );
 
@@ -927,9 +929,8 @@ mod tests {
         );
         assert!(matches!(result, KillResult::Stopped | KillResult::Forced), "got {result:?}");
         assert!(matches!(h.finished(), Some(Verdict::Failed { .. })), "a killed gate did not pass");
-        assert_ne!(
-            unsafe { libc::kill(hook_pid, 0) },
-            0,
+        assert!(
+            !kill(Pid::from_raw(hook_pid), None).is_ok(),
             "the git subprocess and its hook must actually be gone, not merely abandoned"
         );
         assert!(!done_file.exists(), "the hook must have been stopped before it could finish");
