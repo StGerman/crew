@@ -14,7 +14,7 @@ use crew::config::{AgentConfig, Config, PollingConfig, TrackerConfig, WorkspaceC
 use crew::gate::Verdict as GateVerdict;
 use crew::gate::fake::{FakeGate, GateScript};
 use crew::gate::{Gate, GateHandle, GitGate};
-use crew::model::{ErrorClass, Issue, Outcome, Phase};
+use crew::model::{ErrorClass, Issue, Outcome, Phase, worktree_key};
 use crew::project::{NoopProjector, Projector, TasksProjector};
 use crew::sched::{Scheduler, WorkerPool};
 use crew::store::Store;
@@ -1147,6 +1147,25 @@ fn a_continuation_stays_on_the_worker_that_holds_its_session() {
     let seen = h.worker.sessions_for("iss-1");
     assert_eq!(seen.len(), 3, "claude takes it back once the window resets");
     assert_eq!(seen[2], Session::Resume(first.id().to_string()));
+    assert!(grok.sessions_for("iss-1").is_empty());
+}
+
+/// A session recorded before runs named their worker (v13) has no owner. With several workers,
+/// overflow may hand the issue to a provider that never held it, so it starts fresh rather than
+/// resuming an id that means nothing there.
+#[test]
+fn an_ownerless_session_is_not_resumed_when_there_are_several_workers() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    let grok = two_workers(&mut h);
+    let st = h.sched.store();
+    st.ensure(h.clock.as_ref(), "iss-1", "MT-1", &worktree_key("iss-1", "MT-1")).unwrap();
+    st.set_session(h.clock.as_ref(), "iss-1", Some("legacy-session")).unwrap();
+
+    h.sched.tick().unwrap();
+
+    let seen = h.worker.sessions_for("iss-1");
+    assert_eq!(seen.len(), 1);
+    assert!(matches!(&seen[0], Session::New(id) if id != "legacy-session"), "{seen:?}");
     assert!(grok.sessions_for("iss-1").is_empty());
 }
 

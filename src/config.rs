@@ -316,7 +316,7 @@ impl Default for BrokerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerConfig {
     /// `fake` (default) or `claude`. Deliberately independent of `tracker.kind` — a real
     /// tracker with a fake worker is a safe way to watch real dispatch decisions without
@@ -760,8 +760,10 @@ impl Config {
     }
 
     fn check_workers(&self) -> Result<(), ConfigError> {
-        // Two sources for one list would leave the operator guessing which one ran.
-        if !self.workers.is_empty() && !self.worker.kind.trim().is_empty() {
+        // Two sources for one list would leave the operator guessing which one ran. Any field
+        // counts, not only `kind`: `[worker] model = ...` beside `[[workers]]` would otherwise be
+        // dropped without a word.
+        if !self.workers.is_empty() && self.worker != WorkerConfig::default() {
             return Err(ConfigError::Invalid(
                 "set either [worker] or [[workers]], not both".into(),
             ));
@@ -782,7 +784,7 @@ impl Config {
                     "worker {name:?} needs max_concurrent > 0"
                 )));
             }
-            // A blank name would reach the child as `--model ""`, which the CLI refuses on every
+            // A blank model would reach the child as `--model ""`, which the CLI refuses on every
             // attempt — one quarantine per issue for a typo that belongs here.
             if w.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
                 return Err(ConfigError::Invalid(
@@ -1000,6 +1002,8 @@ mod tests {
         both.worker.kind = "claude".into();
         both.workers = vec![pool("a", 1)];
         assert!(both.preflight().is_err(), "[worker] and [[workers]] together");
+        both.worker = WorkerConfig { model: Some("opus".into()), ..Default::default() };
+        assert!(both.preflight().is_err(), "a [worker] with only a model is still a [worker]");
 
         let mut shared = base();
         shared.workers = vec![pool("a", 1), pool("a", 1)];

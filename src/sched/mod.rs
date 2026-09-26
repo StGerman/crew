@@ -1483,11 +1483,17 @@ impl Scheduler {
         //
         // A session held by another worker is not resumed: its id means nothing to this
         // provider (#119). `pick_worker` never sends a pinned issue elsewhere, so this is the
-        // case of a worker removed from the config since the session began.
+        // case of a worker removed from the config since the session began. A session no run
+        // names a worker for predates v13: with one worker it can only be that worker's, and
+        // with several, overflow may have sent it to another provider, so it starts fresh.
         let pin = self.store.session_worker(&issue.id)?;
         let stored = self.store.get(&issue.id)?.and_then(|s| s.session_id);
+        let owned = match pin.as_deref() {
+            Some(p) => p == pool_name,
+            None => self.workers.len() == 1,
+        };
         let session = match stored {
-            Some(id) if pin.as_deref().is_none_or(|p| p == pool_name) => Session::Resume(id),
+            Some(id) if owned => Session::Resume(id),
             _ => {
                 let id = session_id(&issue.id, self.clock.wall().0);
                 self.store.set_session(self.clock.as_ref(), &issue.id, Some(&id))?;
