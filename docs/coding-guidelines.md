@@ -79,7 +79,7 @@ this file.
   `std::thread::sleep`, `std::time::Instant::now` and `std::time::SystemTime::now` in
   `clippy.toml`, with `#[allow]` in the two named files and in `src/clock.rs`.
   `Not yet enforced: #52`.
-- **MUST** pair every row in the CLAUDE.md invariant table with a named guard test. A change
+- **MUST** pair every row in the invariant table (`docs/invariants.md`) with a named guard test. A change
   that weakens a mechanism must first make its guard test fail. Why: several guard tests fail
   only in the exact scenario they were written for, so a green run is not proof that the test
   still means anything. Check: a CI step that extracts the test names from the table and runs
