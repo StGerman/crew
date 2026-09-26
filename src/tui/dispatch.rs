@@ -38,10 +38,11 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, selected: usize) {
             let note = if r.quarantined {
                 r.last_error.clone().unwrap_or_else(|| "quarantined".into())
             } else if let Some(due) = r.retry_in_ms {
+                let held = if r.holds_slot { ", slot held" } else { "" };
                 if due > 0 {
-                    format!("retry in {}", fmt_ms(due as u64))
+                    format!("retry in {}{held}", fmt_ms(due as u64))
                 } else {
-                    "retry due".into()
+                    format!("retry due{held}")
                 }
             } else if r.phase == Phase::Running {
                 r.last_event.clone().unwrap_or_default()
