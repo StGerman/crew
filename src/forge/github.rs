@@ -999,6 +999,23 @@ mod tests {
         assert_eq!(got.state, PrState::Closed);
     }
 
+    /// #159: `dirty` is a conflict whatever `mergeable` says, and a `null` is still computing.
+    #[test]
+    fn mergeability_parses_dirty_as_a_conflict_and_null_as_unknown() {
+        let read = |mergeable: Value, state: Value| {
+            let http = FakeHttp::new();
+            let mut pr = gh_pr(9, "sha2", "master", "open");
+            pr["mergeable"] = mergeable;
+            pr["mergeable_state"] = state;
+            http.push(ok(pr));
+            forge(http).pull_request(9).unwrap().mergeable
+        };
+        assert_eq!(read(json!(false), json!("dirty")), Some(false));
+        assert_eq!(read(Value::Null, json!("dirty")), Some(false));
+        assert_eq!(read(Value::Null, json!("unknown")), None);
+        assert_eq!(read(json!(true), json!("blocked")), Some(true));
+    }
+
     #[test]
     fn request_review_posts_exactly_the_reviewers_array_and_nothing_else() {
         let http = FakeHttp::new();
