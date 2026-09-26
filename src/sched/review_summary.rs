@@ -25,9 +25,7 @@ pub(super) fn summary_findings(
     reviews
         .iter()
         .filter(|r| r.commit_sha == head)
-        .filter(|r| {
-            r.state == "CHANGES_REQUESTED" || summary_reviewers.iter().any(|l| *l == r.reviewer)
-        })
+        .filter(|r| r.state == "CHANGES_REQUESTED" || summary_reviewers.contains(&r.reviewer))
         .filter(|r| carries_findings(&r.body))
         .map(|r| ReviewComment {
             id: format!("{SUMMARY_PREFIX}{}", r.id),

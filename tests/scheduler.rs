@@ -3290,6 +3290,173 @@ fn a_refused_resolve_is_reported_on_the_row_without_handing_off_a_ready_pull_req
     assert_eq!(forge.replies_to(pr, &c).len(), 1);
 }
 
+const COPILOT: &str = "copilot-pull-request-reviewer[bot]";
+
+/// The review ids a round was handed, in order.
+fn handed_ids(h: &Harness, id: &str, run: usize) -> Vec<String> {
+    match &h.worker.feedback_for(id)[run] {
+        Some(Feedback::Review { comments, .. }) => comments.iter().map(|c| c.id.clone()).collect(),
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+}
+
+/// #126: Copilot put a real finding in its review's summary, with no inline comment, and
+/// delivery — reading only threads — never saw it.
+#[test]
+fn a_finding_only_in_a_review_summary_is_handed_back_to_the_agent() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let review = forge.add_summary_review(
+        pr,
+        COPILOT,
+        "COMMENTED",
+        "## Copilot review overview\n\nPreviously missed: src/gate/git.rs:325 reports \
+         `on_base: false` on the no-rebase path.\n\n**Findings:** None",
+    );
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
+    match &h.worker.feedback_for("iss-1")[1] {
+        Some(Feedback::Review { comments, .. }) => {
+            assert_eq!(comments.len(), 1, "{comments:?}");
+            assert_eq!(comments[0].id, format!("review-{review}"), "keyed by the review");
+            assert!(comments[0].body.contains("Previously missed"), "handed over whole");
+        }
+        other => panic!("expected review feedback, got {other:?}"),
+    }
+}
+
+/// #126, the case as it happened: the pull request was `ready` when the review arrived.
+#[test]
+fn a_review_after_ready_with_a_summary_finding_reopens_the_round() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    forge.add_summary_review(pr, COPILOT, "COMMENTED", "The dirty-tree failure is misreported.");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let d = delivery_of(&h, "iss-1");
+    assert_ne!(d.stage, crew::store::DeliveryStage::Ready, "the finding holds ready: {d:?}");
+    assert_eq!(d.rounds_pr, 1, "and costs a round like any comment");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2);
+}
+
+/// #126: a summary finding has the inline comment's lifecycle — a verdict keyed by the review,
+/// posted on the pull request since there is no thread, the first verdict standing, and one
+/// round charged however often the same review is read again.
+#[test]
+fn a_settled_summary_finding_is_not_handed_back_again() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    let reviewed_head = forge.pr(pr).unwrap().head_sha;
+    let review = forge.add_summary_review(pr, COPILOT, "COMMENTED", "Consider renaming `x`.");
+    let key = format!("review-{review}");
+    h.worker.set_default(Script::succeeds_in(1_000).with_verdicts(vec![ReviewVerdict {
+        comment_id: key.clone(),
+        verdict: Verdict::Rejected,
+        detail: "the name is the one the spec uses".into(),
+    }]));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(handed_ids(&h, "iss-1", 1), std::slice::from_ref(&key));
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let verdicts = h.sched.store().verdicts_for("iss-1").unwrap();
+    assert_eq!(verdicts[&key].0, Verdict::Rejected);
+    let posted = forge.comments_on(pr);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert!(posted[0].contains("> Consider renaming `x`."), "quotes the finding: {}", posted[0]);
+    assert!(posted[0].contains("**Rejected** — the name is the one the spec uses"));
+    assert!(forge.replies_to(pr, &key).is_empty(), "a summary has no thread to reply on");
+    assert!(
+        forge.ops().iter().all(|o| !matches!(o, Op::Resolve { .. })),
+        "nor one to resolve: {:?}",
+        forge.ops()
+    );
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+
+    // The same review read on the head again — settled by its id, not re-argued; and a later
+    // run's different verdict on it does not replace the first.
+    forge.push_head(pr, &reviewed_head);
+    for _ in 0..5 {
+        h.clock.advance_ms(2_000);
+        h.sched.tick().unwrap();
+    }
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "no further round over a settled summary");
+    let d = delivery_of(&h, "iss-1");
+    assert_eq!(d.stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(d.rounds_pr, 1);
+    assert_eq!(d.rounds_issue, 1);
+    assert_eq!(forge.comments_on(pr).len(), 1, "one verdict comment, ever");
+}
+
+/// #126: Copilot's summary saying there is nothing is not a finding.
+#[test]
+fn a_summary_that_says_findings_none_and_nothing_else_hands_nothing_back() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    forge.add_summary_review(
+        pr,
+        COPILOT,
+        "COMMENTED",
+        "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n**Findings:** None\n",
+    );
+    for _ in 0..3 {
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+    }
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Ready);
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1);
+    assert_eq!(delivery_of(&h, "iss-1").rounds_pr, 0);
+}
+
+/// #126: the same gap for a human who requested changes in the summary alone.
+#[test]
+fn a_changes_requested_review_with_only_a_summary_is_handed_back() {
+    let (mut h, forge) = delivery_harness(
+        vec![issue(1, "In Progress", Some(1))],
+        Store::open_in_memory().unwrap(),
+        |_| {},
+    );
+    run_once(&mut h);
+    let pr = forge.open_prs()[0].number;
+    // A human's plain comment summary is not a finding; their request for changes is.
+    forge.add_summary_review(pr, "alice", "COMMENTED", "Nice work overall.");
+    let review =
+        forge.add_summary_review(pr, "alice", "CHANGES_REQUESTED", "Split the migration out.");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(delivery_of(&h, "iss-1").stage, crew::store::DeliveryStage::Redispatched);
+    assert_eq!(handed_ids(&h, "iss-1", 1), [format!("review-{review}")]);
+}
+
 /// Finding 4 on #47, end to end: the reviewer approves the first head, CI sends the issue round,
 /// and the fix lands as a second head on the same pull request. Nobody had asked the reviewer
 /// again, so `Ready` was reached on a head no one had looked at.

@@ -228,7 +228,13 @@ impl FakeForge {
     }
 
     /// The same, with a summary body. Returns the review's id.
-    pub fn add_summary_review(&self, number: u64, reviewer: &str, state: &str, body: &str) -> String {
+    pub fn add_summary_review(
+        &self,
+        number: u64,
+        reviewer: &str,
+        state: &str,
+        body: &str,
+    ) -> String {
         let mut g = self.inner.lock().unwrap();
         let rec = g.prs.get_mut(&number).expect("no such pull request");
         let id = format!("r-{}-{}", number, rec.reviews.len() + 1);

@@ -683,8 +683,7 @@ impl<H: Http> Forge for GithubForge<H> {
 
     /// A pull request's conversation is its issue's, so this is the issues endpoint.
     fn comment(&self, number: u64, body: &str) -> Result<(), ForgeError> {
-        let url =
-            format!("{API_BASE}/repos/{}/{}/issues/{number}/comments", self.owner, self.repo);
+        let url = format!("{API_BASE}/repos/{}/{}/issues/{number}/comments", self.owner, self.repo);
         self.send_json("POST", &url, &json!({ "body": body }))?;
         Ok(())
     }
