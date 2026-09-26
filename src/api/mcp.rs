@@ -25,8 +25,8 @@
 //!
 //! ## The constraint that must survive review
 //!
-//! **crewd must never hand this server to a dispatched agent.** The broker exists because a worker gets
-//! authority scoped to one issue; this is scoped to the whole daemon. A worker that could call
+//! **crewd must never hand this server to a dispatched agent.** The broker exists because a
+//! worker gets authority scoped to one issue; this is scoped to the whole daemon. A worker that could call
 //! `unquarantine` or `unblock` could clear its own quarantine or park and re-dispatch itself, defeating
 //! `max_turns_per_issue`, the verdict and `parked_state` in one move — the three independent
 //! brakes the invariant table says to keep all of.
