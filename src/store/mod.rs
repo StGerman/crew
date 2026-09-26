@@ -400,9 +400,9 @@ impl Store {
     /// a `handed_off` one, which gave the branch to the operator: a dispatch there would end in a
     /// `Done` that restarts delivery, stepping around `max_rounds_per_issue` and the handoff
     /// itself. Only `redispatched` and `closed` are left out, since neither pushes nor hands
-    /// back, and a re-dispatched run that ends `Blocked` keeps its row `redispatched`. The claim is never touched —
-    /// the next `dispatch_new` takes it the ordinary way. The parked note goes too, since
-    /// it names the problem the operator has just resolved.
+    /// back, and a re-dispatched run that ends `Blocked` keeps its row `redispatched`. The
+    /// claim is never touched — the next `dispatch_new` takes it the ordinary way. The parked
+    /// note goes too, since it names the problem the operator has just resolved.
     pub fn unblock(&self, clock: &dyn Clock, issue_id: &str) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
