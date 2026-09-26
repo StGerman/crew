@@ -21,8 +21,10 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use super::{Gate, GateHandle, Verdict};
+use crate::credentials::Credentials;
 use crate::model::Issue;
 use crate::worker::KillResult;
+use crate::workspace::PushCredentialFile;
 
 /// How much of a failing command's output travels back to the agent. The tail, not the head:
 /// `cargo test` prints its `failures:` section and summary last, and a compiler stops at the
@@ -39,12 +41,33 @@ pub struct GitGate {
     /// own `base` moves only when someone pulls, and a gate that resolved it passed #50 "on the
     /// base" five seconds before its pull request opened conflicting (#134).
     remote: Option<String>,
+    fetch_auth: Option<FetchAuth>,
     commands: Vec<Vec<String>>,
+}
+
+/// The credential and URL the base is fetched with, when the push has them: the same pair
+/// `GitWorktreeWorkspace::with_push_credentials` pushes with, so a host whose only credential
+/// is the orchestrator's can gate what it can deliver.
+#[derive(Clone)]
+struct FetchAuth {
+    creds: Arc<dyn Credentials>,
+    url: String,
 }
 
 impl GitGate {
     pub fn new(repo: impl Into<PathBuf>, base: Option<String>, commands: Vec<Vec<String>>) -> Self {
-        Self { repo: repo.into(), base, remote: None, commands }
+        Self { repo: repo.into(), base, remote: None, fetch_auth: None, commands }
+    }
+
+    /// Fetch from `url` with `creds` instead of from the remote's own URL on the operator's
+    /// ambient credential. The fetched commit still lands in `refs/remotes/<remote>/<base>`.
+    pub fn with_fetch_credentials(
+        mut self,
+        creds: Arc<dyn Credentials>,
+        url: impl Into<String>,
+    ) -> Self {
+        self.fetch_auth = Some(FetchAuth { creds, url: url.into() });
+        self
     }
 
     /// Gate against `remote`'s copy of the base rather than `repo`'s. Ignored with no base set:
@@ -129,6 +152,7 @@ impl Gate for GitGate {
             repo: self.repo.clone(),
             base: self.base.clone(),
             remote: self.remote.clone(),
+            fetch_auth: self.fetch_auth.clone(),
             commands: self.commands.clone(),
             workspace: workspace.to_path_buf(),
             identifier: issue.identifier.clone(),
@@ -168,6 +192,7 @@ struct GateRun {
     repo: PathBuf,
     base: Option<String>,
     remote: Option<String>,
+    fetch_auth: Option<FetchAuth>,
     commands: Vec<Vec<String>>,
     workspace: PathBuf,
     identifier: String,
@@ -301,7 +326,22 @@ impl GateRun {
         let step = format!("fetch {remote}/{base}");
         self.set_step(&step);
         let refspec = format!("+refs/heads/{base}:refs/remotes/{remote}/{base}");
-        match self.git(&self.repo, &["fetch", "--quiet", "--no-tags", remote, &refspec]) {
+        let fetched = match &self.fetch_auth {
+            None => self.git(&self.repo, &["fetch", "--quiet", "--no-tags", remote, &refspec]),
+            Some(FetchAuth { creds, url }) => {
+                // Held until git returns: dropping it deletes the token's file.
+                let file = creds
+                    .token()
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| PushCredentialFile::new(&t).map_err(|e| e.to_string()));
+                file.and_then(|file| {
+                    let mut args = file.git_config();
+                    args.extend(["fetch", "--quiet", "--no-tags", url, &refspec].map(String::from));
+                    self.git(&self.repo, &args.iter().map(String::as_str).collect::<Vec<_>>())
+                })
+            }
+        };
+        match fetched {
             Ok(_) if self.killed() => Err(stopped(step, false)),
             Ok(_) => Ok(format!("refs/remotes/{remote}/{base}")),
             Err(e) => Err(Verdict::Failed {
@@ -684,6 +724,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review on #161: delivery pushes with the App's token to the canonical URL, so a host
+    /// with no ambient credential for the remote could deliver and yet fail every gate fetch.
+    /// The remote's own URL here leads nowhere; only the push URL reaches the base.
+    #[test]
+    fn the_base_is_fetched_from_the_push_url_with_the_push_credential() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("fetch-auth");
+        commit(&wt, "base.txt", "agent's version\n", "agent edits base");
+        commit(&upstream, "base.txt", "merged meanwhile\n", "another pull request merged");
+        sh_git(&repo, &["remote", "set-url", "origin", dir.join("nowhere").to_str().unwrap()]);
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![])
+            .with_remote("origin")
+            .with_fetch_credentials(
+                Arc::new(crate::credentials::StaticToken::new("ghs_token")),
+                upstream.to_str().unwrap(),
+            );
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        let remote_master = sh_git(&upstream, &["rev-parse", "master"]);
+        assert_eq!(
+            verdict,
+            Verdict::Conflict { paths: vec!["base.txt".into()], base_sha: remote_master.clone() }
+        );
+        assert_eq!(sh_git(&repo, &["rev-parse", "origin/master"]), remote_master);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_failed_fetch_of_the_base_fails_the_gate_rather_than_passing_on_the_stale_ref() {
         let (dir, upstream, repo, wt) = clone_and_worktree("fetch-fails");
@@ -765,6 +833,7 @@ mod tests {
             repo: repo.clone(),
             base: None,
             remote: None,
+            fetch_auth: None,
             commands: Vec::new(),
             workspace: wt.clone(),
             identifier: "MT-1".into(),
@@ -844,6 +913,7 @@ mod tests {
             repo: repo.clone(),
             base: None,
             remote: None,
+            fetch_auth: None,
             commands: Vec::new(),
             workspace: wt.clone(),
             identifier: "MT-1".into(),
@@ -1065,6 +1135,7 @@ mod tests {
             repo: PathBuf::from("/nonexistent"),
             base: None,
             remote: None,
+            fetch_auth: None,
             commands: vec![],
             workspace: PathBuf::from("/nonexistent"),
             identifier: "MT-1".into(),

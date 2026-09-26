@@ -248,8 +248,8 @@ not compile — three defects that existed only in the merge, which neither agen
 Nothing rebased a finished branch onto the current base, and nothing re-ran the checks after. So
 `Gate` is the seam between an agent saying `Done` and a human being handed the branch: `GitGate`
 resolves `gate.base` in `workspace.repo` (not in the worktree, whose HEAD is the run's own
-branch) — with delivery on, after fetching it from `delivery.remote` and resolving
-`<remote>/<base>`, because the local branch lags until someone pulls and a fetch that fails
+branch) — with delivery on, `delivery.base` when `gate.base` is unset, fetched from
+`delivery.remote` with the push's credential and resolved as `<remote>/<base>`, because the local branch lags until someone pulls and a fetch that fails
 fails the gate rather than passing on it (#134) — skips a branch with no commits beyond it, rebases — unless the branch already contains the
 base's tip, since a rebase would drop an agent's merge of the base and its conflict resolution
 with it (#122) — and on a clean rebase execs each
