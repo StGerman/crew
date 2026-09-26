@@ -73,9 +73,10 @@ pub enum Verdict {
         /// Whether the branch is sitting on the base by the time this failed.
         ///
         /// False for every step that runs before the rebase — resolving the base, counting
-        /// commits — and for a rebase that was refused and therefore aborted. True only once
-        /// the branch is on the base — rebased, or already containing its tip — which is the
-        /// case where a command failed *on the base*. The scheduler needs the distinction because it tells the agent where its work
+        /// commits — and for a rebase that was refused and therefore aborted. True once the
+        /// branch is on the base — rebased, or already containing its tip — which covers a
+        /// command failing *on the base* and a dirty tree refused on a branch that skipped the
+        /// rebase because it already contained the base. The scheduler needs the distinction because it tells the agent where its work
         /// now sits: saying "the branch has been rebased, fix this on top of it" when nothing
         /// was rebased describes a tree the agent will not find, and an agent that cannot
         /// reconcile the instruction with what it sees tends to report `Done` again unchanged.

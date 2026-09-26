@@ -311,7 +311,9 @@ impl GateRun {
 
     /// The failure for a worktree holding uncommitted changes to tracked files — the policy
     /// `git rebase` enforces by refusing, stated for the path that does not rebase. Untracked
-    /// files pass, as they do for the rebase.
+    /// files pass, as they do for the rebase. Only reached once the branch is known to contain
+    /// the base, so the failure reports `on_base: true`: the brief must not tell the agent its
+    /// branch is off the base when it is on it (review on #123).
     fn uncommitted(&self, ws: &Path) -> Option<Verdict> {
         let step = "check the worktree is clean".to_string();
         let output = match self.git(ws, &["status", "--porcelain", "--untracked-files=no"]) {
@@ -322,7 +324,7 @@ impl GateRun {
             ),
             Err(e) => format!("cannot read the worktree's status: {e}"),
         };
-        Some(Verdict::Failed { step, output, on_base: false })
+        Some(Verdict::Failed { step, output, on_base: true })
     }
 
     /// Spawn `cmd` in its own process group and record its pid as `pgid` for as long as it is
@@ -609,7 +611,7 @@ mod tests {
                 assert_eq!(step, "check the worktree is clean");
                 assert!(output.contains("agent.txt"), "names the edit: {output}");
                 assert!(!output.contains("scratch.txt"), "untracked files pass: {output}");
-                assert!(!on_base, "nothing moved, so the brief says where the agent left it");
+                assert!(on_base, "the branch already contains the base, and the brief says so");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
