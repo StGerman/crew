@@ -158,7 +158,7 @@ this file.
   file. Why: a `/dev/urandom` read or a raw `libc::kill` works on the developer machine and
   fails silently elsewhere. Check: `unsafe_code = "forbid"` covers the syscall half;
   `clippy::disallowed_methods` on `std::fs::File::open` with a `/dev/` literal is not
-  expressible, so the device-file half is review. `Not yet enforced: #51`.
+  expressible, so the device-file half is review (#51 removed the last `/dev/urandom` read).
 - **MUST** keep `Cargo.lock` committed and build with `--locked` in CI. Why: a drifted lock
   file must fail the build rather than be rewritten quietly. Check: `--locked` on every cargo
   step in [.github/workflows/ci.yml](../.github/workflows/ci.yml). Enforced.
@@ -176,7 +176,7 @@ this file.
 | `libc` | Process-group signals in `src/worker/claude.rs` | Leaves with #50 |
 | `parking_lot` | The GitHub App's token cache in `src/credentials.rs` | Rolls out to the rest with #49 |
 | `ratatui` | The dashboard | |
-| `ring` | RS256 signature on the GitHub App JWT (#64), and the `crewd init` state nonce (#65) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
+| `ring` | RS256 signature on the GitHub App JWT (#64), the `crewd init` state nonce (#65), and the broker's per-run bearer token (#51) | Already in the tree under `rustls`; `jsonwebtoken` would add a second RSA stack |
 | `rusqlite` (bundled) | The store | Bundled so no system SQLite is needed |
 | `rustls-pki-types` | PEM parsing of the GitHub App private key | Already in the tree under `rustls` |
 | `serde`, `serde_json` | Config, `stream-json`, MCP framing, GitHub payloads | |
@@ -202,7 +202,6 @@ linked issue.
 | :---- | :---- | :---- |
 | `parking_lot` | Non-poisoning locks, removes every `lock().unwrap()` | #49 |
 | `nix` | Safe `kill` to a process group, removes every `unsafe` block | #50 |
-| `getrandom` | OS entropy for the broker bearer token | #51 |
 | `tempfile` | Temp directories in tests with automatic cleanup | #54 |
 | `rstest` | Shared fixtures for the test harness | #54 |
 | `tiny_http` | One HTTP/1.1 server for both listeners | #57 or its follow-ups |
