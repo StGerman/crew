@@ -136,6 +136,11 @@ commands = [
   ["cargo", "test"],
 ]
 max_failures = 3
+# A rebase conflict confined to these paths goes back to the agent as a continuation instead of
+# parking for a human (#111): they are lists two branches in flight both append to. It counts
+# toward `max_failures`. `schema.rs` is here because the gate's own `cargo test` runs
+# `a_released_migration_is_never_edited`, which catches a wrong renumbering.
+agent_resolvable = ["CLAUDE.md", "docs/**", "src/store/schema.rs"]
 # A cold `cargo test` in a fresh worktree builds everything first; 30 minutes is a bound
 # against a hang, not a budget a healthy run approaches.
 timeout_ms = 1800000
