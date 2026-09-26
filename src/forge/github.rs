@@ -101,9 +101,14 @@ fn to_pull_request(gh: GhPullRequest) -> PullRequest {
 
 #[derive(Debug, Deserialize)]
 struct GhReview {
+    id: u64,
     user: GhUser,
     commit_id: String,
     state: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -582,7 +587,14 @@ impl<H: Http> Forge for GithubForge<H> {
         })?;
         Ok(raw
             .into_iter()
-            .map(|r| Review { reviewer: r.user.login, commit_sha: r.commit_id, state: r.state })
+            .map(|r| Review {
+                id: r.id.to_string(),
+                reviewer: r.user.login,
+                commit_sha: r.commit_id,
+                state: r.state,
+                body: r.body.unwrap_or_default(),
+                url: r.html_url,
+            })
             .collect())
     }
 
@@ -665,6 +677,13 @@ impl<H: Http> Forge for GithubForge<H> {
             "{API_BASE}/repos/{}/{}/pulls/{number}/comments/{id}/replies",
             self.owner, self.repo
         );
+        self.send_json("POST", &url, &json!({ "body": body }))?;
+        Ok(())
+    }
+
+    /// A pull request's conversation is its issue's, so this is the issues endpoint.
+    fn comment(&self, number: u64, body: &str) -> Result<(), ForgeError> {
+        let url = format!("{API_BASE}/repos/{}/{}/issues/{number}/comments", self.owner, self.repo);
         self.send_json("POST", &url, &json!({ "body": body }))?;
         Ok(())
     }
@@ -1143,6 +1162,37 @@ mod tests {
     }
 
     #[test]
+    fn a_review_carries_its_id_summary_and_url() {
+        let http = FakeHttp::new();
+        http.push(ok(json!([{
+            "id": 5325971434u64, "user": { "login": "copilot-pull-request-reviewer[bot]" },
+            "commit_id": "b414d2c", "state": "COMMENTED", "body": "Correct the dirty-tree status.",
+            "html_url": "https://github.com/o/r/pull/1#pullrequestreview-5325971434",
+        }])));
+        let f = forge(http);
+
+        let got = f.reviews(1).unwrap();
+        assert_eq!(got[0].id, "5325971434");
+        assert_eq!(got[0].body, "Correct the dirty-tree status.");
+        assert!(got[0].url.as_deref().unwrap().ends_with("pullrequestreview-5325971434"));
+    }
+
+    #[test]
+    fn a_pull_request_comment_posts_to_its_issue_conversation() {
+        let http = FakeHttp::new();
+        http.push(ok(json!({})));
+        let f = forge(http);
+
+        f.comment(1, "**Rejected**").unwrap();
+
+        let w = f.http.writes();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, "POST");
+        assert_eq!(w[0].1, "https://api.github.com/repos/o/r/issues/1/comments");
+        assert_eq!(w[0].2, json!({ "body": "**Rejected**" }));
+    }
+
+    #[test]
     fn a_reply_with_a_non_numeric_comment_id_is_refused_before_any_request() {
         let f = forge(FakeHttp::new());
         let err = f.reply(1, "not-a-number", "done").unwrap_err();
@@ -1337,12 +1387,13 @@ mod tests {
     fn reviews_paginate_the_same_way_the_tracker_does() {
         let http = FakeHttp::new();
         let full_page: Vec<_> = (1..=PER_PAGE)
-            .map(|_| json!({ "user": { "login": "r" }, "commit_id": "s", "state": "APPROVED" }))
+            .map(|_| json!({ "id": 1, "user": { "login": "r" }, "commit_id": "s", "state": "APPROVED" }))
             .collect();
         http.push(ok(Value::Array(full_page)));
-        http.push(ok(
-            json!([{ "user": { "login": "r2" }, "commit_id": "s2", "state": "COMMENTED" }]),
-        ));
+        http.push(ok(json!([{
+            "id": 2, "user": { "login": "r2" }, "commit_id": "s2", "state": "COMMENTED",
+            "body": null,
+        }])));
         let f = forge(http);
 
         let got = f.reviews(1).unwrap();
