@@ -61,11 +61,11 @@ pub mod server;
 pub mod writes;
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 
 use crate::clock::Clock;
@@ -602,14 +602,17 @@ impl Drop for Broker {
     }
 }
 
-/// 32 bytes of kernel entropy, hex encoded.
+/// 32 bytes of OS entropy, hex encoded. `ring` picks the source per platform, so this is not
+/// tied to `/dev/urandom` (#51).
 ///
 /// Not derived from the run id and clock like [`crate::model::session_id`] is: that one only
 /// has to be unique, this one has to be unguessable, and every input a derivation could use
 /// here is something an agent already knows.
 fn random_token() -> std::io::Result<String> {
     let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| std::io::Error::other("the OS entropy source failed"))?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -861,6 +864,15 @@ mod tests {
         let err = b.call(&token, TOOL_COMMENT, &json!({ "body": "after the run" })).unwrap_err();
         assert!(matches!(err, ToolError::Refused(_)), "got {err:?}");
         assert_eq!(writes.count(), 0);
+    }
+
+    #[test]
+    fn the_run_token_is_64_hex_chars_and_differs_between_calls() {
+        let a = random_token().unwrap();
+        let b = random_token().unwrap();
+        assert_eq!(a.len(), 64, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{a}");
+        assert_ne!(a, b);
     }
 
     #[test]
