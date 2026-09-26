@@ -67,6 +67,19 @@ pub struct RetryEntry {
     pub due_at: i64,
     pub attempt: u32,
     pub reason: Option<String>,
+    /// The state key whose concurrency slot this retry holds until it is dispatched, or `None`
+    /// when it holds none. See [`Store::schedule_retry`].
+    pub reserved_state: Option<String>,
+}
+
+fn retry_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<RetryEntry> {
+    Ok(RetryEntry {
+        issue_id: r.get(0)?,
+        due_at: r.get(1)?,
+        attempt: r.get::<_, i64>(2)? as u32,
+        reason: r.get(3)?,
+        reserved_state: r.get(4)?,
+    })
 }
 
 pub struct Store {
@@ -516,6 +529,10 @@ impl Store {
         Ok(())
     }
 
+    /// `reserve` names the state whose slot the retry holds while it waits, and is `Some` only
+    /// for a continuation (#86): a slot handed to a new dispatch during the delay is the
+    /// continuing issue's place in the queue, lost. A failure backoff passes `None`, or one
+    /// failing issue could hold capacity for as long as its backoff grows.
     pub fn schedule_retry(
         &self,
         clock: &dyn Clock,
@@ -523,12 +540,15 @@ impl Store {
         due_at: Wall,
         attempt: u32,
         reason: &str,
+        reserve: Option<&str>,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO retry (issue_id, due_at, attempt, reason) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(issue_id) DO UPDATE SET due_at = ?2, attempt = ?3, reason = ?4",
-            params![issue_id, due_at.0, attempt as i64, reason],
+            "INSERT INTO retry (issue_id, due_at, attempt, reason, reserved_state)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(issue_id) DO UPDATE
+             SET due_at = ?2, attempt = ?3, reason = ?4, reserved_state = ?5",
+            params![issue_id, due_at.0, attempt as i64, reason, reserve],
         )?;
         conn.execute(
             "UPDATE issue_state SET phase = 'retry', updated_at = ?2 WHERE issue_id = ?1",
@@ -540,31 +560,19 @@ impl Store {
     pub fn due_retries(&self, now: Wall) -> rusqlite::Result<Vec<RetryEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT issue_id, due_at, attempt, reason FROM retry WHERE due_at <= ?1 ORDER BY due_at",
+            "SELECT issue_id, due_at, attempt, reason, reserved_state FROM retry
+             WHERE due_at <= ?1 ORDER BY due_at",
         )?;
-        let rows = stmt.query_map(params![now.0], |r| {
-            Ok(RetryEntry {
-                issue_id: r.get(0)?,
-                due_at: r.get(1)?,
-                attempt: r.get::<_, i64>(2)? as u32,
-                reason: r.get(3)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![now.0], retry_entry)?;
         rows.collect()
     }
 
     pub fn all_retries(&self) -> rusqlite::Result<Vec<RetryEntry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT issue_id, due_at, attempt, reason FROM retry ORDER BY due_at")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(RetryEntry {
-                issue_id: r.get(0)?,
-                due_at: r.get(1)?,
-                attempt: r.get::<_, i64>(2)? as u32,
-                reason: r.get(3)?,
-            })
-        })?;
+        let mut stmt = conn.prepare(
+            "SELECT issue_id, due_at, attempt, reason, reserved_state FROM retry ORDER BY due_at",
+        )?;
+        let rows = stmt.query_map([], retry_entry)?;
         rows.collect()
     }
 
@@ -921,7 +929,7 @@ mod tests {
     fn retries_become_due_only_once_the_clock_reaches_them() {
         let (s, c) = setup();
         let due = Wall(c.wall().0 + 10_000);
-        s.schedule_retry(&c, "id-1", due, 1, "backoff").unwrap();
+        s.schedule_retry(&c, "id-1", due, 1, "backoff", None).unwrap();
         assert!(s.due_retries(c.wall()).unwrap().is_empty());
         c.advance_ms(10_000);
         assert_eq!(s.due_retries(c.wall()).unwrap().len(), 1);
@@ -948,7 +956,7 @@ mod tests {
         let (s, c) = setup();
         s.ensure(&c, "id-2", "MT-2", "MT-2-def").unwrap();
 
-        s.schedule_retry(&c, "id-1", Wall(c.wall().0 + 10_000), 1, "backoff").unwrap();
+        s.schedule_retry(&c, "id-1", Wall(c.wall().0 + 10_000), 1, "backoff", None).unwrap();
         s.record_failure(&c, "id-2", ErrorClass::AuthFailed, "401", 3).unwrap();
 
         assert!(s.claimed().unwrap().is_empty());

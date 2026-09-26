@@ -36,11 +36,15 @@ use crate::model::{
     ErrorClass, Feedback, Issue, Outcome, Phase, ReviewVerdict, session_id, worktree_key,
 };
 use crate::project::{ProjectedIssue, Projector};
-use crate::store::{RunRecord, RunStart, Store};
+use crate::store::{RetryEntry, RunRecord, RunStart, Store};
 use crate::tracker::{Tracker, TrackerError};
 use crate::transcript::Transcripts;
 use crate::worker::{Progress, RunHandle, Session, Spawn, Worker};
 use crate::workspace::Workspace;
+
+/// Continuations holding a concurrency slot through their delay: issue id to the state key the
+/// slot counts against (#86).
+type Reservations = HashMap<String, String>;
 
 /// Bounded wait for a worker to stop before the workspace may be touched.
 const KILL_GRACE_MS: u64 = 10_000;
@@ -569,6 +573,11 @@ impl Scheduler {
                 };
 
                 let delay = retry::continuation_delay_ms(streak, self.cfg.polling.interval_ms);
+                let held = self
+                    .seen
+                    .get(issue_id)
+                    .map(|i| i.state_key())
+                    .unwrap_or_else(|| r.issue.state_key());
                 let due = Wall(self.clock.wall().0 + delay as i64);
                 tracing::info!(issue_id, why, delay_ms = delay, moved, "run continues");
                 self.store.schedule_retry(
@@ -577,6 +586,7 @@ impl Scheduler {
                     due,
                     0,
                     &format!("continuation: {why}"),
+                    Some(&held),
                 )?;
             }
             Outcome::Failed { class, msg } => {
@@ -611,7 +621,14 @@ impl Scheduler {
                     let attempt = self.store.get(issue_id)?.map(|s| s.attempt).unwrap_or(1);
                     let delay = retry::backoff_ms(attempt, self.cfg.agent.max_retry_backoff_ms);
                     let due = Wall(self.clock.wall().0 + delay as i64);
-                    self.store.schedule_retry(self.clock.as_ref(), issue_id, due, attempt, &msg)?;
+                    self.store.schedule_retry(
+                        self.clock.as_ref(),
+                        issue_id,
+                        due,
+                        attempt,
+                        &msg,
+                        None,
+                    )?;
                 }
             }
         }
@@ -837,7 +854,14 @@ impl Scheduler {
                 let attempt = self.store.get(&id)?.map(|s| s.attempt).unwrap_or(1);
                 let delay = retry::backoff_ms(attempt, self.cfg.agent.max_retry_backoff_ms);
                 let due = Wall(self.clock.wall().0 + delay as i64);
-                self.store.schedule_retry(self.clock.as_ref(), &id, due, attempt, "stalled")?;
+                self.store.schedule_retry(
+                    self.clock.as_ref(),
+                    &id,
+                    due,
+                    attempt,
+                    "stalled",
+                    None,
+                )?;
             }
         }
         Ok(())
@@ -1056,7 +1080,7 @@ impl Scheduler {
                 .all(|want| issue.labels.iter().any(|l| l == want))
     }
 
-    /// Capacity counts gating runs as well as running ones.
+    /// Capacity counts gating runs and reserved continuations as well as running ones.
     ///
     /// A gate is work on this machine — a rebase and then whatever `gate.commands` names, which
     /// for this repository is a `cargo test`. Counting only `running` frees the slot the moment
@@ -1065,27 +1089,56 @@ impl Scheduler {
     /// gates accumulate, and `max_concurrent` stops describing how many builds the host is
     /// running. The claim is held across the gate for the same reason, so counting it here is
     /// what makes the two agree.
-    fn global_slots(&self) -> usize {
-        let used = self.running.len() + self.gating.len();
+    ///
+    /// A continuation waiting out its delay counts too, or `dispatch_new` hands its slot to
+    /// whatever became eligible in the same tick and the continuing issue loses its place in
+    /// the milestone order at every session boundary (#86).
+    fn global_slots(&self, reserved: &Reservations) -> usize {
+        let used = self.running.len() + self.gating.len() + reserved.len();
         self.cfg.agent.max_concurrent.saturating_sub(used)
     }
 
-    fn state_slots(&self, state_key: &str) -> usize {
+    fn state_slots(&self, state_key: &str, reserved: &Reservations) -> usize {
         let used = self
             .running
             .values()
             .chain(self.gating.values().map(|g| &g.run))
-            .filter(|r| r.issue.state_key() == state_key)
+            .map(|r| r.issue.state_key())
+            .chain(reserved.values().cloned())
+            .filter(|k| k == state_key)
             .count();
         self.cfg.state_limit(state_key).saturating_sub(used)
     }
 
+    /// Continuations holding a slot, read from the retry rows themselves so a reservation
+    /// cannot outlive the row it belongs to: `release`, `clear_retry` and quarantine all end
+    /// it by deleting that row.
+    fn reservations(&self) -> anyhow::Result<Reservations> {
+        Ok(self
+            .store
+            .all_retries()?
+            .into_iter()
+            .filter_map(|r| r.reserved_state.map(|k| (r.issue_id, k)))
+            .collect())
+    }
+
+    /// Dispatch every retry that is due, and re-read every continuation still holding a slot.
+    ///
+    /// The re-read is what ends a reservation whose ticket went terminal or lost its label
+    /// during the delay: without it the slot stays held until the delay runs out, which grows
+    /// to the poll interval for a continuation that is not moving the ticket.
     fn dispatch_due_retries(&mut self) -> anyhow::Result<()> {
-        let due = self.store.due_retries(self.clock.wall())?;
-        if due.is_empty() {
+        let now = self.clock.wall().0;
+        let pending: Vec<RetryEntry> = self
+            .store
+            .all_retries()?
+            .into_iter()
+            .filter(|r| r.due_at <= now || r.reserved_state.is_some())
+            .collect();
+        if pending.is_empty() {
             return Ok(());
         }
-        let ids: Vec<String> = due.iter().map(|d| d.issue_id.clone()).collect();
+        let ids: Vec<String> = pending.iter().map(|d| d.issue_id.clone()).collect();
 
         let refreshed = match self.tracker.by_ids(&ids) {
             Ok(v) => v,
@@ -1097,11 +1150,13 @@ impl Scheduler {
         };
         let by_id: HashMap<String, Issue> =
             refreshed.into_iter().map(|i| (i.id.clone(), i)).collect();
+        let mut reserved = self.reservations()?;
 
-        for entry in due {
+        for entry in pending {
             let Some(issue) = by_id.get(&entry.issue_id) else {
                 // Gone from the tracker: release rather than inventing a state for it.
                 tracing::info!(issue_id = %entry.issue_id, "retry target not visible; releasing");
+                reserved.remove(&entry.issue_id);
                 self.store.clear_retry(&entry.issue_id)?;
                 self.store.release(self.clock.as_ref(), &entry.issue_id)?;
                 continue;
@@ -1110,6 +1165,7 @@ impl Scheduler {
             let key = issue.state_key();
 
             if self.cfg.is_terminal(&key) {
+                reserved.remove(&issue.id);
                 self.store.clear_retry(&issue.id)?;
                 match self.workspace.remove(&issue.id, &issue.identifier) {
                     Ok(removed) if removed.branch_deleted => {
@@ -1124,13 +1180,38 @@ impl Scheduler {
                 continue;
             }
             if !self.cfg.is_active(&key) || !self.routable(issue) {
+                reserved.remove(&issue.id);
                 self.store.clear_retry(&issue.id)?;
                 self.store.release(self.clock.as_ref(), &issue.id)?;
                 continue;
             }
-            if self.global_slots() == 0 || self.state_slots(&key) == 0 {
+            if entry.due_at > now {
+                // A reservation still waiting. It follows the ticket's state, so a move during
+                // the delay does not leave the old state's limit charged for a run it will not
+                // hold.
+                if entry.reserved_state.as_deref() != Some(key.as_str()) {
+                    self.store.schedule_retry(
+                        self.clock.as_ref(),
+                        &issue.id,
+                        Wall(entry.due_at),
+                        entry.attempt,
+                        entry.reason.as_deref().unwrap_or_default(),
+                        Some(&key),
+                    )?;
+                    reserved.insert(issue.id.clone(), key);
+                }
+                continue;
+            }
+
+            // Its own reservation is the slot it is about to take, so it does not count
+            // against itself.
+            let own = reserved.remove(&issue.id);
+            if self.global_slots(&reserved) == 0 || self.state_slots(&key, &reserved) == 0 {
                 // Leave the entry in place; it is already due and will be retried next tick.
                 tracing::debug!(issue_id = %issue.id, "no slots for retry; deferring");
+                if let Some(k) = own {
+                    reserved.insert(issue.id.clone(), k);
+                }
                 continue;
             }
 
@@ -1171,8 +1252,9 @@ impl Scheduler {
                 .then_with(|| a.identifier.cmp(&b.identifier))
         });
 
+        let reserved = self.reservations()?;
         for issue in sorted {
-            if self.global_slots() == 0 {
+            if self.global_slots(&reserved) == 0 {
                 break;
             }
             self.seen.insert(issue.id.clone(), issue.clone());
@@ -1187,7 +1269,7 @@ impl Scheduler {
             if self.running.contains_key(&issue.id) {
                 continue;
             }
-            if self.state_slots(&key) == 0 {
+            if self.state_slots(&key, &reserved) == 0 {
                 // Per-state saturation skips this issue but not the rest of the queue.
                 continue;
             }
@@ -1271,6 +1353,7 @@ impl Scheduler {
                         due,
                         attempt,
                         "workspace error",
+                        None,
                     )?;
                 }
                 return Ok(());
@@ -1418,8 +1501,8 @@ impl Scheduler {
         let now_mono = self.clock.mono();
         let now_wall = self.clock.wall().0;
         let states = self.store.all()?;
-        let retries: HashMap<String, i64> =
-            self.store.all_retries()?.into_iter().map(|r| (r.issue_id, r.due_at)).collect();
+        let retries: HashMap<String, RetryEntry> =
+            self.store.all_retries()?.into_iter().map(|r| (r.issue_id.clone(), r)).collect();
         let totals = self.store.token_totals()?;
 
         // One query for every issue's history, not one per row: this runs on every tick, and
@@ -1458,7 +1541,8 @@ impl Scheduler {
                 turns: if run.is_some() { progress.turns } else { st.cumulative_turns },
                 tokens: progress.tokens,
                 age_ms: run.map(|r| now_mono.saturating_since(r.started)).unwrap_or(0),
-                retry_in_ms: retries.get(&st.issue_id).map(|d| d - now_wall),
+                retry_in_ms: retries.get(&st.issue_id).map(|r| r.due_at - now_wall),
+                holds_slot: retries.get(&st.issue_id).is_some_and(|r| r.reserved_state.is_some()),
                 quarantined: st.is_quarantined(),
                 last_error: st.last_error.clone(),
                 last_event: progress.last_event,
@@ -1491,7 +1575,8 @@ impl Scheduler {
 
         Ok(Snapshot {
             generated_at: now_wall,
-            running: self.running.len(),
+            running: self.running.len() + self.gating.len(),
+            reserved: retries.values().filter(|r| r.reserved_state.is_some()).count(),
             limit: self.cfg.agent.max_concurrent,
             retrying: retries.len(),
             quarantined: states.iter().filter(|s| s.is_quarantined()).count(),

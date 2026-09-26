@@ -562,6 +562,127 @@ fn continuation_backs_off_instead_of_respawning_every_second() {
     assert_eq!(due - h.clock.wall().0, 30_000);
 }
 
+/// The milestone order is the priority (#86). A continuation's delay slows one issue's loop; it
+/// must not also hand that issue's slot to whatever became eligible in the same tick, or at
+/// `max_concurrent = 1` the milestone is worked round-robin by session.
+#[test]
+fn a_continuing_issue_keeps_its_slot_through_its_continuation_delay() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1)), issue(2, "Todo", Some(2))], |c| {
+        c.agent.max_concurrent = 1;
+        // B in another state, so only the global count stands between it and A's slot.
+        c.tracker.active_states.push("todo".into());
+    });
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // A continues, 5s out; B is eligible in this same tick
+    assert!(h.worker.sessions_for("iss-2").is_empty(), "B must not take A's slot");
+
+    let snap = h.sched.snapshot().unwrap();
+    assert_eq!((snap.running, snap.reserved, snap.limit), (0, 1, 1), "the slot shows as taken");
+    let a = snap.rows.iter().find(|r| r.issue_id == "iss-1").unwrap();
+    assert!(a.holds_slot, "and names the issue holding it");
+    let b = snap.rows.iter().find(|r| r.issue_id == "iss-2");
+    assert!(b.is_none_or(|b| !b.holds_slot));
+
+    h.worker.script("iss-1", Script::succeeds_in(1_000));
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "A is dispatched again first");
+    assert!(h.worker.sessions_for("iss-2").is_empty(), "and B still waits while A runs");
+    assert_eq!(h.sched.snapshot().unwrap().reserved, 0, "a dispatched retry reserves nothing");
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap(); // A ends done, and only then does B get the slot
+    assert_eq!(h.worker.sessions_for("iss-2").len(), 1);
+}
+
+/// The per-state limit is capacity too: a continuation's slot in its own state is held just as
+/// its global one is, or a second issue in that state takes it while global room remains (#86).
+#[test]
+fn a_continuation_holds_its_slot_in_its_own_state_limit() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |c| {
+            c.agent.max_concurrent = 2;
+            c.agent.max_concurrent_by_state.insert("in progress".into(), 1);
+        });
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert!(h.worker.sessions_for("iss-2").is_empty(), "B must not take A's state slot");
+
+    h.clock.advance_ms(5_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 2, "A continues in the slot it held");
+}
+
+/// A failure backoff grows to minutes, so a reservation there would let one failing issue hold
+/// capacity hostage (#86): only a continuation keeps its slot.
+#[test]
+fn a_failure_backoff_does_not_hold_a_slot() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |c| {
+            c.agent.max_concurrent = 1;
+        });
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Failed { class: ErrorClass::AgentCrash, msg: "boom".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    assert_eq!(h.sched.store().all_retries().unwrap().len(), 1, "A waits on its backoff");
+    assert_eq!(h.worker.sessions_for("iss-2").len(), 1, "B dispatches in the same tick");
+}
+
+/// A reservation that outlives its retry row is a slot lost for good (#86). A ticket closed
+/// during the delay ends the reservation at the next tick, not when the delay runs out.
+#[test]
+fn a_continuation_whose_ticket_went_terminal_releases_its_reserved_slot() {
+    let mut h =
+        harness(vec![issue(1, "In Progress", Some(1)), issue(2, "In Progress", Some(2))], |c| {
+            c.agent.max_concurrent = 1;
+        });
+    h.tracker.set_dispatchable("iss-2", false);
+    h.worker.script(
+        "iss-1",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+
+    h.sched.tick().unwrap();
+    h.tracker.set_dispatchable("iss-2", true);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert!(h.worker.sessions_for("iss-2").is_empty(), "held while A is continuing");
+
+    h.tracker.set_state("iss-1", "Done");
+    h.clock.advance_ms(1_000); // still 4s short of A's due time
+    h.sched.tick().unwrap();
+
+    assert!(h.sched.store().all_retries().unwrap().is_empty(), "the retry row is gone");
+    assert_eq!(h.sched.snapshot().unwrap().reserved, 0);
+    assert_eq!(h.worker.sessions_for("iss-2").len(), 1, "and its slot went to B");
+    assert_eq!(h.worker.sessions_for("iss-1").len(), 1, "A is not dispatched again");
+}
+
 /// A continuation is only worth having if it continues something. Respawning `claude -p` cold
 /// makes the agent re-read the issue and re-explore the tree on every turn the budget buys, so
 /// the budget and the restart spend the same turns twice.
