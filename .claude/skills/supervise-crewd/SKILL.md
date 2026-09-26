@@ -11,7 +11,7 @@ interval the operator passed to this command, or `15m` if they passed none. An i
 means passing no interval, so the loop sets its own pace.
 
 ```
-15m Check crewd with the crew_ops snapshot tool and report only what changed since the last check: runs started or finished, a pull request opened or updated, a quarantine, a rate-limit pause, a delivery handoff, a new last_error. When a pull request's delivery stage becomes ready, run /code-review on it and summarise. Read only: never call refresh or unquarantine, and never push to a branch the daemon owns, without asking.
+15m Check crewd with the crew_ops snapshot tool and report only what changed since the last check: runs started or finished, a pull request opened or updated, a quarantine, a rate-limit pause, a delivery handoff, a new last_error. When a pull request's delivery stage becomes ready, run /code-review on it and summarise. Read only: never call refresh, unquarantine or unblock, and never push to a branch the daemon owns, without asking.
 ```
 
 Before starting, check that the `crew_ops` tools are connected. If they aren't, the daemon was
@@ -20,7 +20,7 @@ local scope. Say which, and stop.
 
 ## Why it is read-only
 
-`refresh` and `unquarantine` change what the scheduler does next. A push from outside the daemon
+`refresh`, `unquarantine` and `unblock` change what the scheduler does next. A push from outside the daemon
 onto a branch it is delivering is exactly what delivery's `--force-with-lease` exists to refuse,
 and the push becomes a permanent handoff. Report, and let the operator decide.
 

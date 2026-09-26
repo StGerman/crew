@@ -55,7 +55,7 @@ cargo run -- --max-ticks 20                # headless smoke run, then exit
 cargo run -- --api 127.0.0.1:8787          # headless, with the ops API on for this run
 cargo run -p crewctl -- status             # what a running daemon is doing, read over that API
 cargo run -p crewctl -- status MT-649      # one issue in full: phase, attempt, turns, cost, branch
-cargo run -- --mcp 127.0.0.1:8788          # the same four routes as MCP tools, for a supervising agent
+cargo run -- --mcp 127.0.0.1:8788          # the same five routes as MCP tools, for a supervising agent
 claude mcp add --scope local --transport http crew_ops http://127.0.0.1:8788/ops
                                            # ...and how that agent gets them. Local scope, never user
 cargo run -- init                          # register your own GitHub App: two clicks, writes ~/.crewd/
@@ -454,11 +454,12 @@ off.
 
 The ops API ([src/api/mod.rs](src/api/mod.rs)) is the second observer of that same published
 snapshot: `GET /api/v1/snapshot`, `GET /api/v1/issues/:identifier`, `POST /api/v1/refresh`,
-`POST /api/v1/unquarantine/:identifier`. `Api` holds a `watch::Receiver` and a command sender
-and no `Store`, so rule 3 is enforced by the type rather than by discipline — and the two
-`POST`s can express nothing the dashboard's `r` and `u` keys cannot. Off by default (`[api]
+`POST /api/v1/unquarantine/:identifier`, `POST /api/v1/unblock/:identifier`. `Api` holds a
+`watch::Receiver` and a command sender and no `Store`, so rule 3 is enforced by the type rather
+than by discipline — and the three `POST`s can express nothing the dashboard's `r`, `u` and `b`
+keys cannot. Off by default (`[api]
 enabled`, or `--api <addr>` for one run) and loopback unless `api.allow_public` says otherwise,
-because those two routes control agent execution. Deliberately *not* validated in
+because those routes control agent execution. Deliberately *not* validated in
 `Config::preflight`: preflight gates dispatch, so a typo in an address the scheduler never uses
 must not be what stops it — `api::bind` parses it once, and a failure there is logged and
 costs the API alone. The write path goes `HTTP task → Command → the loop in main.rs → oneshot`,
@@ -474,7 +475,13 @@ issues — identifiers are not unique, which is the same fact `worktree_key` exi
 `POST /unquarantine` on an issue that is not quarantined is a `200` saying so, not an error:
 the guard lives in `Store::unquarantine`'s `WHERE` clause, because an unconditional version
 would reset a *running* issue's phase to `released` and let the next tick dispatch a second
-agent onto its worktree.
+agent onto its worktree. `POST /unblock` (#108) is the same shape for a park: it is how a
+`Blocked` issue — a gate's rebase conflict, typically — is handed back once a human has resolved
+it, since with `active_states = ["open"]` the tracker has no state to move it through. It clears
+`parked_state` and the parked note and nothing else, so the next `dispatch_new` claims it the
+ordinary way and `prepare` attaches to its branch; `Store::unblock`'s `WHERE` refuses anything
+running, gating (a held claim is phase `running`), retry-queued or quarantined. Write what
+changed into the issue's description first: that is the prompt the next run reads.
 
 `crewctl status` ([crewctl/src/main.rs](crewctl/src/main.rs), over
 [libcrew/src/client.rs](libcrew/src/client.rs) and [libcrew/src/render.rs](libcrew/src/render.rs))
@@ -500,11 +507,11 @@ and so the likelier reading) versus a daemon that answered and refused. Collapsi
 what has somebody restart a daemon that was never down, so each message names the address
 tried, where that address came from, and the way out.
 
-The ops MCP server ([src/api/mcp.rs](src/api/mcp.rs)) is the same four routes for an *agent*
+The ops MCP server ([src/api/mcp.rs](src/api/mcp.rs)) is the same five routes for an *agent*
 supervising the daemon — the one driving a dogfooding session, a watchdog later — which the
 `status` client left on the wrong side of the gap it closed: an agent had to spawn the CLI and
 parse a rendering built to read well to a person. One tool per route (`snapshot`, `issue`,
-`refresh`, `unquarantine`) and nothing else; each runs the *same* `Api` method the HTTP router
+`refresh`, `unquarantine`, `unblock`) and nothing else; each runs the *same* `Api` method the HTTP router
 runs and frames the same `Response` as a tool result, a status of 400 or more becoming
 `isError: true`. So it holds an `Api` and no `Store`, and it cannot express an authority the
 HTTP API lacks — new authority is a separate decision from new transport, and this module has
@@ -525,8 +532,8 @@ dispatched run of its tools.
 
 **This server must never reach a dispatched agent**, and that is the thing to hold when
 touching any of this. The broker gives a worker authority scoped to one issue; this is scoped
-to the whole daemon, and a worker that could call `unquarantine` could clear its own quarantine
-and re-dispatch itself, defeating the verdict, `max_turns_per_issue` and `parked_state`
+to the whole daemon, and a worker that could call `unquarantine` or `unblock` could clear its own
+quarantine or park and re-dispatch itself, defeating the verdict, `max_turns_per_issue` and `parked_state`
 together. What enforces it is wiring, not a check on the tool: the ops server binds **its own
 listener** (never the broker's — a shared one routed by prefix would put these tools at the
 exact `host:port` every worker is handed), answers only at `/ops`, and is never passed to
@@ -652,7 +659,7 @@ reading — check that the named test is still meaningful, not just still green.
 | An agent cannot write to another ticket | no tool takes an issue id; the target comes from the per-run token | `a_call_naming_a_different_issue_is_refused_and_the_refusal_is_audited` |
 | A looping agent cannot write without bound | per-run **and** per-issue budgets, charged on attempts not successes | `a_continuation_cannot_refresh_the_budget_by_opening_a_new_session` |
 | A finished run keeps no write authority | the session is an RAII guard living in the `running` entry | `a_run_that_ends_takes_its_broker_authority_with_it` |
-| Clearing a quarantine cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL` and reports what it did | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim` |
+| Clearing a quarantine or a park cannot release a live claim | `Store::unquarantine` is guarded on `quarantined_at IS NOT NULL`, and `Store::unblock` on a park in phase `released` with no quarantine and no retry row — so a running, gating or retry-queued issue is untouched — and both report what they did; unblock lifts the park and never takes or releases a claim (#108) | `clearing_a_quarantine_that_is_not_there_does_not_release_a_live_claim`, `unblocking_an_issue_that_is_not_parked_does_not_release_a_live_claim`, `unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch` |
 | A slow HTTP client cannot delay a tick | one task per connection, a `oneshot` reply the scheduler never waits on, and a bounded read timeout | `a_client_that_never_finishes_its_request_cannot_delay_a_tick` |
 | The projection cannot become load-bearing | `publish` logs a projector error and returns `Ok`; nothing written is ever read back | `the_scheduler_makes_the_same_decisions_whether_the_projector_writes_fails_or_is_off` |
 | A killed run cannot record a fabricated cost | totals are read only from the `result` event; a run that never emits one stores NULL, not a per-event sum | `a_run_that_dies_before_its_result_event_reports_no_token_total` |

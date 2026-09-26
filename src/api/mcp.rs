@@ -343,6 +343,25 @@ mod tests {
     }
 
     #[test]
+    fn the_unblock_tool_sends_the_resolved_issue_and_answers_with_the_schedulers_word() {
+        // The tool resolves the key against the snapshot and hands the scheduler a dispatch
+        // id, never the raw identifier; the store's answer, not the row, is what comes back.
+        let (svc, mut commands) = ops(vec![row("iss-a", "MT-1")]);
+        let scheduler = std::thread::spawn(move || match commands.blocking_recv() {
+            Some(super::super::Command::Unblock { issue_id, reply }) => {
+                let _ = reply.send(Ok(false));
+                issue_id
+            }
+            other => panic!("expected an unblock, got {other:?}"),
+        });
+
+        let body = parsed(svc.call(PATH, TOOL_UNBLOCK, &json!({ "key": "MT-1" })));
+        assert_eq!(scheduler.join().unwrap(), "iss-a");
+        assert_eq!(body["cleared"], false);
+        assert_eq!(body["identifier"], "MT-1");
+    }
+
+    #[test]
     fn the_only_path_that_serves_tools_is_the_ops_path() {
         // A worker's config points at `/mcp/<token>`. Aimed at this port by mistake, it must
         // find no tools and be refused on a call — not fall through to the ops routes.

@@ -876,3 +876,97 @@ async fn a_dispatched_worker_is_not_handed_the_ops_tools() {
     );
     drop(session);
 }
+
+/// A harness whose one issue has already been parked by a `Blocked` verdict.
+async fn blocked_harness() -> Harness {
+    let mut h = Harness::new(vec![issue(1, "In Progress")]).await;
+    h.worker.set_default(
+        Script::succeeds_in(1_000)
+            .with_outcome(Outcome::Blocked { why: "rebase onto master conflicts".into() }),
+    );
+    h.tick();
+    h.clock.advance_ms(1_000);
+    h.tick();
+    h.clock.advance_ms(60_000);
+    h.tick();
+    assert_eq!(h.sched.running_count(), 0, "a blocked issue stays parked");
+    h.worker.set_default(Script::succeeds_in(60_000));
+    h
+}
+
+#[tokio::test]
+async fn unblocking_a_parked_issue_over_the_api_returns_it_to_service() {
+    let mut h = blocked_harness().await;
+    let (_, snap) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(row(&snap, "MT-1")["last_error"], "rebase onto master conflicts");
+
+    let (status, body) = h.request("POST", "/api/v1/unblock/MT-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["cleared"], true, "there was a park, and it was lifted");
+    assert_eq!(body["issue_id"], "iss-1");
+    let (_, snap) = h.request("GET", "/api/v1/snapshot").await;
+    assert_eq!(row(&snap, "MT-1")["last_error"], Value::Null, "published before answering");
+
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1, "the next tick dispatches it");
+
+    // Now live: the same request is a plain no-op, and the claim stands.
+    let (status, body) = h.request("POST", "/api/v1/unblock/MT-1").await;
+    assert_eq!(status, 200, "a no-op is not an error");
+    assert_eq!(body["cleared"], false);
+    assert_eq!(
+        body["detail"],
+        "not parked, or running, gating or waiting on a retry; nothing to unblock"
+    );
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1, "the live run is untouched");
+
+    let (status, unknown) = h.request("POST", "/api/v1/unblock/MT-404").await;
+    assert_eq!(status, 404, "an issue that does not exist is not a silent success");
+    assert!(unknown["error"].is_string());
+
+    let (status, _) = h.request("GET", "/api/v1/unblock/MT-1").await;
+    assert_eq!(status, 405, "an action is a POST");
+}
+
+#[tokio::test]
+async fn an_unblock_naming_an_identifier_two_issues_share_is_refused_with_both_ids() {
+    // Identifiers are not unique, so an unblock sent by one must not pick an issue and hope:
+    // the wrong pick re-dispatches an issue nobody resolved.
+    let mut twin = issue(2, "In Progress");
+    twin.identifier = "MT-1".into();
+    let mut h = Harness::new(vec![issue(1, "In Progress"), twin]).await;
+    h.tick();
+
+    let (status, body) = h.request("POST", "/api/v1/unblock/MT-1").await;
+    assert_eq!(status, 409);
+    let mut ids: Vec<&str> =
+        body["issue_ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, ["iss-1", "iss-2"], "both candidates, to retry with");
+
+    let (status, body) = h.request("POST", "/api/v1/unblock/iss-2").await;
+    assert_eq!(status, 200, "a dispatch id resolves exactly");
+    assert_eq!(body["issue_id"], "iss-2");
+}
+
+#[tokio::test]
+async fn unblocking_over_mcp_returns_a_parked_issue_to_service_and_reports_a_no_op_plainly() {
+    let mut h = blocked_harness().await;
+
+    let (is_error, body) = h.tool("unblock", json!({ "key": "MT-1" })).await;
+    assert!(!is_error, "{body}");
+    assert_eq!(body["cleared"], true);
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1, "unblocked issues are dispatched again");
+
+    let (is_error, body) = h.tool("unblock", json!({ "key": "MT-1" })).await;
+    assert!(!is_error, "a no-op is not an error: {body}");
+    assert_eq!(body["cleared"], false);
+    h.tick();
+    assert_eq!(h.sched.running_count(), 1);
+
+    let (is_error, body) = h.tool("unblock", json!({ "key": "MT-404" })).await;
+    assert!(is_error);
+    assert!(body["error"].as_str().unwrap().contains("MT-404"), "{body}");
+}

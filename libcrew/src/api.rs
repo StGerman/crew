@@ -22,7 +22,7 @@ fn d_mcp_bind() -> String {
 
 /// The ops HTTP surface ([`crate::api`]).
 ///
-/// Off by default, and loopback when on: `POST /refresh` and `POST /unquarantine` control
+/// Off by default, and loopback when on: `POST /refresh`, `POST /unquarantine` and `POST /unblock` control
 /// agent execution, so an orchestrator that grows a control plane merely by being upgraded, or
 /// that binds `0.0.0.0` because a field was left at a convenient default, is not something an
 /// operator asked for.
@@ -41,10 +41,10 @@ pub struct ApiConfig {
     /// Permit a non-loopback bind — a deliberate decision to expose the write endpoints to
     /// whatever can reach that interface, which is why it is a separate flag rather than an
     /// inference from the address. Governs `bind` and `mcp_bind` alike: they carry the same
-    /// two write actions.
+    /// write actions.
     #[serde(default)]
     pub allow_public: bool,
-    /// The same four routes as MCP tools, for a supervising agent (`crewd`'s `api::mcp`). Off
+    /// The same five routes as MCP tools, for a supervising agent (`crewd`'s `api::mcp`). Off
     /// by default like `enabled`, and independent of it: a daemon watched by a person needs the
     /// HTTP API and a daemon watched by an agent needs this, and neither should have to carry
     /// the other. **Never reachable by a dispatched worker** — see that module's doc for what

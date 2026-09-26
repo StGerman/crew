@@ -3350,3 +3350,116 @@ fn a_done_branch_is_gated_before_delivery_pushes_it_and_a_failing_gate_publishes
     assert!(ops.iter().any(|o| matches!(o, Op::OpenPr { .. })), "and opened: {ops:?}");
     assert_eq!(forge.open_prs().len(), 1);
 }
+
+/// #108. A gate conflict is a human's problem, and once the human has resolved it the issue has
+/// to be handed back without closing and reopening its ticket. The unblock lifts the park and
+/// nothing else, so the next tick dispatches through the ordinary path — and `prepare` attaches
+/// to the branch the blocked run committed to rather than resetting it to the base.
+#[test]
+fn unblocking_a_parked_blocked_issue_dispatches_it_onto_its_existing_branch() {
+    let dir = tmp_dir("unblock-attaches");
+    let root = dir.join("workspaces");
+    let repo = git_repo(&dir.join("repo"));
+    let mut h = harness_over(
+        vec![issue(1, "In Progress", Some(1))],
+        root.clone(),
+        Store::open_in_memory().unwrap(),
+        Arc::new(GitWorktreeWorkspace::new(&root, &repo).unwrap()),
+        |_| {},
+    );
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    gate.set_default(
+        GateScript::passes_in(1_000)
+            .with_verdict(GateVerdict::Conflict { paths: vec!["src/store/schema.rs".into()] }),
+    );
+    h.worker.set_default(Script::succeeds_in(1_000));
+
+    h.sched.tick().unwrap();
+    let ws = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    commit_in(&ws, "work.txt", "the blocked run's work");
+    let head = git_out(&ws, &["rev-parse", "HEAD"]).unwrap();
+    let branch = git_out(&ws, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.parked_state.as_deref(), Some("in progress"), "the conflict parks the issue");
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 0, "and it stays parked while nothing has changed");
+
+    gate.set_default(GateScript::passes_in(1_000));
+    assert!(h.sched.unblock("iss-1").unwrap(), "a parked issue is unblocked, and says so");
+    let st = h.sched.store().get("iss-1").unwrap().unwrap();
+    assert_eq!(st.parked_state, None);
+    assert_eq!(st.phase, Phase::Released, "unblock lifts the park; it takes no claim");
+    assert_eq!(st.last_error, None, "the parked note names a problem now resolved");
+
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "the next tick dispatches it");
+    let ws2 = PathBuf::from(h.sched.snapshot().unwrap().rows[0].workspace.clone().unwrap());
+    assert_eq!(git_out(&ws2, &["symbolic-ref", "--short", "HEAD"]), Some(branch));
+    assert_eq!(
+        git_out(&ws2, &["rev-parse", "HEAD"]),
+        Some(head),
+        "prepare attached to the branch the blocked run committed to, not a reset one"
+    );
+
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #108, the invariant "Clearing a quarantine cannot release a live claim" widened to parks. An
+/// unblock names an issue from a snapshot as old as the last tick, so it can land on a run, a
+/// gate or a waiting continuation; each must be a no-op that reports it, or the next tick would
+/// dispatch a second agent onto a worktree already in use.
+#[test]
+fn unblocking_an_issue_that_is_not_parked_does_not_release_a_live_claim() {
+    let issues = vec![
+        issue(1, "In Progress", Some(1)),
+        issue(2, "In Progress", Some(1)),
+        issue(3, "In Progress", Some(1)),
+    ];
+    let mut h = harness(issues, |_| {});
+    let gate = Arc::new(FakeGate::new(h.clock.clone()));
+    h.sched.set_gate(Some(gate.clone()));
+    gate.set_default(GateScript::passes_in(600_000));
+    h.worker.script("iss-1", Script::succeeds_in(600_000));
+    h.worker.script("iss-2", Script::succeeds_in(1_000));
+    h.worker.script(
+        "iss-3",
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+
+    let phase = |h: &Harness, id: &str| h.sched.store().get(id).unwrap().unwrap().phase;
+    assert_eq!(h.sched.running_count(), 1, "iss-1 is running");
+    assert_eq!(h.sched.gating_count(), 1, "iss-2 is gating");
+    assert_eq!(phase(&h, "iss-3"), Phase::RetryQueued, "iss-3 waits on its continuation");
+
+    // Parked as well, so only the live-claim half of the guard stands between each of these
+    // and an unpark. Parking alongside a live phase is not a path the scheduler takes today;
+    // the guard must not rely on that.
+    for id in ["iss-1", "iss-2", "iss-3"] {
+        h.sched.store().park(h.clock.as_ref(), id, "in progress").unwrap();
+        assert!(!h.sched.unblock(id).unwrap(), "{id}: nothing to unblock, and it says so");
+        let st = h.sched.store().get(id).unwrap().unwrap();
+        assert_eq!(st.parked_state.as_deref(), Some("in progress"), "{id}: untouched");
+    }
+    assert!(!h.sched.unblock("iss-404").unwrap(), "an unknown id is a no-op too");
+
+    assert_eq!(phase(&h, "iss-1"), Phase::Running, "the claim must stand");
+    assert_eq!(phase(&h, "iss-2"), Phase::Running, "a gate holds its claim");
+    assert_eq!(phase(&h, "iss-3"), Phase::RetryQueued);
+    assert_eq!(h.sched.store().all_retries().unwrap().len(), 1, "the continuation is kept");
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "no second agent is dispatched onto iss-1");
+    assert_eq!(h.sched.gating_count(), 1);
+}
