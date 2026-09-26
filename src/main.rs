@@ -366,8 +366,9 @@ async fn main() -> anyhow::Result<()> {
     // The same surface as tools, on its own listener. Same contract as the HTTP API above: a
     // bind failure costs this server, never a dispatch. It is served by the broker's transport
     // but is deliberately *not* the broker — nothing here passes it to `Broker`, and the
-    // `--mcp-config` a worker receives is written by `Broker::open` alone, so no dispatched
-    // agent learns this address. `a_dispatched_worker_is_not_handed_the_ops_tools` holds that.
+    // `--mcp-config` crewd gives a worker is written by `Broker::open` alone, so crewd never
+    // hands a dispatched agent this address (`a_dispatched_worker_is_not_handed_the_ops_tools`).
+    // A worker can still inherit it from the operator's own MCP config; see `api::mcp`.
     if api_cfg.mcp_enabled {
         match crew::api::mcp::bind(&api_cfg) {
             Ok(listener) => {
