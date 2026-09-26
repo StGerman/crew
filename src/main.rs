@@ -317,7 +317,11 @@ async fn main() -> anyhow::Result<()> {
             commands = cfg.gate.commands.len(),
             "handoff gate on: done runs are rebased and re-gated before release"
         );
-        Some(Arc::new(GitGate::new(repo, cfg.gate.base.clone(), cfg.gate.commands.clone())))
+        let gate = GitGate::new(repo, cfg.gate.base.clone(), cfg.gate.commands.clone());
+        // With delivery on, the base is the remote's: the one the pull request merges into.
+        let gate =
+            if cfg.delivery.enabled { gate.with_remote(cfg.delivery.remote.clone()) } else { gate };
+        Some(Arc::new(gate))
     } else {
         tracing::warn!("handoff gate off: done runs are released as the agent left them");
         None

@@ -35,12 +35,23 @@ pub struct GitGate {
     /// The ref to rebase onto, resolved in `repo`. `None` means `repo`'s own HEAD — the same
     /// commit `GitWorktreeWorkspace::prepare` branches from, now rather than then.
     base: Option<String>,
+    /// The remote `base` is fetched from before it is resolved, when delivery names one. `repo`'s
+    /// own `base` moves only when someone pulls, and a gate that resolved it passed #50 "on the
+    /// base" five seconds before its pull request opened conflicting (#134).
+    remote: Option<String>,
     commands: Vec<Vec<String>>,
 }
 
 impl GitGate {
     pub fn new(repo: impl Into<PathBuf>, base: Option<String>, commands: Vec<Vec<String>>) -> Self {
-        Self { repo: repo.into(), base, commands }
+        Self { repo: repo.into(), base, remote: None, commands }
+    }
+
+    /// Gate against `remote`'s copy of the base rather than `repo`'s. Ignored with no base set:
+    /// `HEAD` names nothing to fetch.
+    pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
+        self.remote = Some(remote.into());
+        self
     }
 }
 
@@ -117,6 +128,7 @@ impl Gate for GitGate {
             state: state.clone(),
             repo: self.repo.clone(),
             base: self.base.clone(),
+            remote: self.remote.clone(),
             commands: self.commands.clone(),
             workspace: workspace.to_path_buf(),
             identifier: issue.identifier.clone(),
@@ -155,6 +167,7 @@ struct GateRun {
     state: Shared,
     repo: PathBuf,
     base: Option<String>,
+    remote: Option<String>,
     commands: Vec<Vec<String>>,
     workspace: PathBuf,
     identifier: String,
@@ -181,8 +194,15 @@ impl GateRun {
     }
 
     fn gate(&self) -> Verdict {
-        let base_label = self.base.as_deref().unwrap_or("HEAD");
         let ws = &self.workspace;
+        let base_label = match (self.base.as_deref(), self.remote.as_deref()) {
+            (Some(base), Some(remote)) => match self.fetch_base(remote, base) {
+                Ok(tracking) => tracking,
+                Err(verdict) => return verdict,
+            },
+            (base, _) => base.unwrap_or("HEAD").to_string(),
+        };
+        let base_label = base_label.as_str();
 
         // Resolved in `repo`, not in the worktree: the worktree's HEAD is the run's own branch,
         // and a bare `HEAD` there would rebase the branch onto itself and call it current.
@@ -270,6 +290,30 @@ impl GateRun {
             }
         }
         Verdict::Passed { rebased }
+    }
+
+    /// Fetch `base` from `remote` into `refs/remotes/<remote>/<base>` and name that ref. The
+    /// refspec is explicit so the fetch writes the remote-tracking ref and nothing else: the
+    /// operator's checked-out branch and local `base` are theirs, never the gate's. A fetch that
+    /// fails ends the gate rather than falling back to the local ref, which is the stale base
+    /// this exists to avoid.
+    fn fetch_base(&self, remote: &str, base: &str) -> Result<String, Verdict> {
+        let step = format!("fetch {remote}/{base}");
+        self.set_step(&step);
+        let refspec = format!("+refs/heads/{base}:refs/remotes/{remote}/{base}");
+        match self.git(&self.repo, &["fetch", "--quiet", "--no-tags", remote, &refspec]) {
+            Ok(_) if self.killed() => Err(stopped(step, false)),
+            Ok(_) => Ok(format!("refs/remotes/{remote}/{base}")),
+            Err(e) => Err(Verdict::Failed {
+                output: format!(
+                    "cannot fetch the base `{base}` from `{remote}` in {}; the gate does not \
+                     fall back to the local ref, which may be behind the pull request's base: {e}",
+                    self.repo.display()
+                ),
+                step,
+                on_base: false,
+            }),
+        }
     }
 
     /// Rebase the worktree onto `base_sha`: whether that moved any commits, or the verdict a
@@ -597,6 +641,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `repo_and_worktree`, with `repo` cloned from an `upstream` that stands in for the remote
+    /// its pull requests merge into. Returns `(dir, upstream, repo, worktree)`.
+    fn clone_and_worktree(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let (dir, upstream, _) = repo_and_worktree(tag);
+        let repo = dir.join("clone");
+        sh_git(&dir, &["clone", "-q", upstream.to_str().unwrap(), repo.to_str().unwrap()]);
+        sh_git(&repo, &["config", "user.email", "test@example.com"]);
+        sh_git(&repo, &["config", "user.name", "test"]);
+        let repo = repo.canonicalize().unwrap();
+        let ws = GitWorktreeWorkspace::new(dir.join("clone-workspaces"), &repo).unwrap();
+        let wt = ws.prepare("iss-1", "MT-1").unwrap().path;
+        (dir, upstream, repo, wt)
+    }
+
+    /// The guard for #134: the daemon's own `master` lagged the remote's by a merged pull
+    /// request, the gate passed on it, and the pull request opened conflicting. Resolve the
+    /// local ref instead of fetching and this passes.
+    #[test]
+    fn the_gate_rebases_onto_the_remote_base_not_a_stale_local_ref() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("remote-base");
+        commit(&wt, "base.txt", "agent's version\n", "agent edits base");
+        commit(&upstream, "base.txt", "merged meanwhile\n", "another pull request merged");
+        let local_master = sh_git(&repo, &["rev-parse", "master"]);
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])])
+            .with_remote("origin");
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        let remote_master = sh_git(&upstream, &["rev-parse", "master"]);
+        assert_eq!(
+            verdict,
+            Verdict::Conflict { paths: vec!["base.txt".into()], base_sha: remote_master }
+        );
+        assert!(!wt.join("gate-ran").exists(), "a conflicted branch is not gated");
+        assert_eq!(
+            sh_git(&repo, &["rev-parse", "master"]),
+            local_master,
+            "the operator's local master is fetched past, never moved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_fetch_of_the_base_fails_the_gate_rather_than_passing_on_the_stale_ref() {
+        let (dir, upstream, repo, wt) = clone_and_worktree("fetch-fails");
+        commit(&wt, "agent.txt", "agent\n", "the agent's work");
+        std::fs::remove_dir_all(&upstream).unwrap();
+
+        let gate = GitGate::new(&repo, Some("master".into()), vec![argv(&["touch", "gate-ran"])])
+            .with_remote("origin");
+        let verdict = wait(&gate.start(&issue(), &wt));
+
+        match verdict {
+            Verdict::Failed { step, output, on_base } => {
+                assert_eq!(step, "fetch origin/master");
+                assert!(output.contains("cannot fetch the base `master`"), "{output}");
+                assert!(!on_base, "nothing was rebased");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!wt.join("gate-ran").exists(), "the commands do not run on a stale base");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Skipping the rebase must not skip its refusal of a dirty tree: delivery pushes `HEAD`,
     /// so an uncommitted edit that passed the gate would be dropped from the handoff unseen.
     #[test]
@@ -654,6 +764,7 @@ mod tests {
             state: Arc::new((Mutex::new(Inner::default()), Condvar::new())),
             repo: repo.clone(),
             base: None,
+            remote: None,
             commands: Vec::new(),
             workspace: wt.clone(),
             identifier: "MT-1".into(),
@@ -732,6 +843,7 @@ mod tests {
             state: Arc::new((Mutex::new(Inner::default()), Condvar::new())),
             repo: repo.clone(),
             base: None,
+            remote: None,
             commands: Vec::new(),
             workspace: wt.clone(),
             identifier: "MT-1".into(),
@@ -952,6 +1064,7 @@ mod tests {
             state: state.clone(),
             repo: PathBuf::from("/nonexistent"),
             base: None,
+            remote: None,
             commands: vec![],
             workspace: PathBuf::from("/nonexistent"),
             identifier: "MT-1".into(),

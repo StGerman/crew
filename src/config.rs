@@ -126,8 +126,10 @@ pub struct Config {
 pub struct GateConfig {
     #[serde(default = "d_gate_enabled")]
     pub enabled: bool,
-    /// The ref a finished branch is rebased onto, resolved in `workspace.repo`. Unset means that
-    /// repository's current HEAD — the same commit worktrees are branched from, only now.
+    /// The ref a finished branch is rebased onto, resolved in `workspace.repo`. With delivery on
+    /// it is fetched from `delivery.remote` first and `<remote>/<base>` is used, since the local
+    /// branch lags until someone pulls (#134). Unset means that repository's current HEAD — the
+    /// same commit worktrees are branched from, only now.
     #[serde(default)]
     pub base: Option<String>,
     /// Each command is an argv, exec'd directly in the worktree with no shell: `["cargo",
