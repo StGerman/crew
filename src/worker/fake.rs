@@ -105,6 +105,7 @@ pub struct FakeWorker {
     feedback: Mutex<HashMap<String, Vec<Option<Feedback>>>>,
     /// The work-in-progress snapshot each spawn was told about, for the same reason.
     wips: Mutex<HashMap<String, Vec<Vec<WipSnapshot>>>>,
+    body_changed: Mutex<HashMap<String, Vec<bool>>>,
     /// Mutable so a test can change it between dispatches, which is how a config change looks
     /// to the scheduler across a restart.
     model: Mutex<ModelChoice>,
@@ -120,6 +121,7 @@ impl FakeWorker {
             endpoints: Mutex::new(HashMap::new()),
             feedback: Mutex::new(HashMap::new()),
             wips: Mutex::new(HashMap::new()),
+            body_changed: Mutex::new(HashMap::new()),
             model: Mutex::new(ModelChoice::default()),
         }
     }
@@ -156,15 +158,21 @@ impl FakeWorker {
     pub fn wips_for(&self, issue_id: &str) -> Vec<Vec<WipSnapshot>> {
         self.wips.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
     }
+
+    /// Whether each spawn for this issue was told its body changed since the session saw it.
+    pub fn body_changed_for(&self, issue_id: &str) -> Vec<bool> {
+        self.body_changed.lock().unwrap().get(issue_id).cloned().unwrap_or_default()
+    }
 }
 
 impl Worker for FakeWorker {
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
-        let Spawn { issue, session, tools, transcript, feedback, wip, .. } = req;
+        let Spawn { issue, session, tools, transcript, feedback, wip, body_changed, .. } = req;
         self.sessions.lock().unwrap().entry(issue.id.clone()).or_default().push(session.clone());
         self.endpoints.lock().unwrap().entry(issue.id.clone()).or_default().push(tools.cloned());
         self.feedback.lock().unwrap().entry(issue.id.clone()).or_default().push(feedback.cloned());
         self.wips.lock().unwrap().entry(issue.id.clone()).or_default().push(wip.to_vec());
+        self.body_changed.lock().unwrap().entry(issue.id.clone()).or_default().push(body_changed);
 
         let script = self
             .scripts

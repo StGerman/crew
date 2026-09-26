@@ -416,6 +416,13 @@ the turn budget is not spent twice over on the same re-orientation. The name is 
 store before the process exists, for the same reason the claim is — the child cannot be what
 records it. A run that takes no turns drops the name, which is how a session the CLI no longer
 holds degrades to a cold start instead of failing every retry identically into quarantine.
+A resume leaves the issue body out, as already held, unless it changed: `launch` swaps the
+body's hash into `issue_state.session_body` (v12), and a resume whose hash differs sends the
+body again under a "changed since your last session" heading, because the description is where
+decisions are written (#109). A rebase conflict that parked the issue `Blocked` is queued in
+`issue_state.pending_feedback` as `Feedback::Conflict` and taken by the next launch, so the
+run a human's unblocking dispatches is told the base and the paths, not that it ran out of
+turns.
 
 The first live end-to-end run of `ClaudeWorker` (real agent, real worktree, cut off mid-run by
 `--max-ticks`) left an orphaned `claude` process running after `cargo run` had already
@@ -663,6 +670,8 @@ reading — check that the named test is still meaningful, not just still green.
 | Cleanup cannot discard an agent's commits | `branch -d` (not `-D`) on remove; attach, not `-B`, on reuse | `a_branch_holding_committed_work_outlives_the_worktree_it_is_removed_with` |
 | Cleanup cannot discard an agent's *uncommitted* work | `remove` snapshots a dirty tree to a new ref under `refs/crew/wip/<issue key>/` (never the branch, never overwriting an earlier snapshot) before deleting it, failing closed; `prepare` reports every such ref and the next prompt names them | `a_worktree_removed_with_uncommitted_changes_leaves_them_recoverable_from_its_wip_ref`, `a_run_killed_with_uncommitted_changes_has_them_recoverable_after_its_workspace_is_removed` |
 | A dead session cannot strand an issue | drop the session name after a run with zero turns | `a_run_that_took_no_turns_is_not_retried_into_the_same_conversation` |
+| A resumed session reads a description edited since it last saw one | `launch` swaps the body's `blake3` into `issue_state.session_body` (v12) and sets `Spawn::body_changed` on a resume whose hash differs or was never recorded; the continuation prompt then carries the body under a "changed since your last session" heading (#109) | `a_description_edited_after_the_session_started_reaches_the_resumed_session` (in `tests/scheduler.rs` and in the worker's snapshots) |
+| A run resumed after a rebase conflict is told the conflict, not a turn budget | `gate_outcome` queues `Feedback::Conflict { base, base_sha, paths }` in `issue_state.pending_feedback`; `launch` takes it ahead of delivery's feedback and the retry reason, and the continuation prompt opens by saying the gate stopped the handoff (#109) | `a_resume_after_a_rebase_conflict_is_handed_the_conflict_rather_than_a_turn_budget`, `a_resume_after_a_rebase_conflict_names_the_conflict_rather_than_a_turn_budget` |
 | A hard kill cannot strand a claim | startup `recover()`: a claim with no live run is stale, because `running` cannot cross a process boundary | `a_claim_stranded_by_a_hard_kill_is_recovered_at_the_next_startup` |
 | A hard kill cannot zero an in-flight run's progress | `observe_progress` checkpoints `run.turns` once per tick when the count moved, and `close_open_runs` keeps it and charges it to `cumulative_turns` in one transaction | `a_run_interrupted_by_a_hard_kill_reports_its_last_known_turn_count_after_restart` |
 | An agent cannot write to another ticket | no tool takes an issue id; the target comes from the per-run token | `a_call_naming_a_different_issue_is_refused_and_the_refusal_is_audited` |

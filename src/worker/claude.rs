@@ -263,14 +263,23 @@ impl RunHandle for ClaudeRun {
 
 impl Worker for ClaudeWorker {
     fn spawn(&self, req: Spawn<'_>) -> Arc<dyn RunHandle> {
-        let Spawn { issue, workspace, attempt, session, tools, mut transcript, feedback, wip } =
-            req;
+        let Spawn {
+            issue,
+            workspace,
+            attempt,
+            session,
+            tools,
+            mut transcript,
+            feedback,
+            wip,
+            body_changed,
+        } = req;
         // `--resume` is passed with an explicit id, never bare: bare opens an interactive
         // picker, and there is no human here to answer it.
         let (prompt, flag) = match session {
             Session::New(_) => (build_prompt(issue, tools, feedback, wip), "--session-id"),
             Session::Resume(_) => {
-                (build_continuation_prompt(issue, tools, feedback, wip), "--resume")
+                (build_continuation_prompt(issue, tools, feedback, wip, body_changed), "--resume")
             }
         };
 
@@ -663,21 +672,33 @@ fn truncate(s: &str, n: usize) -> String {
 
 /// The prompt for an attempt that resumes an existing conversation.
 ///
-/// It deliberately omits the issue body and most of the contract: the session being resumed
-/// already holds both, and re-sending them spends the turn budget on what the agent is about to
-/// re-read anyway. What it adds is the one thing the agent cannot see from inside — that the
-/// previous session ended without the work being finished.
+/// It omits the issue body when the session already holds the current one, and most of the
+/// contract always: re-sending them spends the turn budget on what the agent is about to re-read
+/// anyway. A body edited since the session last saw it is sent again (#109) — it is where the
+/// operator writes decisions, and a session told only to continue acts on the old text. What
+/// the prompt adds is what the agent cannot see from inside: why the previous session ended,
+/// which is a rebase conflict when the gate blocked it and an unfinished session otherwise.
 fn build_continuation_prompt(
     issue: &Issue,
     tools: Option<&ToolEndpoint>,
     feedback: Option<&Feedback>,
     wip: &[WipSnapshot],
+    body_changed: bool,
 ) -> String {
+    let why = match feedback {
+        Some(Feedback::Conflict { .. }) => {
+            "Your previous session on this issue reported its work finished, but the \
+             orchestrator could not hand the branch off; what stopped it is below."
+        }
+        _ => {
+            "Your previous session on this issue ended before the work was finished — either \
+             you asked for another turn, or the orchestrator's per-session turn budget stopped \
+             you."
+        }
+    };
     let mut p = format!(
-        "Continue working on {}. Your previous session on this issue ended before the work was \
-         finished — either you asked for another turn, or the orchestrator's per-session turn \
-         budget stopped you. The working directory is the same worktree, with whatever you \
-         committed still in it. Pick up where you left off.\n\n\
+        "Continue working on {}. {why} The working directory is the same worktree, with \
+         whatever you committed still in it. Pick up where you left off.\n\n\
          The same rules apply: commit as you go, and when the work is fully complete, simply \
          stop. If you need another turn, end your final message with a line reading \
          exactly:\n\
@@ -686,6 +707,14 @@ fn build_continuation_prompt(
          CREW_OUTCOME: blocked: <one-sentence reason>\n",
         issue.identifier
     );
+    if body_changed {
+        p.push_str(
+            "\nThe issue description has changed since your last session. Re-read it: it may \
+             carry new decisions that override what you did before.\n\nDescription:\n",
+        );
+        p.push_str(issue.body.as_deref().unwrap_or("(now empty)"));
+        p.push('\n');
+    }
     p.push_str(&feedback_help(feedback));
     p.push_str(&wip_help(wip));
     p.push_str(&tool_help(tools));
@@ -742,6 +771,17 @@ fn feedback_help(feedback: Option<&Feedback>) -> String {
             s.push_str(&format!(
                 "\nFrom the orchestrator, on why this attempt was dispatched:\n{}\n",
                 output.trim_end()
+            ));
+        }
+        Feedback::Conflict { base, base_sha, paths } => {
+            s.push_str(&format!(
+                "\nThe orchestrator could not rebase your branch onto {base} ({base_sha}): \
+                 conflicts in {}. The rebase was aborted, so your branch is exactly as you left \
+                 it. Your job this run is to resolve that yourself — `git rebase {base_sha}`, \
+                 resolve each conflict (the description may say how), `git rebase --continue` — \
+                 then run the project's own gate and commit. Do not report done while the branch \
+                 still conflicts with {base}.\n",
+                paths.join(", ")
             ));
         }
         Feedback::Ci { pr_url, failures } => {
@@ -1043,7 +1083,7 @@ mod tests {
         };
         for prompt in [
             build_prompt(&issue(), None, Some(&fb), &[]),
-            build_continuation_prompt(&issue(), None, Some(&fb), &[]),
+            build_continuation_prompt(&issue(), None, Some(&fb), &[], false),
         ] {
             assert!(prompt.contains("CI is red"), "{prompt}");
             assert!(prompt.contains("fmt + clippy + test"));
@@ -1072,9 +1112,42 @@ mod tests {
         insta::assert_snapshot!("new_prompt_with_wip", build_prompt(&issue(), None, None, &wip));
         insta::assert_snapshot!(
             "continuation_prompt_with_wip",
-            build_continuation_prompt(&issue(), None, None, &wip)
+            build_continuation_prompt(&issue(), None, None, &wip, false)
         );
         insta::assert_snapshot!("new_prompt_without_wip", build_prompt(&issue(), None, None, &[]));
+    }
+
+    /// #109: a Decisions section written into #105's description after its session started was
+    /// never read, because the continuation prompt leaves the body out as already held.
+    #[test]
+    fn a_description_edited_after_the_session_started_reaches_the_resumed_session() {
+        let edited = Issue {
+            body: Some("Fix the thing.\n\n## Decisions\n\nKeep #86's v10; make yours v11.".into()),
+            ..issue()
+        };
+        insta::assert_snapshot!(
+            "continuation_prompt_body_changed",
+            build_continuation_prompt(&edited, None, None, &[], true)
+        );
+        insta::assert_snapshot!(
+            "continuation_prompt_body_unchanged",
+            build_continuation_prompt(&edited, None, None, &[], false)
+        );
+    }
+
+    /// #109: a resume after the gate parked the issue on a rebase conflict told the agent its
+    /// session had run out of turns, and it reported the work already done.
+    #[test]
+    fn a_resume_after_a_rebase_conflict_names_the_conflict_rather_than_a_turn_budget() {
+        let fb = Feedback::Conflict {
+            base: "master".into(),
+            base_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            paths: vec!["src/store/schema.rs".into(), "src/store/mod.rs".into()],
+        };
+        insta::assert_snapshot!(
+            "continuation_prompt_after_conflict",
+            build_continuation_prompt(&issue(), None, Some(&fb), &[], false)
+        );
     }
 
     #[test]

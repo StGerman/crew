@@ -563,6 +563,38 @@ fn continuation_backs_off_instead_of_respawning_every_second() {
     assert_eq!(due - h.clock.wall().0, 30_000);
 }
 
+/// #109: a Decisions section written into a description after the session started never
+/// reached the resumed session, because the continuation prompt leaves the body out. The
+/// worker is told exactly when the body differs from what the session last saw.
+#[test]
+fn a_description_edited_after_the_session_started_reaches_the_resumed_session() {
+    let mut h = harness(vec![issue(1, "In Progress", Some(1))], |_| {});
+    h.tracker.set_body("iss-1", Some("do the thing"));
+    h.worker.set_default(
+        Script::succeeds_in(1_000).with_outcome(Outcome::Continue { why: "more to do".into() }),
+    );
+    let attempt = |h: &mut Harness| {
+        h.sched.tick().unwrap();
+        h.clock.advance_ms(1_000);
+        h.sched.tick().unwrap();
+        h.clock.advance_ms(60_000);
+    };
+
+    attempt(&mut h);
+    attempt(&mut h);
+    h.tracker.set_body("iss-1", Some("do the thing\n\n## Decisions\n\nthis way"));
+    attempt(&mut h);
+    attempt(&mut h);
+    h.sched.tick().unwrap();
+
+    assert_eq!(
+        h.worker.body_changed_for("iss-1"),
+        vec![false, false, true, false, false],
+        "a new session has the body in its first prompt; a resume gets it again only once \
+         after it changes"
+    );
+}
+
 /// The milestone order is the priority (#86). A continuation's delay slows one issue's loop; it
 /// must not also hand that issue's slot to whatever became eligible in the same tick, or at
 /// `max_concurrent = 1` the milestone is worked round-robin by session.
@@ -1143,6 +1175,54 @@ fn a_rebase_conflict_parks_the_issue_blocked_naming_the_conflicted_paths() {
         h.sched.tick().unwrap();
         assert_eq!(h.sched.running_count() + h.sched.gating_count(), 0, "blocked stays parked");
     }
+}
+
+/// #109: #105 was parked on a conflict, unblocked, and resumed with a prompt saying it had run
+/// out of turns — so it reported its work already done and hit the same conflict a minute later.
+/// The run after the unblocking must be handed the conflict itself, once.
+#[test]
+fn a_resume_after_a_rebase_conflict_is_handed_the_conflict_rather_than_a_turn_budget() {
+    let (mut h, gate) = gated_harness(|c| {
+        c.gate.base = Some("master".into());
+        c.tracker.active_states.push("todo".into());
+    });
+    gate.set_default(GateScript::passes_in(1_000).with_verdict(GateVerdict::Conflict {
+        paths: vec!["src/store/schema.rs".into()],
+        base_sha: BASE.into(),
+    }));
+    dispatch_and_finish(&mut h);
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count() + h.sched.gating_count(), 0, "parked Blocked");
+
+    // The operator's unblocking: the ticket moves, which lifts the park.
+    gate.set_default(GateScript::passes_in(1_000));
+    h.tracker.set_state("iss-1", "Todo");
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    assert_eq!(h.sched.running_count(), 1, "the unblocked issue is dispatched again");
+    assert!(matches!(h.worker.sessions_for("iss-1")[1], Session::Resume(_)));
+    assert_eq!(
+        h.worker.feedback_for("iss-1")[1],
+        Some(Feedback::Conflict {
+            base: "master".into(),
+            base_sha: BASE.into(),
+            paths: vec!["src/store/schema.rs".into()]
+        }),
+        "the resumed run is told what blocked the last one"
+    );
+
+    // Told once: the run after that one has nothing queued.
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.clock.advance_ms(1_000);
+    h.sched.tick().unwrap();
+    h.tracker.set_state("iss-1", "In Progress");
+    h.clock.advance_ms(60_000);
+    h.sched.tick().unwrap();
+    let feedback = h.worker.feedback_for("iss-1");
+    assert_eq!(feedback.len(), 3, "dispatched a third time: {feedback:?}");
+    assert_eq!(feedback[2], None, "the conflict was taken by the run it was queued for");
 }
 
 const BASE: &str = "0123456789abcdef0123456789abcdef01234567";

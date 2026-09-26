@@ -191,6 +191,19 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE delivery ADD COLUMN ci_pending_head TEXT;
     ALTER TABLE delivery ADD COLUMN ci_pending_since INTEGER;
     "#,
+    // v12
+    r#"
+    -- What a resumed session has not seen (#109). `session_body` is the hash of the issue body
+    -- the session was started or last resumed with; a continuation whose current body hashes
+    -- differently is handed the body again, because the decisions an operator writes into a
+    -- description after the first attempt otherwise never reach the conversation. NULL means
+    -- unknown, which a resume reads as changed. `pending_feedback` is why the last run ended
+    -- when nothing else records it in a form the next prompt can use — a rebase conflict that
+    -- parked the issue `Blocked` — taken by the next launch like delivery's column of the same
+    -- name, which exists only while delivery is on.
+    ALTER TABLE issue_state ADD COLUMN session_body TEXT;
+    ALTER TABLE issue_state ADD COLUMN pending_feedback TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -284,6 +297,7 @@ mod tests {
         "c0f411b768e640dee5cfa9e4703d8af27c23a7e322bcac4c3e5585fdf083fca7", // v9
         "6a9665ba56edbe4ceccb6d168c317ca59b6b7f100e03790a66323dda541c5caf", // v10
         "3a74fa83ec2e66ebeb9a2231b6086493884f40fdabed03608e3608f2a9cd0a5d", // v11
+        "1b15b60789f8f4d2dedd3427f09829947ef902234e31abcc5b9de075e8a7502e", // v12
     ];
 
     #[test]

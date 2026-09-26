@@ -74,6 +74,12 @@ impl FakeTracker {
         }
     }
 
+    pub fn set_body(&self, id: &str, body: Option<&str>) {
+        if let Some(i) = self.inner.lock().unwrap().issues.get_mut(id) {
+            i.body = body.map(str::to_string);
+        }
+    }
+
     pub fn set_dispatchable(&self, id: &str, v: bool) {
         if let Some(i) = self.inner.lock().unwrap().issues.get_mut(id) {
             i.dispatchable = v;

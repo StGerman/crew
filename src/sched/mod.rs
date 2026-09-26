@@ -807,7 +807,7 @@ impl Scheduler {
                     conflict_brief(base, &base_sha, &paths, n, max)
                 })?
             }
-            Verdict::Conflict { paths, .. } => {
+            Verdict::Conflict { paths, base_sha } => {
                 let base = base.unwrap_or("the repository HEAD");
                 tracing::warn!(
                     issue_id,
@@ -815,6 +815,16 @@ impl Scheduler {
                     ?paths,
                     "rebase conflicts; blocking for a human"
                 );
+                // Queued for whichever run a human's unblocking dispatches next: `last_error`
+                // reaches the dashboard, not the prompt, and without this the resumed session
+                // is told it merely ran out of turns and reports its work already done (#109).
+                let fb =
+                    Feedback::Conflict { base: base.to_string(), base_sha, paths: paths.clone() };
+                self.store.set_pending_feedback(
+                    self.clock.as_ref(),
+                    issue_id,
+                    &serde_json::to_string(&fb)?,
+                )?;
                 Outcome::Blocked {
                     why: format!(
                         "rebase onto {base} conflicts in {} file(s): {}",
@@ -1456,6 +1466,13 @@ impl Scheduler {
                 Session::New(id)
             }
         };
+        // A resumed session holds the body it was started with, and nothing newer: a decision
+        // written into the description since then is otherwise never read (#109). An unknown
+        // previous hash counts as changed — re-sending a body costs a few tokens, missing one
+        // costs the attempt.
+        let body_hash = blake3::hash(issue.body.as_deref().unwrap_or("").as_bytes()).to_hex();
+        let seen = self.store.swap_session_body(self.clock.as_ref(), &issue.id, &body_hash)?;
+        let body_changed = session.is_resume() && seen.as_deref() != Some(body_hash.as_str());
         // Opened before the process exists, like the claim and the session name, and for a
         // reason specific to this one: a run that dies in its first second is exactly the run
         // someone will want the bytes from, so the file and the record of where it went both
@@ -1499,16 +1516,27 @@ impl Scheduler {
         // delivery hand-back writes both and the structured one carries more; the reason is
         // what is left when there is no row, or the row could not be read — for a gate-sent
         // continuation, the output of the suite that disagreed with the agent's `Done`.
-        let feedback: Option<Feedback> = self
+        //
+        // A queued conflict is taken first and wins over both: it is what stopped the most
+        // recent run, and no CI result or review on the branch can be acted on until the branch
+        // rebases again.
+        let parse = |j: String, source: &str| match serde_json::from_str::<Feedback>(&j) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(issue_id = %issue.id, error = %e, source, "unreadable feedback dropped");
+                None
+            }
+        };
+        let conflict = self
+            .store
+            .take_pending_feedback(self.clock.as_ref(), &issue.id)?
+            .and_then(|j| parse(j, "conflict"));
+        let delivery = self
             .store
             .take_delivery_feedback(self.clock.as_ref(), &issue.id)?
-            .and_then(|j| match serde_json::from_str(&j) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    tracing::warn!(issue_id = %issue.id, error = %e, "unreadable delivery feedback dropped");
-                    None
-                }
-            })
+            .and_then(|j| parse(j, "delivery"));
+        let feedback: Option<Feedback> = conflict
+            .or(delivery)
             .or_else(|| brief.map(|b| Feedback::Gate { output: b.to_string() }));
 
         let handle = self.worker.spawn(Spawn {
@@ -1516,6 +1544,7 @@ impl Scheduler {
             transcript,
             feedback: feedback.as_ref(),
             wip: &prepared.wip,
+            body_changed,
             ..Spawn::new(issue, &prepared.path, attempt, &session)
         });
         // The stall clock starts here, after workspace preparation — not at dispatch. Hook or
@@ -1537,6 +1566,7 @@ impl Scheduler {
             effort = model.effort.map(|e| e.as_str()).unwrap_or("-"),
             feedback = feedback.as_ref().map(|f| f.label()).unwrap_or("-"),
             wip = prepared.wip.len(),
+            body_changed,
             transcript = transcript_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
             "dispatched"
         );
